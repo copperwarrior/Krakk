@@ -19,6 +19,12 @@ import org.shipwrights.krakk.api.network.KrakkNetworkApi;
 
 import java.util.Objects;
 
+/**
+ * Service locator for Krakk subsystems.
+ * <p>
+ * Integrations should read APIs through this class, while Krakk bootstrap code
+ * is responsible for installing concrete runtime implementations.
+ */
 public final class KrakkApi {
     private static volatile KrakkDamageApi damageApi = new NoOpDamageApi();
     private static volatile KrakkExplosionApi explosionApi = new NoOpExplosionApi();
@@ -28,34 +34,58 @@ public final class KrakkApi {
     private KrakkApi() {
     }
 
+    /**
+     * Returns the server-authoritative damage API.
+     */
     public static KrakkDamageApi damage() {
         return damageApi;
     }
 
+    /**
+     * Returns the explosion simulation API.
+     */
     public static KrakkExplosionApi explosions() {
         return explosionApi;
     }
 
+    /**
+     * Returns the client overlay and mining baseline API.
+     */
     public static KrakkClientOverlayApi clientOverlay() {
         return clientOverlayApi;
     }
 
+    /**
+     * Returns the networking boundary API for damage/explosion sync.
+     */
     public static KrakkNetworkApi network() {
         return networkApi;
     }
 
+    /**
+     * Installs the damage API implementation.
+     */
     public static void setDamageApi(KrakkDamageApi api) {
         damageApi = Objects.requireNonNull(api, "api");
     }
 
+    /**
+     * Installs the explosion API implementation.
+     */
     public static void setExplosionApi(KrakkExplosionApi api) {
         explosionApi = Objects.requireNonNull(api, "api");
     }
 
+    /**
+     * Installs the client overlay API implementation.
+     */
     public static void setClientOverlayApi(KrakkClientOverlayApi api) {
         clientOverlayApi = Objects.requireNonNull(api, "api");
     }
 
+    /**
+     * Installs the network API implementation.
+     */
     public static void setNetworkApi(KrakkNetworkApi api) {
         networkApi = Objects.requireNonNull(api, "api");
     }
