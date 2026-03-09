@@ -1,0 +1,23 @@
+{
+  "required": true,
+  "package": "org.shipwrights.krakk.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "minVersion": "0.8",
+  "client": [
+    "client.KrakkMinecraftMixin",
+    "client.KrakkMultiPlayerGameModeMixin"
+  ],
+  "mixins": [
+    "common.KrakkChunkAccessMixin",
+    "common.KrakkChunkMapMixin",
+    "common.KrakkChunkSerializerMixin",
+    "common.KrakkFallingBlockEntityMixin",
+    "common.KrakkLevelChunkMixin",
+    "common.KrakkLevelMixin",
+    "common.KrakkPistonMovingBlockEntityMixin",
+    "common.KrakkServerPlayerGameModeMiningMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

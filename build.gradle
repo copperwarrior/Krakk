@@ -1,0 +1,49 @@
+plugins {
+    id 'dev.architectury.loom' version '1.3.355'
+    id 'architectury-plugin' version '3.4-SNAPSHOT'
+    id 'maven-publish'
+}
+
+group = project.krakk_group
+version = project.krakk_version
+
+base {
+    archivesName = project.krakk_artifact
+}
+
+architectury {
+    minecraft = project.minecraft_version
+    common project.enabled_platforms.split(',')
+}
+
+repositories {
+    mavenLocal()
+}
+
+dependencies {
+    minecraft "net.minecraft:minecraft:$project.minecraft_version"
+    mappings loom.officialMojangMappings()
+
+    // Keep dependency surface aligned with Cannonical common/runtime hooks.
+    modImplementation "net.fabricmc:fabric-loader:$project.fabric_loader_version"
+    modImplementation "dev.architectury:architectury:$project.architectury_api_version"
+}
+
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = 17
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            artifactId = base.archivesName.get()
+            from components.java
+        }
+    }
+}

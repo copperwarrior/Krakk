@@ -1,0 +1,521 @@
+package org.shipwrights.krakk.runtime.damage;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.block.FallingBlock;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.piston.MovingPistonBlock;
+import net.minecraft.world.level.block.piston.PistonMovingBlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
+import org.shipwrights.krakk.api.KrakkApi;
+import org.shipwrights.krakk.api.damage.KrakkDamageApi;
+import org.shipwrights.krakk.api.damage.KrakkImpactResult;
+import org.shipwrights.krakk.engine.damage.KrakkDamageCurves;
+import org.shipwrights.krakk.engine.damage.KrakkDamageDecay;
+import org.shipwrights.krakk.state.chunk.KrakkBlockDamageChunkAccess;
+import org.shipwrights.krakk.state.chunk.KrakkBlockDamageChunkStorage;
+
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.UUID;
+
+public final class KrakkDamageRuntime implements KrakkDamageApi {
+    private static final int MAX_DAMAGE_STATE = KrakkDamageCurves.MAX_DAMAGE_STATE;
+    private static final int NO_DAMAGE_STATE = -1;
+    private static final long DAMAGE_DECAY_INTERVAL_TICKS = 24_000L;
+    private static final int CONNECT_SYNC_DELAY_TICKS = 12;
+    private static final int CONNECT_SYNC_ATTEMPTS = 20;
+    private static final Map<UUID, PendingSync> PENDING_PLAYER_SYNCS = new HashMap<>();
+
+    public KrakkDamageRuntime() {
+    }
+
+    public KrakkImpactResult applyImpact(ServerLevel level, BlockPos blockPos, BlockState blockState, Entity source, double impactPower) {
+        return applyImpact(level, blockPos, blockState, source, impactPower, true);
+    }
+
+    @Override
+    public KrakkImpactResult applyImpact(ServerLevel level, BlockPos blockPos, BlockState blockState, Entity source,
+                                         double impactPower, boolean dropOnBreak) {
+        float hardness = blockState.getDestroySpeed(level, blockPos);
+        if (hardness < 0.0F || blockState.isAir()) {
+            clearDamage(level, blockPos);
+            return new KrakkImpactResult(false, NO_DAMAGE_STATE);
+        }
+
+        float resistance = blockState.getBlock().getExplosionResistance();
+        int addedState = computeDamageStateDelta(blockState, impactPower, resistance, hardness);
+        if (addedState <= 0) {
+            return new KrakkImpactResult(false, getDamageState(level, blockPos));
+        }
+
+        int previousState = getDamageState(level, blockPos);
+        int nextState = clamp(previousState + addedState, 0, MAX_DAMAGE_STATE);
+
+        if (nextState >= MAX_DAMAGE_STATE) {
+            clearDamage(level, blockPos);
+            boolean broken = level.destroyBlock(blockPos, dropOnBreak, source);
+            if (!broken) {
+                int fallbackState = MAX_DAMAGE_STATE - 1;
+                setDamageState(level, blockPos, fallbackState);
+                return new KrakkImpactResult(false, fallbackState);
+            }
+            return new KrakkImpactResult(true, NO_DAMAGE_STATE);
+        }
+
+        setDamageState(level, blockPos, nextState);
+        return new KrakkImpactResult(false, nextState);
+    }
+
+    @Override
+    public void clearDamage(ServerLevel level, BlockPos blockPos) {
+        ChunkStorageRef ref = getChunkStorage(level, blockPos, false);
+        if (ref == null) {
+            return;
+        }
+
+        long key = blockPos.asLong();
+        if (ref.storage().removeDamageState(key) != NO_DAMAGE_STATE) {
+            ref.chunk().setUnsaved(true);
+            syncDamageState(level, blockPos, 0);
+        }
+    }
+
+    public float getMiningProgressFraction(ServerLevel level, BlockPos blockPos) {
+        int damageState = getDamageState(level, blockPos);
+        return KrakkDamageCurves.toMiningBaseline(damageState);
+    }
+
+    @Override
+    public float getMiningBaseline(ServerLevel level, BlockPos pos) {
+        return getMiningProgressFraction(level, pos);
+    }
+
+    public int getRawDamageState(ServerLevel level, BlockPos blockPos) {
+        ChunkStorageRef ref = getChunkStorage(level, blockPos, false);
+        if (ref == null) {
+            return 0;
+        }
+        return ref.storage().getDamageState(blockPos.asLong());
+    }
+
+    @Override
+    public int getMaxDamageState() {
+        return MAX_DAMAGE_STATE;
+    }
+
+    @Override
+    public boolean setDamageStateForDebug(ServerLevel level, BlockPos blockPos, int damageState) {
+        BlockState liveState = level.getBlockState(blockPos);
+        if (liveState.isAir() || liveState.getDestroySpeed(level, blockPos) < 0.0F) {
+            clearDamage(level, blockPos);
+            return false;
+        }
+
+        setDamageState(level, blockPos, damageState);
+        return true;
+    }
+
+    public void queueConnectSync(ServerPlayer player) {
+        PENDING_PLAYER_SYNCS.put(player.getUUID(), new PendingSync(CONNECT_SYNC_DELAY_TICKS, CONNECT_SYNC_ATTEMPTS));
+    }
+
+    @Override
+    public void queuePlayerSync(ServerPlayer player) {
+        queueConnectSync(player);
+    }
+
+    public void clearQueuedSync(ServerPlayer player) {
+        PENDING_PLAYER_SYNCS.remove(player.getUUID());
+    }
+
+    @Override
+    public void clearQueuedPlayerSync(ServerPlayer player) {
+        clearQueuedSync(player);
+    }
+
+    @Override
+    public void tickQueuedSyncs(MinecraftServer server) {
+        if (PENDING_PLAYER_SYNCS.isEmpty()) {
+            return;
+        }
+
+        Iterator<Map.Entry<UUID, PendingSync>> iterator = PENDING_PLAYER_SYNCS.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<UUID, PendingSync> entry = iterator.next();
+            PendingSync pending = entry.getValue();
+            if (pending.ticksUntilNextAttempt > 0) {
+                pending.ticksUntilNextAttempt--;
+                continue;
+            }
+
+            ServerPlayer player = server.getPlayerList().getPlayer(entry.getKey());
+            if (player == null || player.connection == null) {
+                iterator.remove();
+                continue;
+            }
+
+            syncAllDamageStatesToPlayer(player);
+
+            pending.attemptsRemaining--;
+            if (pending.attemptsRemaining <= 0) {
+                iterator.remove();
+            } else {
+                pending.ticksUntilNextAttempt = CONNECT_SYNC_DELAY_TICKS;
+            }
+        }
+    }
+
+    public void syncAllDamageStatesToPlayer(ServerPlayer player) {
+        ServerLevel level = player.serverLevel();
+        ChunkPos centerChunk = player.chunkPosition();
+        int viewDistance = level.getServer().getPlayerList().getViewDistance() + 1;
+        for (int chunkX = centerChunk.x - viewDistance; chunkX <= centerChunk.x + viewDistance; chunkX++) {
+            for (int chunkZ = centerChunk.z - viewDistance; chunkZ <= centerChunk.z + viewDistance; chunkZ++) {
+                syncChunkColumnToPlayer(player, level, chunkX, chunkZ, false);
+            }
+        }
+    }
+
+    public void syncChunkColumnToPlayer(ServerPlayer player, ServerLevel level, int chunkX, int chunkZ) {
+        syncChunkColumnToPlayer(player, level, chunkX, chunkZ, false);
+    }
+
+    public void syncChunkColumnToPlayer(ServerPlayer player, ServerLevel level, int chunkX, int chunkZ, boolean loadIfMissing) {
+        LevelChunk chunk = level.getChunkSource().getChunkNow(chunkX, chunkZ);
+        if (chunk == null && loadIfMissing) {
+            chunk = level.getChunk(chunkX, chunkZ);
+        }
+        if (!(chunk instanceof KrakkBlockDamageChunkAccess access)) {
+            return;
+        }
+
+        access.krakk$getBlockDamageStorage().forEachSection((sectionY, states) -> {
+            if (states.isEmpty()) {
+                return;
+            }
+            KrakkApi.network().sendSectionSnapshot(
+                    player,
+                    level.dimension().location(),
+                    chunkX,
+                    sectionY,
+                    chunkZ,
+                    states
+            );
+        });
+    }
+
+    @Override
+    public void syncChunkToPlayer(ServerPlayer player, ServerLevel level, int chunkX, int chunkZ, boolean loadIfMissing) {
+        syncChunkColumnToPlayer(player, level, chunkX, chunkZ, loadIfMissing);
+    }
+
+    @Override
+    public int repairDamage(ServerLevel level, BlockPos blockPos, int repairAmount) {
+        if (repairAmount <= 0) {
+            return 0;
+        }
+
+        int currentState = getDamageState(level, blockPos);
+        if (currentState <= 0) {
+            return 0;
+        }
+
+        int nextState = clamp(currentState - repairAmount, 0, MAX_DAMAGE_STATE);
+        if (nextState <= 0) {
+            clearDamage(level, blockPos);
+            return currentState;
+        }
+
+        setDamageState(level, blockPos, nextState);
+        return currentState - nextState;
+    }
+
+    @Override
+    public int takeDamageState(ServerLevel level, BlockPos blockPos) {
+        int currentState = getDamageState(level, blockPos);
+        if (currentState <= 0) {
+            return 0;
+        }
+
+        clearDamage(level, blockPos);
+        return currentState;
+    }
+
+    @Override
+    public int takeStoredDamageState(ServerLevel level, BlockPos blockPos) {
+        ChunkStorageRef ref = getChunkStorage(level, blockPos, false);
+        if (ref == null) {
+            return 0;
+        }
+
+        int removedState = ref.storage().removeDamageState(blockPos.asLong());
+        int clampedState = clamp(removedState, 0, MAX_DAMAGE_STATE);
+        if (removedState != NO_DAMAGE_STATE) {
+            ref.chunk().setUnsaved(true);
+            syncDamageState(level, blockPos, 0);
+        }
+        return clampedState;
+    }
+
+    @Override
+    public boolean isLikelyPistonMoveSource(ServerLevel level, BlockPos sourcePos, BlockState sourceState) {
+        if (sourceState.isAir()) {
+            return false;
+        }
+
+        for (Direction direction : Direction.values()) {
+            BlockPos possibleDestination = sourcePos.relative(direction);
+            if (!level.getBlockState(possibleDestination).is(Blocks.MOVING_PISTON)) {
+                continue;
+            }
+
+            BlockEntity blockEntity = level.getBlockEntity(possibleDestination);
+            if (!(blockEntity instanceof PistonMovingBlockEntity movingBlockEntity)) {
+                continue;
+            }
+            if (movingBlockEntity.isSourcePiston()) {
+                continue;
+            }
+            if (movingBlockEntity.getMovementDirection() != direction) {
+                continue;
+            }
+
+            BlockState movedState = movingBlockEntity.getMovedState();
+            if (movedState.isAir()) {
+                continue;
+            }
+            if (movedState.getBlock() != sourceState.getBlock()) {
+                continue;
+            }
+            return true;
+        }
+
+        return false;
+    }
+
+    @Override
+    public boolean transferLikelyPistonCompletionDamage(ServerLevel level, BlockPos destinationPos, BlockState destinationState) {
+        if (destinationState.isAir() || destinationState.getDestroySpeed(level, destinationPos) < 0.0F) {
+            return false;
+        }
+
+        BlockPos bestSourcePos = null;
+        int bestDamageState = 0;
+        for (Direction direction : Direction.values()) {
+            BlockPos sourceCandidate = destinationPos.relative(direction);
+            int candidateState = getRawDamageState(level, sourceCandidate);
+            if (candidateState <= 0) {
+                continue;
+            }
+
+            BlockState candidateLiveState = level.getBlockState(sourceCandidate);
+            if (!candidateLiveState.isAir() && !(candidateLiveState.getBlock() instanceof MovingPistonBlock)) {
+                continue;
+            }
+            if (candidateState <= bestDamageState) {
+                continue;
+            }
+            bestDamageState = candidateState;
+            bestSourcePos = sourceCandidate.immutable();
+        }
+
+        if (bestSourcePos == null) {
+            return false;
+        }
+
+        int carriedState = takeStoredDamageState(level, bestSourcePos);
+        if (carriedState <= 0) {
+            return false;
+        }
+        applyTransferredDamageState(level, destinationPos, destinationState, carriedState);
+        return true;
+    }
+
+    @Override
+    public void applyTransferredDamageState(ServerLevel level, BlockPos blockPos, BlockState expectedState, int transferredState) {
+        int clampedState = clamp(transferredState, 0, MAX_DAMAGE_STATE);
+        if (clampedState <= 0) {
+            return;
+        }
+
+        BlockState currentState = level.getBlockState(blockPos);
+        if (currentState.isAir() || currentState.getDestroySpeed(level, blockPos) < 0.0F) {
+            return;
+        }
+        if (expectedState != null && currentState.getBlock() != expectedState.getBlock()) {
+            return;
+        }
+
+        int existingState = getDamageState(level, blockPos);
+        int mergedState = Math.max(existingState, clampedState);
+        if (mergedState > existingState) {
+            setDamageState(level, blockPos, mergedState);
+        }
+    }
+
+    @Override
+    public KrakkImpactResult accumulateTransferredDamageState(ServerLevel level, BlockPos blockPos, BlockState expectedState,
+                                                              int addedState, boolean dropOnBreak) {
+        int clampedAdded = clamp(addedState, 0, MAX_DAMAGE_STATE);
+        if (clampedAdded <= 0) {
+            return new KrakkImpactResult(false, getDamageState(level, blockPos));
+        }
+
+        BlockState currentState = level.getBlockState(blockPos);
+        if (currentState.isAir() || currentState.getDestroySpeed(level, blockPos) < 0.0F) {
+            return new KrakkImpactResult(false, NO_DAMAGE_STATE);
+        }
+        if (expectedState != null && currentState.getBlock() != expectedState.getBlock()) {
+            return new KrakkImpactResult(false, NO_DAMAGE_STATE);
+        }
+
+        int existingState = getDamageState(level, blockPos);
+        int nextState = clamp(existingState + clampedAdded, 0, MAX_DAMAGE_STATE);
+        if (nextState >= MAX_DAMAGE_STATE) {
+            clearDamage(level, blockPos);
+            boolean broken = level.destroyBlock(blockPos, dropOnBreak, null);
+            if (!broken) {
+                int fallbackState = MAX_DAMAGE_STATE - 1;
+                setDamageState(level, blockPos, fallbackState);
+                return new KrakkImpactResult(false, fallbackState);
+            }
+            return new KrakkImpactResult(true, NO_DAMAGE_STATE);
+        }
+
+        setDamageState(level, blockPos, nextState);
+        return new KrakkImpactResult(false, nextState);
+    }
+
+    public void moveDamageState(ServerLevel level, BlockPos fromPos, BlockPos toPos, BlockState expectedDestinationState) {
+        if (fromPos.equals(toPos)) {
+            return;
+        }
+
+        int carriedState = takeStoredDamageState(level, fromPos);
+        if (carriedState <= 0) {
+            return;
+        }
+
+        applyTransferredDamageState(level, toPos, expectedDestinationState, carriedState);
+    }
+
+    private static int computeDamageStateDelta(BlockState blockState, double impactPower, float resistance, float hardness) {
+        boolean isFallingBlock = blockState.getBlock() instanceof FallingBlock;
+        return KrakkDamageCurves.computeImpactDamageDelta(isFallingBlock, impactPower, resistance, hardness);
+    }
+
+    @Override
+    public int getDamageState(ServerLevel level, BlockPos blockPos) {
+        BlockState liveState = level.getBlockState(blockPos);
+        if (liveState.isAir() || liveState.getDestroySpeed(level, blockPos) < 0.0F) {
+            clearDamage(level, blockPos);
+            return 0;
+        }
+
+        ChunkStorageRef ref = getChunkStorage(level, blockPos, false);
+        if (ref == null) {
+            return 0;
+        }
+
+        long posLong = blockPos.asLong();
+        int state = ref.storage().getDamageState(posLong);
+        if (state <= 0) {
+            return 0;
+        }
+
+        long now = level.getGameTime();
+        long lastUpdateTick = ref.storage().getLastUpdateTick(posLong);
+        if (lastUpdateTick < 0L) {
+            if (ref.storage().setLastUpdateTick(posLong, now)) {
+                ref.chunk().setUnsaved(true);
+            }
+            return state;
+        }
+
+        long elapsedTicks = now - lastUpdateTick;
+        if (elapsedTicks < DAMAGE_DECAY_INTERVAL_TICKS) {
+            return state;
+        }
+
+        KrakkDamageDecay.DecayResult decayResult = KrakkDamageDecay.applyDecay(state, elapsedTicks, DAMAGE_DECAY_INTERVAL_TICKS);
+        int decayedState = clamp(decayResult.state(), 0, MAX_DAMAGE_STATE);
+        if (decayedState <= 0) {
+            if (ref.storage().removeDamageState(posLong) != NO_DAMAGE_STATE) {
+                ref.chunk().setUnsaved(true);
+                syncDamageState(level, blockPos, 0);
+            }
+            return 0;
+        }
+
+        long consumedTicks = decayResult.consumedTicks();
+        if (ref.storage().setDamageState(posLong, decayedState, lastUpdateTick + consumedTicks)) {
+            ref.chunk().setUnsaved(true);
+        }
+        if (decayedState != state) {
+            syncDamageState(level, blockPos, decayedState);
+        }
+        return decayedState;
+    }
+
+    private void setDamageState(ServerLevel level, BlockPos blockPos, int damageState) {
+        ChunkStorageRef ref = getChunkStorage(level, blockPos, true);
+        if (ref == null) {
+            return;
+        }
+
+        long posLong = blockPos.asLong();
+        int clampedState = clamp(damageState, 0, MAX_DAMAGE_STATE);
+        int previousState = ref.storage().getDamageState(posLong);
+        if (ref.storage().setDamageState(posLong, clampedState, level.getGameTime())) {
+            ref.chunk().setUnsaved(true);
+        }
+        if (previousState != clampedState) {
+            syncDamageState(level, blockPos, clampedState);
+        }
+    }
+
+    private ChunkStorageRef getChunkStorage(ServerLevel level, BlockPos blockPos, boolean loadIfMissing) {
+        int chunkX = blockPos.getX() >> 4;
+        int chunkZ = blockPos.getZ() >> 4;
+
+        LevelChunk chunk = level.getChunkSource().getChunkNow(chunkX, chunkZ);
+        if (chunk == null && loadIfMissing) {
+            chunk = level.getChunkAt(blockPos);
+        }
+        if (!(chunk instanceof KrakkBlockDamageChunkAccess access)) {
+            return null;
+        }
+        return new ChunkStorageRef(chunk, access.krakk$getBlockDamageStorage());
+    }
+
+    private static int clamp(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private void syncDamageState(ServerLevel level, BlockPos blockPos, int damageState) {
+        KrakkApi.network().sendDamageSync(level, blockPos, damageState);
+    }
+
+    private record ChunkStorageRef(LevelChunk chunk, KrakkBlockDamageChunkStorage storage) {
+    }
+
+    private static final class PendingSync {
+        private int ticksUntilNextAttempt;
+        private int attemptsRemaining;
+
+        private PendingSync(int ticksUntilNextAttempt, int attemptsRemaining) {
+            this.ticksUntilNextAttempt = ticksUntilNextAttempt;
+            this.attemptsRemaining = attemptsRemaining;
+        }
+    }
+
+}
