@@ -20,8 +20,3 @@ Published coordinates:
 - Group: `org.shipwrights.krakk`
 - Artifact: `krakk`
 - Version: `0.1.0-SNAPSHOT` (default in `gradle.properties`)
-
-## Used by Cannonical
-Cannonical resolves Krakk via Maven coordinates and optionally includes this checkout directly through Gradle composite build (`includeBuild`).
-
-If this directory is used as a git submodule, Cannonical can consume local source changes without publishing.
