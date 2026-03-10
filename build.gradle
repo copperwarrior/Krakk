@@ -1,50 +1,10 @@
 plugins {
-    id 'dev.architectury.loom' version '1.3.355'
-    id 'architectury-plugin' version '3.4-SNAPSHOT'
-    id 'maven-publish'
+    id 'dev.architectury.loom' version '1.3.355' apply false
+    id 'architectury-plugin' version '3.4-SNAPSHOT' apply false
+    id 'com.github.johnrengelman.shadow' version '8.1.1' apply false
 }
 
-group = project.krakk_group
-version = project.krakk_version
-
-base {
-    archivesName = project.krakk_artifact
-}
-
-architectury {
-    minecraft = project.minecraft_version
-    common project.enabled_platforms.split(',')
-}
-
-repositories {
-    mavenLocal()
-}
-
-dependencies {
-    minecraft "net.minecraft:minecraft:$project.minecraft_version"
-    mappings loom.officialMojangMappings()
-
-    // Keep dependency surface aligned with Cannonical common/runtime hooks.
-    modImplementation "net.fabricmc:fabric-loader:$project.fabric_loader_version"
-    modImplementation "dev.architectury:architectury:$project.architectury_api_version"
-}
-
-java {
-    withSourcesJar()
-    withJavadocJar()
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
-}
-
-tasks.withType(JavaCompile).configureEach {
-    it.options.release = 17
-}
-
-publishing {
-    publications {
-        mavenJava(MavenPublication) {
-            artifactId = base.archivesName.get()
-            from components.java
-        }
-    }
+allprojects {
+    group = findProperty("krakk_group") ?: "org.shipwrights.krakk"
+    version = findProperty("krakk_version") ?: "0.1.0-SNAPSHOT"
 }

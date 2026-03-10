@@ -56,14 +56,10 @@ Related record:
 
 Interface: `KrakkExplosionApi`
 
-Explosion simulation execution and global power/radius tuning.
+Explosion simulation execution.
 
 Methods:
 1. `void detonate(ServerLevel level, double x, double y, double z, Entity source, LivingEntity owner, KrakkExplosionProfile profile)`
-2. `void setPower(double impactPower)`
-3. `double getPower()`
-4. `double getDefaultPower()`
-5. `double getRadius()`
 
 Related record:
 1. `KrakkExplosionProfile(double impactPower, double blastRadius)`

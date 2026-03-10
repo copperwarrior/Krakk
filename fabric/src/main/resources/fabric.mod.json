@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "krakk",
+  "version": "${version}",
+  "name": "Krakk",
+  "description": "Standalone block damage and explosion simulation library mod.",
+  "authors": [
+    "Shipwrights"
+  ],
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "org.shipwrights.krakk.fabric.KrakkFabric"
+    ],
+    "client": [
+      "org.shipwrights.krakk.fabric.client.KrakkFabricClient"
+    ]
+  },
+  "mixins": [
+    "krakk.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.18.4",
+    "minecraft": "~1.20.1",
+    "java": ">=17",
+    "architectury": ">=9.2.14",
+    "fabric-api": "*"
+  }
+}
+

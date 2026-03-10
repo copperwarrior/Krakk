@@ -1,0 +1,96 @@
+plugins {
+    id 'dev.architectury.loom'
+    id 'architectury-plugin'
+    id 'maven-publish'
+    id 'com.github.johnrengelman.shadow'
+}
+
+def minecraftVersion = findProperty("minecraft_version") ?: "1.20.1"
+def architecturyApiVersion = findProperty("architectury_api_version") ?: "9.2.14"
+def forgeVersion = findProperty("forge_version") ?: "1.20.1-47.4.16"
+
+group = findProperty("krakk_group") ?: "org.shipwrights.krakk"
+version = findProperty("krakk_version") ?: "0.1.0-SNAPSHOT"
+
+base {
+    archivesName = "${findProperty("krakk_artifact") ?: "krakk"}-forge"
+}
+
+repositories {
+    mavenLocal()
+}
+
+loom {
+    forge {
+        mixinConfig "krakk.mixins.json"
+    }
+}
+
+architectury {
+    platformSetupLoomIde()
+    forge()
+}
+
+configurations {
+    common {
+        canBeResolved = true
+        canBeConsumed = false
+    }
+    compileClasspath.extendsFrom common
+    runtimeClasspath.extendsFrom common
+    developmentForge.extendsFrom common
+
+    shadowBundle {
+        canBeResolved = true
+        canBeConsumed = false
+    }
+}
+
+def krakkCommonProjectPath = findProject(':krakk-common') != null ? ':krakk-common' : ':krakkCommon'
+
+dependencies {
+    minecraft "net.minecraft:minecraft:${minecraftVersion}"
+    mappings loom.officialMojangMappings()
+
+    forge "net.minecraftforge:forge:${forgeVersion}"
+    modImplementation "dev.architectury:architectury-forge:${architecturyApiVersion}"
+
+    common(project(path: krakkCommonProjectPath, configuration: 'namedElements')) { transitive false }
+    shadowBundle project(path: krakkCommonProjectPath, configuration: 'transformProductionForge')
+}
+
+processResources {
+    inputs.property 'version', project.version
+
+    filesMatching('META-INF/mods.toml') {
+        expand version: project.version
+    }
+}
+
+shadowJar {
+    configurations = [project.configurations.shadowBundle]
+    archiveClassifier = 'dev-shadow'
+}
+
+remapJar {
+    input.set shadowJar.archiveFile
+}
+
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 17
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            artifactId = base.archivesName.get()
+            from components.java
+        }
+    }
+}

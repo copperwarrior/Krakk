@@ -23,8 +23,29 @@ Krakk is a standalone library mod focused on:
 
 Published coordinates:
 - Group: `org.shipwrights.krakk`
-- Artifact: `krakk`
+- Artifacts:
+  - `krakk-common`
+  - `krakk-fabric`
+  - `krakk-forge`
 - Version: `0.1.0-SNAPSHOT` (default in `gradle.properties`)
 
 ## API Reference
 - [KRAKK-API-REFERENCE.md](docs/KRAKK-API-REFERENCE.md)
+
+## Debug Commands
+All commands are under `/krakk` and require permission level 2.
+
+1. `setblockdamage <pos> <value>`
+2. `getblockdamage <pos>`
+3. `clearblockdamage <pos>`
+4. `fillblockdamage <from> <to> <value>`
+5. `clearareadamage <from> <to>`
+6. `damage <pos> <amount>`
+7. `areadamage <from> <to> <amount>`
+8. `explode <pos> <radius> <power>`
+9. `profexplode <pos> <radius> <power> [runs] [warmup] [seed] [apply]`
+10. `decaytick [ticks] [player]`
+11. `syncchunk [player]`
+12. `stats [player]`
+13. `overlay refresh [player]`
+14. `overlay clear [player]`

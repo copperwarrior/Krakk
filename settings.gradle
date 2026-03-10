@@ -8,3 +8,11 @@ pluginManagement {
 }
 
 rootProject.name = "krakk"
+
+include "krakk-common"
+include "krakk-fabric"
+include "krakk-forge"
+
+project(":krakk-common").projectDir = file("common")
+project(":krakk-fabric").projectDir = file("fabric")
+project(":krakk-forge").projectDir = file("forge")
