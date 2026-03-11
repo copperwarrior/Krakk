@@ -121,10 +121,6 @@ public final class KrakkBlockDamageNetwork implements KrakkNetworkApi {
     @Override
     public void sendSectionSnapshot(ServerPlayer player, ResourceLocation dimensionId,
                                     int sectionX, int sectionY, int sectionZ, Short2ByteOpenHashMap states) {
-        if (states.isEmpty()) {
-            return;
-        }
-
         FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
         buf.writeResourceLocation(dimensionId);
         buf.writeVarInt(sectionX);

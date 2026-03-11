@@ -62,7 +62,7 @@ Methods:
 1. `void detonate(ServerLevel level, double x, double y, double z, Entity source, LivingEntity owner, KrakkExplosionProfile profile)`
 
 Related record:
-1. `KrakkExplosionProfile(double impactPower, double blastRadius)`
+1. `KrakkExplosionProfile(double impactPower)`
 
 ## Client Overlay API
 

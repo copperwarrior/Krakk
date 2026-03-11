@@ -176,6 +176,14 @@ public final class KrakkBlockDamageChunkStorage {
         }
     }
 
+    public Short2ByteOpenHashMap snapshotSection(int sectionY) {
+        SectionDamageState section = this.sectionsByY.get(sectionY);
+        if (section == null || section.damageStates.isEmpty()) {
+            return new Short2ByteOpenHashMap();
+        }
+        return section.snapshotDamageStates();
+    }
+
     private void putInternal(int sectionY, short localIndex, byte damageState, long updateTick) {
         SectionDamageState section = this.sectionsByY.get(sectionY);
         if (section == null) {

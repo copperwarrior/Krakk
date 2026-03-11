@@ -23,6 +23,7 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.phys.Vec3;
 import org.shipwrights.krakk.api.KrakkApi;
 import org.shipwrights.krakk.api.explosion.KrakkExplosionProfile;
+import org.shipwrights.krakk.engine.explosion.KrakkExplosionCurves;
 import org.shipwrights.krakk.state.chunk.KrakkBlockDamageChunkAccess;
 import org.shipwrights.krakk.state.chunk.KrakkBlockDamageChunkStorage;
 import org.shipwrights.krakk.runtime.explosion.KrakkExplosionRuntime;
@@ -31,7 +32,6 @@ import java.util.Arrays;
 
 public final class KrakkDebugCommands {
     private static final int DEFAULT_MAX_POWER = 1_000_000;
-    private static final int DEFAULT_MAX_RADIUS = 1_000_000;
     private static final int DEFAULT_DECAY_TICKS = 24_000;
     private static final int DEFAULT_PROFILE_RUNS = 20;
     private static final int DEFAULT_PROFILE_WARMUP = 3;
@@ -69,66 +69,58 @@ public final class KrakkDebugCommands {
                                                         BlockPosArgument.getBlockPos(context, "to"))))))
                         .then(Commands.literal("explode")
                                 .then(Commands.argument("pos", Vec3Argument.vec3())
-                                        .then(Commands.argument("radius", DoubleArgumentType.doubleArg(0.1D, DEFAULT_MAX_RADIUS))
-                                                .then(Commands.argument("power", DoubleArgumentType.doubleArg(0.1D, DEFAULT_MAX_POWER))
-                                                        .executes(context -> explode(
-                                                                context.getSource(),
-                                                                Vec3Argument.getVec3(context, "pos"),
-                                                                DoubleArgumentType.getDouble(context, "radius"),
-                                                                DoubleArgumentType.getDouble(context, "power")))))))
+                                        .then(Commands.argument("power", DoubleArgumentType.doubleArg(0.1D, DEFAULT_MAX_POWER))
+                                                .executes(context -> explode(
+                                                        context.getSource(),
+                                                        Vec3Argument.getVec3(context, "pos"),
+                                                        DoubleArgumentType.getDouble(context, "power"))))))
                         .then(Commands.literal("profexplode")
                                 .then(Commands.argument("pos", Vec3Argument.vec3())
-                                        .then(Commands.argument("radius", DoubleArgumentType.doubleArg(0.1D, DEFAULT_MAX_RADIUS))
-                                                .then(Commands.argument("power", DoubleArgumentType.doubleArg(0.1D, DEFAULT_MAX_POWER))
+                                        .then(Commands.argument("power", DoubleArgumentType.doubleArg(0.1D, DEFAULT_MAX_POWER))
+                                                .executes(context -> profExplode(
+                                                        context.getSource(),
+                                                        Vec3Argument.getVec3(context, "pos"),
+                                                        DoubleArgumentType.getDouble(context, "power"),
+                                                        DEFAULT_PROFILE_RUNS,
+                                                        DEFAULT_PROFILE_WARMUP,
+                                                        Long.MIN_VALUE,
+                                                        false))
+                                                .then(Commands.argument("runs", IntegerArgumentType.integer(1, 200))
                                                         .executes(context -> profExplode(
                                                                 context.getSource(),
                                                                 Vec3Argument.getVec3(context, "pos"),
-                                                                DoubleArgumentType.getDouble(context, "radius"),
                                                                 DoubleArgumentType.getDouble(context, "power"),
-                                                                DEFAULT_PROFILE_RUNS,
+                                                                IntegerArgumentType.getInteger(context, "runs"),
                                                                 DEFAULT_PROFILE_WARMUP,
                                                                 Long.MIN_VALUE,
                                                                 false))
-                                                        .then(Commands.argument("runs", IntegerArgumentType.integer(1, 200))
+                                                        .then(Commands.argument("warmup", IntegerArgumentType.integer(0, 200))
                                                                 .executes(context -> profExplode(
                                                                         context.getSource(),
                                                                         Vec3Argument.getVec3(context, "pos"),
-                                                                        DoubleArgumentType.getDouble(context, "radius"),
                                                                         DoubleArgumentType.getDouble(context, "power"),
                                                                         IntegerArgumentType.getInteger(context, "runs"),
-                                                                        DEFAULT_PROFILE_WARMUP,
+                                                                        IntegerArgumentType.getInteger(context, "warmup"),
                                                                         Long.MIN_VALUE,
                                                                         false))
-                                                                .then(Commands.argument("warmup", IntegerArgumentType.integer(0, 200))
+                                                                .then(Commands.argument("seed", LongArgumentType.longArg())
                                                                         .executes(context -> profExplode(
                                                                                 context.getSource(),
                                                                                 Vec3Argument.getVec3(context, "pos"),
-                                                                                DoubleArgumentType.getDouble(context, "radius"),
                                                                                 DoubleArgumentType.getDouble(context, "power"),
                                                                                 IntegerArgumentType.getInteger(context, "runs"),
                                                                                 IntegerArgumentType.getInteger(context, "warmup"),
-                                                                                Long.MIN_VALUE,
+                                                                                LongArgumentType.getLong(context, "seed"),
                                                                                 false))
-                                                                        .then(Commands.argument("seed", LongArgumentType.longArg())
+                                                                        .then(Commands.argument("apply", BoolArgumentType.bool())
                                                                                 .executes(context -> profExplode(
                                                                                         context.getSource(),
                                                                                         Vec3Argument.getVec3(context, "pos"),
-                                                                                        DoubleArgumentType.getDouble(context, "radius"),
                                                                                         DoubleArgumentType.getDouble(context, "power"),
                                                                                         IntegerArgumentType.getInteger(context, "runs"),
                                                                                         IntegerArgumentType.getInteger(context, "warmup"),
                                                                                         LongArgumentType.getLong(context, "seed"),
-                                                                                        false))
-                                                                                .then(Commands.argument("apply", BoolArgumentType.bool())
-                                                                                        .executes(context -> profExplode(
-                                                                                                context.getSource(),
-                                                                                                Vec3Argument.getVec3(context, "pos"),
-                                                                                                DoubleArgumentType.getDouble(context, "radius"),
-                                                                                                DoubleArgumentType.getDouble(context, "power"),
-                                                                                                IntegerArgumentType.getInteger(context, "runs"),
-                                                                                                IntegerArgumentType.getInteger(context, "warmup"),
-                                                                                                LongArgumentType.getLong(context, "seed"),
-                                                                                                BoolArgumentType.getBool(context, "apply")))))))))))
+                                                                                        BoolArgumentType.getBool(context, "apply"))))))))))
                         .then(Commands.literal("fillblockdamage")
                                 .then(Commands.argument("from", BlockPosArgument.blockPos())
                                         .then(Commands.argument("to", BlockPosArgument.blockPos())
@@ -273,10 +265,11 @@ public final class KrakkDebugCommands {
         return cleared;
     }
 
-    private static int explode(CommandSourceStack source, Vec3 pos, double radius, double power) {
+    private static int explode(CommandSourceStack source, Vec3 pos, double power) {
         ServerLevel level = source.getLevel();
         Entity sourceEntity = source.getEntity();
         LivingEntity owner = sourceEntity instanceof LivingEntity living ? living : null;
+        double derivedRadius = KrakkExplosionCurves.computeBlastRadius(power);
         KrakkApi.explosions().detonate(
                 level,
                 pos.x,
@@ -284,17 +277,17 @@ public final class KrakkDebugCommands {
                 pos.z,
                 sourceEntity,
                 owner,
-                new KrakkExplosionProfile(power, radius)
+                new KrakkExplosionProfile(power)
         );
 
         source.sendSuccess(() -> Component.literal(String.format(
-                "Triggered Krakk explosion at %.2f %.2f %.2f (radius=%.2f, power=%.2f)",
-                pos.x, pos.y, pos.z, radius, power
+                "Triggered Krakk explosion at %.2f %.2f %.2f (power=%.2f, derivedRadius=%.2f)",
+                pos.x, pos.y, pos.z, power, derivedRadius
         )), true);
         return 1;
     }
 
-    private static int profExplode(CommandSourceStack source, Vec3 pos, double radius, double power,
+    private static int profExplode(CommandSourceStack source, Vec3 pos, double power,
                                    int runs, int warmup, long seed, boolean apply) {
         if (!(KrakkApi.explosions() instanceof KrakkExplosionRuntime runtime)) {
             source.sendFailure(Component.literal("Krakk explosion runtime does not support profiling."));
@@ -304,11 +297,28 @@ public final class KrakkDebugCommands {
         ServerLevel level = source.getLevel();
         Entity sourceEntity = source.getEntity();
         LivingEntity owner = sourceEntity instanceof LivingEntity living ? living : null;
-        KrakkExplosionProfile profile = new KrakkExplosionProfile(power, radius);
+        KrakkExplosionProfile profile = new KrakkExplosionProfile(power);
         long effectiveSeed = seed != Long.MIN_VALUE ? seed : (level.getGameTime() ^ BlockPos.containing(pos).asLong());
 
+        ProfileAggregate aggregate = profileMode(
+                runtime, level, sourceEntity, owner, pos, profile, apply, runs, warmup, effectiveSeed
+        );
+        emitProfileAggregate(source, apply, runs, warmup, effectiveSeed, aggregate);
+        return runs;
+    }
+
+    private static ProfileAggregate profileMode(KrakkExplosionRuntime runtime,
+                                                ServerLevel level,
+                                                Entity sourceEntity,
+                                                LivingEntity owner,
+                                                Vec3 pos,
+                                                KrakkExplosionProfile profile,
+                                                boolean apply,
+                                                int runs,
+                                                int warmup,
+                                                long seed) {
         for (int i = 0; i < warmup; i++) {
-            runtime.profileDetonate(level, pos.x, pos.y, pos.z, sourceEntity, owner, profile, apply, effectiveSeed);
+            runtime.profileDetonate(level, pos.x, pos.y, pos.z, sourceEntity, owner, profile, apply, seed);
         }
 
         long[] nanos = new long[runs];
@@ -319,6 +329,7 @@ public final class KrakkDebugCommands {
         long totalInitialRays = 0L;
         long totalProcessedRays = 0L;
         long totalRaySplits = 0L;
+        long totalSplitChecks = 0L;
         long totalRaySteps = 0L;
         long totalRawImpacts = 0L;
         long totalPostAaImpacts = 0L;
@@ -329,12 +340,28 @@ public final class KrakkDebugCommands {
         long totalPredictedDamaged = 0L;
         long totalTnt = 0L;
         long totalSpecial = 0L;
+        long totalLowImpactSkipped = 0L;
+        long totalEntityCandidates = 0L;
+        long totalEntityIntersectionTests = 0L;
+        long totalEntityHits = 0L;
+        long totalOctreeNodeTests = 0L;
+        long totalOctreeLeafVisits = 0L;
+        long totalEntityAffected = 0L;
+        long totalEntityDamaged = 0L;
+        long totalEntityKilled = 0L;
+        long totalBroadphaseNanos = 0L;
+        long totalRaycastNanos = 0L;
+        long totalAntialiasNanos = 0L;
+        long totalBlockResolveNanos = 0L;
+        long totalSplitCheckNanos = 0L;
+        long totalEntitySegmentNanos = 0L;
+        long totalEntityApplyNanos = 0L;
         long totalPackets = 0L;
         long totalBytes = 0L;
 
         for (int i = 0; i < runs; i++) {
             KrakkExplosionRuntime.ExplosionProfileReport report = runtime.profileDetonate(
-                    level, pos.x, pos.y, pos.z, sourceEntity, owner, profile, apply, effectiveSeed
+                    level, pos.x, pos.y, pos.z, sourceEntity, owner, profile, apply, seed
             );
             nanos[i] = report.elapsedNanos();
             sumNanos += report.elapsedNanos();
@@ -343,6 +370,7 @@ public final class KrakkDebugCommands {
             totalInitialRays += report.initialRays();
             totalProcessedRays += report.processedRays();
             totalRaySplits += report.raySplits();
+            totalSplitChecks += report.splitChecks();
             totalRaySteps += report.raySteps();
             totalRawImpacts += report.rawImpactedBlocks();
             totalPostAaImpacts += report.postAaImpactedBlocks();
@@ -353,6 +381,22 @@ public final class KrakkDebugCommands {
             totalPredictedDamaged += report.predictedDamagedBlocks();
             totalTnt += report.tntTriggered();
             totalSpecial += report.specialHandled();
+            totalLowImpactSkipped += report.lowImpactSkipped();
+            totalEntityCandidates += report.entityCandidates();
+            totalEntityIntersectionTests += report.entityIntersectionTests();
+            totalEntityHits += report.entityHits();
+            totalOctreeNodeTests += report.octreeNodeTests();
+            totalOctreeLeafVisits += report.octreeLeafVisits();
+            totalEntityAffected += report.entityAffected();
+            totalEntityDamaged += report.entityDamaged();
+            totalEntityKilled += report.entityKilled();
+            totalBroadphaseNanos += report.broadphaseNanos();
+            totalRaycastNanos += report.raycastNanos();
+            totalAntialiasNanos += report.antialiasNanos();
+            totalBlockResolveNanos += report.blockResolveNanos();
+            totalSplitCheckNanos += report.splitCheckNanos();
+            totalEntitySegmentNanos += report.entitySegmentNanos();
+            totalEntityApplyNanos += report.entityApplyNanos();
             totalPackets += report.estimatedSyncPackets();
             totalBytes += report.estimatedSyncBytes();
         }
@@ -361,50 +405,141 @@ public final class KrakkDebugCommands {
         Arrays.sort(sorted);
         long p95 = sorted[percentileIndex(sorted.length, 0.95D)];
         long p99 = sorted[percentileIndex(sorted.length, 0.99D)];
-        double avgMs = nanosToMs(sumNanos / (double) runs);
-        double minMs = nanosToMs(minNanos);
-        double maxMs = nanosToMs(maxNanos);
-        double p95Ms = nanosToMs(p95);
-        double p99Ms = nanosToMs(p99);
-
-        source.sendSuccess(() -> Component.literal(String.format(
-                "Krakk profexplode: apply=%s runs=%d warmup=%d seed=%d avg=%.3fms p95=%.3fms p99=%.3fms min=%.3fms max=%.3fms",
-                apply, runs, warmup, effectiveSeed, avgMs, p95Ms, p99Ms, minMs, maxMs
-        )), false);
-
         long brokenOut = apply ? totalBroken : totalPredictedBroken;
         long damagedOut = apply ? totalDamaged : totalPredictedDamaged;
-        final double avgInitialRays = totalInitialRays / (double) runs;
-        final double avgProcessedRays = totalProcessedRays / (double) runs;
-        final double avgRaySplits = totalRaySplits / (double) runs;
-        final double avgRaySteps = totalRaySteps / (double) runs;
-        final double avgRawImpacts = totalRawImpacts / (double) runs;
-        final double avgPostAaImpacts = totalPostAaImpacts / (double) runs;
-        final double avgBlocksEvaluated = totalBlocksEvaluated / (double) runs;
-        final double avgBroken = brokenOut / (double) runs;
-        final double avgDamaged = damagedOut / (double) runs;
-        final double avgTnt = totalTnt / (double) runs;
-        final double avgSpecial = totalSpecial / (double) runs;
-        final double avgPackets = totalPackets / (double) runs;
-        final double avgBytes = totalBytes / (double) runs;
-        source.sendSuccess(() -> Component.literal(String.format(
-                "avgMetrics: rays(initial=%.1f processed=%.1f splits=%.1f steps=%.1f) impacts(raw=%.1f postAA=%.1f) blocks(eval=%.1f broken=%.1f damaged=%.1f tnt=%.1f special=%.1f) syncEst(packets=%.1f bytes=%.1f)",
-                avgInitialRays,
-                avgProcessedRays,
-                avgRaySplits,
-                avgRaySteps,
-                avgRawImpacts,
-                avgPostAaImpacts,
-                avgBlocksEvaluated,
-                avgBroken,
-                avgDamaged,
-                avgTnt,
-                avgSpecial,
-                avgPackets,
-                avgBytes
-        )), false);
 
-        return runs;
+        return new ProfileAggregate(
+                nanosToMs(sumNanos / (double) runs),
+                nanosToMs(minNanos),
+                nanosToMs(maxNanos),
+                nanosToMs(p95),
+                nanosToMs(p99),
+                totalInitialRays / (double) runs,
+                totalProcessedRays / (double) runs,
+                totalRaySplits / (double) runs,
+                totalSplitChecks / (double) runs,
+                totalRaySteps / (double) runs,
+                totalRawImpacts / (double) runs,
+                totalPostAaImpacts / (double) runs,
+                totalLowImpactSkipped / (double) runs,
+                totalBlocksEvaluated / (double) runs,
+                brokenOut / (double) runs,
+                damagedOut / (double) runs,
+                totalTnt / (double) runs,
+                totalSpecial / (double) runs,
+                totalEntityCandidates / (double) runs,
+                totalEntityIntersectionTests / (double) runs,
+                totalEntityHits / (double) runs,
+                totalOctreeNodeTests / (double) runs,
+                totalOctreeLeafVisits / (double) runs,
+                totalEntityAffected / (double) runs,
+                totalEntityDamaged / (double) runs,
+                totalEntityKilled / (double) runs,
+                nanosToMs(totalBroadphaseNanos / (double) runs),
+                nanosToMs(totalRaycastNanos / (double) runs),
+                nanosToMs(totalAntialiasNanos / (double) runs),
+                nanosToMs(totalBlockResolveNanos / (double) runs),
+                nanosToMs(totalSplitCheckNanos / (double) runs),
+                nanosToMs(totalEntitySegmentNanos / (double) runs),
+                nanosToMs(totalEntityApplyNanos / (double) runs),
+                totalPackets / (double) runs,
+                totalBytes / (double) runs
+        );
+    }
+
+    private static void emitProfileAggregate(CommandSourceStack source,
+                                             boolean apply,
+                                             int runs,
+                                             int warmup,
+                                             long seed,
+                                             ProfileAggregate aggregate) {
+        source.sendSuccess(() -> Component.literal(String.format(
+                "Krakk profexplode: apply=%s runs=%d warmup=%d seed=%d avg=%.3fms p95=%.3fms p99=%.3fms min=%.3fms max=%.3fms",
+                apply,
+                runs,
+                warmup,
+                seed,
+                aggregate.avgMs,
+                aggregate.p95Ms,
+                aggregate.p99Ms,
+                aggregate.minMs,
+                aggregate.maxMs
+        )), false);
+        source.sendSuccess(() -> Component.literal(String.format(
+                "avgMetrics: rays(initial=%.1f processed=%.1f splits=%.1f checks=%.1f steps=%.1f) impacts(raw=%.1f postAA=%.1f lowSkip=%.1f) blocks(eval=%.1f broken=%.1f damaged=%.1f tnt=%.1f special=%.1f) entities(candidates=%.1f tests=%.1f hits=%.1f octree(nodes=%.1f leaves=%.1f) affected=%.1f damaged=%.1f killed=%.1f) syncEst(packets=%.1f bytes=%.1f)",
+                aggregate.avgInitialRays,
+                aggregate.avgProcessedRays,
+                aggregate.avgRaySplits,
+                aggregate.avgSplitChecks,
+                aggregate.avgRaySteps,
+                aggregate.avgRawImpacts,
+                aggregate.avgPostAaImpacts,
+                aggregate.avgLowImpactSkipped,
+                aggregate.avgBlocksEvaluated,
+                aggregate.avgBroken,
+                aggregate.avgDamaged,
+                aggregate.avgTnt,
+                aggregate.avgSpecial,
+                aggregate.avgEntityCandidates,
+                aggregate.avgEntityIntersectionTests,
+                aggregate.avgEntityHits,
+                aggregate.avgOctreeNodeTests,
+                aggregate.avgOctreeLeafVisits,
+                aggregate.avgEntityAffected,
+                aggregate.avgEntityDamaged,
+                aggregate.avgEntityKilled,
+                aggregate.avgPackets,
+                aggregate.avgBytes
+        )), false);
+        source.sendSuccess(() -> Component.literal(String.format(
+                "avgStages: broadphase=%.3fms raycast=%.3fms antialias=%.3fms blockResolve=%.3fms splitChecks=%.3fms entitySegment=%.3fms entityApply=%.3fms",
+                aggregate.avgBroadphaseMs,
+                aggregate.avgRaycastMs,
+                aggregate.avgAntialiasMs,
+                aggregate.avgBlockResolveMs,
+                aggregate.avgSplitCheckMs,
+                aggregate.avgEntitySegmentMs,
+                aggregate.avgEntityApplyMs
+        )), false);
+    }
+
+    private record ProfileAggregate(
+            double avgMs,
+            double minMs,
+            double maxMs,
+            double p95Ms,
+            double p99Ms,
+            double avgInitialRays,
+            double avgProcessedRays,
+            double avgRaySplits,
+            double avgSplitChecks,
+            double avgRaySteps,
+            double avgRawImpacts,
+            double avgPostAaImpacts,
+            double avgLowImpactSkipped,
+            double avgBlocksEvaluated,
+            double avgBroken,
+            double avgDamaged,
+            double avgTnt,
+            double avgSpecial,
+            double avgEntityCandidates,
+            double avgEntityIntersectionTests,
+            double avgEntityHits,
+            double avgOctreeNodeTests,
+            double avgOctreeLeafVisits,
+            double avgEntityAffected,
+            double avgEntityDamaged,
+            double avgEntityKilled,
+            double avgBroadphaseMs,
+            double avgRaycastMs,
+            double avgAntialiasMs,
+            double avgBlockResolveMs,
+            double avgSplitCheckMs,
+            double avgEntitySegmentMs,
+            double avgEntityApplyMs,
+            double avgPackets,
+            double avgBytes
+    ) {
     }
 
     private static int percentileIndex(int length, double percentile) {
