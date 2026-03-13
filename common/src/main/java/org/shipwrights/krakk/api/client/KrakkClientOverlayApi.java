@@ -24,6 +24,11 @@ public interface KrakkClientOverlayApi {
     void applySection(ResourceLocation dimensionId, int sectionX, int sectionY, int sectionZ, Short2ByteOpenHashMap sectionStates);
 
     /**
+     * Applies a section delta of changed damage states.
+     */
+    void applySectionDelta(ResourceLocation dimensionId, int sectionX, int sectionY, int sectionZ, Short2ByteOpenHashMap sectionStates);
+
+    /**
      * Clears all cached damage states for a chunk.
      */
     void clearChunk(ResourceLocation dimensionId, int chunkX, int chunkZ);

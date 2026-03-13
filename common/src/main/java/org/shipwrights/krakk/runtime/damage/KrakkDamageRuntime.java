@@ -1,11 +1,10 @@
 package org.shipwrights.krakk.runtime.damage;
 
-import it.unimi.dsi.fastutil.longs.LongIterator;
-import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.longs.Long2ByteMap;
+import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.shorts.Short2ByteOpenHashMap;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
-import net.minecraft.core.SectionPos;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -28,6 +27,7 @@ import org.shipwrights.krakk.engine.damage.KrakkDamageCurves;
 import org.shipwrights.krakk.engine.damage.KrakkDamageDecay;
 import org.shipwrights.krakk.state.chunk.KrakkBlockDamageChunkAccess;
 import org.shipwrights.krakk.state.chunk.KrakkBlockDamageChunkStorage;
+import org.shipwrights.krakk.state.network.KrakkServerChunkCacheAccess;
 
 import java.util.HashMap;
 import java.util.Iterator;
@@ -43,11 +43,24 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
     private static final float STONE_EQUIVALENT_RESISTANCE = 6.0F;
     private static final long DAMAGE_DECAY_INTERVAL_TICKS = 24_000L;
     private static final int CONNECT_SYNC_DELAY_TICKS = 12;
-    private static final int CONNECT_SYNC_ATTEMPTS = 20;
+    private static final int CONNECT_SYNC_PASSES = 1;
+    private static final int CONNECT_SYNC_COLUMNS_PER_TICK = 2;
     private static final Map<UUID, PendingSync> PENDING_PLAYER_SYNCS = new HashMap<>();
     private static final ThreadLocal<SyncBatchContext> SYNC_BATCH = new ThreadLocal<>();
+    private static volatile DamageStateConversionHandler damageStateConversionHandler = DamageStateConversionHandler.NOOP;
 
     public KrakkDamageRuntime() {
+    }
+
+    @FunctionalInterface
+    public interface DamageStateConversionHandler {
+        DamageStateConversionHandler NOOP = (level, blockPos, blockState, damageState) -> false;
+
+        boolean apply(ServerLevel level, BlockPos blockPos, BlockState blockState, int damageState);
+    }
+
+    public static void setDamageStateConversionHandler(DamageStateConversionHandler handler) {
+        damageStateConversionHandler = handler == null ? DamageStateConversionHandler.NOOP : handler;
     }
 
     public static void runBatchedSync(ServerLevel level, Runnable action) {
@@ -87,6 +100,16 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
     @Override
     public KrakkImpactResult applyImpact(ServerLevel level, BlockPos blockPos, BlockState blockState, Entity source,
                                          double impactPower, boolean dropOnBreak) {
+        return applyImpactInternal(level, blockPos, blockState, source, impactPower, dropOnBreak, false);
+    }
+
+    public KrakkImpactResult applyImpactPrevalidated(ServerLevel level, BlockPos blockPos, BlockState blockState, Entity source,
+                                                     double impactPower, boolean dropOnBreak) {
+        return applyImpactInternal(level, blockPos, blockState, source, impactPower, dropOnBreak, true);
+    }
+
+    private KrakkImpactResult applyImpactInternal(ServerLevel level, BlockPos blockPos, BlockState blockState, Entity source,
+                                                  double impactPower, boolean dropOnBreak, boolean prevalidatedState) {
         if (blockState.isAir()) {
             clearDamage(level, blockPos);
             return new KrakkImpactResult(false, NO_DAMAGE_STATE);
@@ -104,17 +127,16 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
 
         float resistance = fluidBlock ? STONE_EQUIVALENT_RESISTANCE : blockState.getBlock().getExplosionResistance();
         int addedState = computeDamageStateDelta(blockState, impactPower, resistance, hardness);
+        int previousState = prevalidatedState ? getDamageStateUnchecked(level, blockPos) : getDamageState(level, blockPos);
         if (addedState <= 0) {
-            return new KrakkImpactResult(false, getDamageState(level, blockPos));
+            return new KrakkImpactResult(false, previousState);
         }
 
-        int previousState = getDamageState(level, blockPos);
         int nextState = clamp(previousState + addedState, 0, MAX_DAMAGE_STATE);
 
         if (fluidBlock) {
             if (nextState >= FLUID_REMOVE_THRESHOLD) {
                 if (level.setBlock(blockPos, Blocks.AIR.defaultBlockState(), 3)) {
-                    clearDamage(level, blockPos);
                     return new KrakkImpactResult(true, NO_DAMAGE_STATE);
                 }
                 setDamageState(level, blockPos, nextState);
@@ -183,7 +205,7 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
     }
 
     public void queueConnectSync(ServerPlayer player) {
-        PENDING_PLAYER_SYNCS.put(player.getUUID(), new PendingSync(CONNECT_SYNC_DELAY_TICKS, CONNECT_SYNC_ATTEMPTS));
+        PENDING_PLAYER_SYNCS.put(player.getUUID(), new PendingSync(CONNECT_SYNC_DELAY_TICKS, CONNECT_SYNC_PASSES));
     }
 
     @Override
@@ -210,8 +232,8 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
         while (iterator.hasNext()) {
             Map.Entry<UUID, PendingSync> entry = iterator.next();
             PendingSync pending = entry.getValue();
-            if (pending.ticksUntilNextAttempt > 0) {
-                pending.ticksUntilNextAttempt--;
+            if (pending.ticksUntilNextStep > 0) {
+                pending.ticksUntilNextStep--;
                 continue;
             }
 
@@ -221,15 +243,46 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
                 continue;
             }
 
-            syncAllDamageStatesToPlayer(player);
-
-            pending.attemptsRemaining--;
-            if (pending.attemptsRemaining <= 0) {
+            pending.initializeForPlayer(player);
+            syncQueuedPlayerStep(player, pending);
+            if (pending.passesRemaining <= 0) {
                 iterator.remove();
-            } else {
-                pending.ticksUntilNextAttempt = CONNECT_SYNC_DELAY_TICKS;
             }
         }
+    }
+
+    private void syncQueuedPlayerStep(ServerPlayer player, PendingSync pending) {
+        ServerLevel level = player.serverLevel();
+        int columnsProcessed = 0;
+        while (columnsProcessed < CONNECT_SYNC_COLUMNS_PER_TICK && pending.passesRemaining > 0) {
+            syncChunkColumnToPlayer(player, level, pending.cursorChunkX, pending.cursorChunkZ, false);
+            columnsProcessed++;
+            if (advancePendingChunkCursor(pending)) {
+                continue;
+            }
+
+            pending.passesRemaining--;
+            if (pending.passesRemaining <= 0) {
+                return;
+            }
+            pending.ticksUntilNextStep = CONNECT_SYNC_DELAY_TICKS;
+            pending.dimensionId = null;
+            pending.initializeForPlayer(player);
+            return;
+        }
+    }
+
+    private static boolean advancePendingChunkCursor(PendingSync pending) {
+        if (pending.cursorChunkZ < pending.maxChunkZ) {
+            pending.cursorChunkZ++;
+            return true;
+        }
+        if (pending.cursorChunkX < pending.maxChunkX) {
+            pending.cursorChunkX++;
+            pending.cursorChunkZ = pending.minChunkZ;
+            return true;
+        }
+        return false;
     }
 
     public void syncAllDamageStatesToPlayer(ServerPlayer player) {
@@ -255,14 +308,15 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
         if (!(chunk instanceof KrakkBlockDamageChunkAccess access)) {
             return;
         }
+        ResourceLocation dimensionId = level.dimension().location();
 
-        access.krakk$getBlockDamageStorage().forEachSection((sectionY, states) -> {
+        access.krakk$getBlockDamageStorage().forEachSectionView((sectionY, states) -> {
             if (states.isEmpty()) {
                 return;
             }
             KrakkApi.network().sendSectionSnapshot(
                     player,
-                    level.dimension().location(),
+                    dimensionId,
                     chunkX,
                     sectionY,
                     chunkZ,
@@ -475,7 +529,10 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
             clearDamage(level, blockPos);
             return 0;
         }
+        return getDamageStateUnchecked(level, blockPos);
+    }
 
+    private int getDamageStateUnchecked(ServerLevel level, BlockPos blockPos) {
         ChunkStorageRef ref = getChunkStorage(level, blockPos, false);
         if (ref == null) {
             return 0;
@@ -536,6 +593,12 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
         if (previousState != clampedState) {
             syncDamageState(level, blockPos, clampedState);
         }
+        if (clampedState > 0) {
+            BlockState liveState = level.getBlockState(blockPos);
+            if (!liveState.isAir()) {
+                damageStateConversionHandler.apply(level, blockPos, liveState, clampedState);
+            }
+        }
     }
 
     private ChunkStorageRef getChunkStorage(ServerLevel level, BlockPos blockPos, boolean loadIfMissing) {
@@ -590,7 +653,6 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
     }
 
     private KrakkImpactResult breakDamagedBlock(ServerLevel level, BlockPos blockPos, Entity source, boolean dropOnBreak) {
-        clearDamage(level, blockPos);
         boolean broken = level.destroyBlock(blockPos, dropOnBreak, source);
         if (!broken) {
             int fallbackState = MAX_DAMAGE_STATE - 1;
@@ -603,63 +665,41 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
     private void syncDamageState(ServerLevel level, BlockPos blockPos, int damageState) {
         SyncBatchContext batch = SYNC_BATCH.get();
         if (batch != null && batch.level == level) {
-            batch.markDirtySection(blockPos);
+            batch.markDirtyPosition(blockPos, damageState);
+            return;
+        }
+        markDamageStateChanged(level, blockPos, damageState);
+    }
+
+    private static void markDamageStateChanged(ServerLevel level, BlockPos blockPos, int damageState) {
+        if (level.getChunkSource() instanceof KrakkServerChunkCacheAccess access) {
+            access.krakk$damageStateChanged(blockPos);
             return;
         }
         KrakkApi.network().sendDamageSync(level, blockPos, damageState);
     }
 
     private static void flushBatchedSync(SyncBatchContext context) {
-        if (context.dirtySections.isEmpty()) {
+        if (context.dirtyPositions.isEmpty()) {
             return;
         }
 
-        ServerLevel level = context.level;
-        ResourceLocation dimensionId = level.dimension().location();
-        int viewDistance = level.getServer().getPlayerList().getViewDistance() + 1;
-        LongIterator sectionIterator = context.dirtySections.iterator();
-        while (sectionIterator.hasNext()) {
-            long sectionKey = sectionIterator.nextLong();
-            int sectionX = SectionPos.x(sectionKey);
-            int sectionY = SectionPos.y(sectionKey);
-            int sectionZ = SectionPos.z(sectionKey);
-            LevelChunk chunk = level.getChunkSource().getChunkNow(sectionX, sectionZ);
-            if (!(chunk instanceof KrakkBlockDamageChunkAccess access)) {
-                continue;
-            }
-
-            Short2ByteOpenHashMap snapshot = access.krakk$getBlockDamageStorage().snapshotSection(sectionY);
-            for (ServerPlayer player : level.players()) {
-                if (player.level() != level) {
-                    continue;
-                }
-                ChunkPos playerChunk = player.chunkPosition();
-                if (Math.abs(playerChunk.x - sectionX) > viewDistance || Math.abs(playerChunk.z - sectionZ) > viewDistance) {
-                    continue;
-                }
-                KrakkApi.network().sendSectionSnapshot(
-                        player,
-                        dimensionId,
-                        sectionX,
-                        sectionY,
-                        sectionZ,
-                        snapshot
-                );
-            }
+        for (Long2ByteMap.Entry entry : context.dirtyPositions.long2ByteEntrySet()) {
+            markDamageStateChanged(context.level, BlockPos.of(entry.getLongKey()), entry.getByteValue());
         }
     }
 
     private static final class SyncBatchContext {
         private final ServerLevel level;
-        private final LongOpenHashSet dirtySections = new LongOpenHashSet();
+        private final Long2ByteOpenHashMap dirtyPositions = new Long2ByteOpenHashMap();
         private int depth = 1;
 
         private SyncBatchContext(ServerLevel level) {
             this.level = level;
         }
 
-        private void markDirtySection(BlockPos pos) {
-            this.dirtySections.add(SectionPos.asLong(pos.getX() >> 4, pos.getY() >> 4, pos.getZ() >> 4));
+        private void markDirtyPosition(BlockPos pos, int damageState) {
+            this.dirtyPositions.put(pos.asLong(), (byte) clamp(damageState, 0, MAX_DAMAGE_STATE));
         }
     }
 
@@ -667,12 +707,37 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
     }
 
     private static final class PendingSync {
-        private int ticksUntilNextAttempt;
-        private int attemptsRemaining;
+        private int ticksUntilNextStep;
+        private int passesRemaining;
+        private ResourceLocation dimensionId;
+        private int minChunkX;
+        private int maxChunkX;
+        private int minChunkZ;
+        private int maxChunkZ;
+        private int cursorChunkX;
+        private int cursorChunkZ;
 
-        private PendingSync(int ticksUntilNextAttempt, int attemptsRemaining) {
-            this.ticksUntilNextAttempt = ticksUntilNextAttempt;
-            this.attemptsRemaining = attemptsRemaining;
+        private PendingSync(int ticksUntilNextStep, int passesRemaining) {
+            this.ticksUntilNextStep = ticksUntilNextStep;
+            this.passesRemaining = passesRemaining;
+        }
+
+        private void initializeForPlayer(ServerPlayer player) {
+            ServerLevel level = player.serverLevel();
+            ResourceLocation currentDimensionId = level.dimension().location();
+            if (currentDimensionId.equals(this.dimensionId)) {
+                return;
+            }
+
+            ChunkPos centerChunk = player.chunkPosition();
+            int viewDistance = level.getServer().getPlayerList().getViewDistance() + 1;
+            this.minChunkX = centerChunk.x - viewDistance;
+            this.maxChunkX = centerChunk.x + viewDistance;
+            this.minChunkZ = centerChunk.z - viewDistance;
+            this.maxChunkZ = centerChunk.z + viewDistance;
+            this.cursorChunkX = this.minChunkX;
+            this.cursorChunkZ = this.minChunkZ;
+            this.dimensionId = currentDimensionId;
         }
     }
 

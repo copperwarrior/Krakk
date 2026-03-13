@@ -194,6 +194,11 @@ public final class KrakkApi {
         }
 
         @Override
+        public void applySectionDelta(ResourceLocation dimensionId, int sectionX, int sectionY, int sectionZ,
+                                      Short2ByteOpenHashMap sectionStates) {
+        }
+
+        @Override
         public void clearChunk(ResourceLocation dimensionId, int chunkX, int chunkZ) {
         }
 
@@ -223,8 +228,22 @@ public final class KrakkApi {
         }
 
         @Override
+        public void sendDamageSyncBatch(java.util.List<ServerPlayer> players, ResourceLocation dimensionId, long posLong, int damageState) {
+        }
+
+        @Override
         public void sendSectionSnapshot(ServerPlayer player, ResourceLocation dimensionId, int sectionX, int sectionY, int sectionZ,
                                         Short2ByteOpenHashMap states) {
+        }
+
+        @Override
+        public void sendSectionSnapshotBatch(java.util.List<ServerPlayer> players, ResourceLocation dimensionId,
+                                             int sectionX, int sectionY, int sectionZ, Short2ByteOpenHashMap states) {
+        }
+
+        @Override
+        public void sendSectionDeltaBatch(java.util.List<ServerPlayer> players, ResourceLocation dimensionId,
+                                          int sectionX, int sectionY, int sectionZ, Short2ByteOpenHashMap states) {
         }
 
         @Override

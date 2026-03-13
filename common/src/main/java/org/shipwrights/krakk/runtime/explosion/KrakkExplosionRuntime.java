@@ -2,13 +2,16 @@ package org.shipwrights.krakk.runtime.explosion;
 
 import it.unimi.dsi.fastutil.bytes.ByteArrayList;
 import it.unimi.dsi.fastutil.doubles.DoubleArrayList;
+import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.Int2DoubleOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.Long2ByteMap;
 import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2DoubleMap;
 import it.unimi.dsi.fastutil.longs.Long2DoubleOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2FloatOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.minecraft.core.BlockPos;
@@ -42,8 +45,14 @@ import org.shipwrights.krakk.runtime.damage.KrakkDamageRuntime;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.BitSet;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.Future;
 
 public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final int MIN_RAY_COUNT = 640;
@@ -128,6 +137,73 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final double POST_EDGE_PEAK_SCALE = 0.10D;
     private static final int POST_EDGE_MAX_DAMAGE_STATE = 6;
     private static final double MAX_BLOCK_IMPACT_MULTIPLIER = 2.5D;
+    private static final int VOLUMETRIC_MAX_RADIUS = 96;
+    private static final double VOLUMETRIC_MIN_ENERGY = 1.0E-6D;
+    private static final double VOLUMETRIC_DEFORM_SAMPLE_STEP = 0.5D;
+    private static final double VOLUMETRIC_PRESSURE_AIR_DECAY_PER_BLOCK = 0.01D;
+    private static final double VOLUMETRIC_PRESSURE_RESISTANCE_LOSS_SCALE = 0.04D;
+    private static final double VOLUMETRIC_PRESSURE_DIFFUSION = 0.24D;
+    private static final double VOLUMETRIC_PRESSURE_RECOVERY_PER_BLOCK = 0.08D;
+    private static final int VOLUMETRIC_DIRECTION_NEIGHBOR_COUNT = 10;
+    private static final int VOLUMETRIC_DIRECTION_BLEND_COUNT = 8;
+    private static final double VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT = 1.7D;
+    private static final double VOLUMETRIC_RADIUS_SCALE_BASE = 6.0D;
+    private static final double VOLUMETRIC_MAX_POWER_RADIUS_SCALE = 8.0D;
+    private static final double VOLUMETRIC_MAX_POINT_RADIUS_SCALE = 8.0D;
+    private static final double VOLUMETRIC_DIRECTION_SAMPLES_PER_RADIUS2 = 6.0D;
+    private static final int VOLUMETRIC_MIN_DIRECTION_SAMPLES = 128;
+    private static final int VOLUMETRIC_MAX_DIRECTION_SAMPLES = 3072;
+    private static final double VOLUMETRIC_EDGE_POINT_BIAS_BLEND = 0.70D;
+    private static final double VOLUMETRIC_EDGE_POINT_BIAS_EXPONENT = 2.25D;
+    private static final double VOLUMETRIC_OUTER_SMOOTHING_RATIO = 0.06D;
+    private static final double VOLUMETRIC_OUTER_SMOOTHING_VARIANCE = 0.010D;
+    private static final double VOLUMETRIC_EDGE_SPIKE_START_FRACTION = 0.72D;
+    private static final double VOLUMETRIC_EDGE_SPIKE_MAX_REDUCTION = 0.12D;
+    private static final double VOLUMETRIC_EDGE_SPIKE_REDUCTION_EXPONENT = 2.6D;
+    private static final double VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION = 96.0D;
+    private static final double VOLUMETRIC_EDGE_SPIKE_MIN_STRENGTH = 0.08D;
+    private static final double VOLUMETRIC_EDGE_SPIKE_RAMP_EXPONENT = 2.2D;
+    private static final double VOLUMETRIC_OUTER_SMOOTHING_FULL_WEIGHT_FRACTION = 1.0D
+            - Mth.clamp(VOLUMETRIC_OUTER_SMOOTHING_RATIO + VOLUMETRIC_OUTER_SMOOTHING_VARIANCE, 0.01D, 0.20D);
+    private static final double VOLUMETRIC_RESISTANCE_FIELD_PREALLOC_SOLID_FRACTION = 0.85D;
+    private static final double VOLUMETRIC_AIR_DISTRIBUTION_BLEND = 0.78D;
+    private static final double VOLUMETRIC_MAX_AIR_NORMALIZATION_SCALE = 8.0D;
+    private static final double VOLUMETRIC_IMPACT_POWER_PER_ENERGY = 500.0D;
+    private static final double STRUCTURAL_COLLAPSE_IMPACT_POWER = 1_000_000.0D;
+    private static final int STRUCTURAL_COLLAPSE_MAX_VOXELS = 24_000_000;
+    private static final double EIKONAL_AIR_SLOWNESS = 1.0D;
+    private static final double EIKONAL_SOLID_SLOWNESS_SCALE = 0.040D;
+    private static final int EIKONAL_BASE_SWEEP_CYCLES = 8;
+    private static final int EIKONAL_MAX_SWEEP_CYCLES = 24;
+    private static final double EIKONAL_CONVERGENCE_EPSILON = 1.0E-3D;
+    private static final double EIKONAL_MAX_ARRIVAL_MULTIPLIER = 1.20D;
+    private static final double EIKONAL_WEIGHT_EXPONENT = 1.35D;
+    private static final double EIKONAL_RESISTANCE_ATTENUATION_PER_OVERRUN = 3.0D;
+    private static final double EIKONAL_RESISTANCE_NORMALIZED_ATTENUATION = 3.5D;
+    private static final double EIKONAL_HARD_BLOCK_NORMALIZED_OVERRUN = 4.0D;
+    private static final double EIKONAL_OVERRUN_DEADZONE = 0.05D;
+    private static final double EIKONAL_SHADOW_SOLID_SLOWNESS_SCALE = 4.0D;
+    private static final double EIKONAL_SHADOW_ATTENUATION_PER_OVERRUN = 4.0D;
+    private static final double EIKONAL_SHADOW_NORMALIZED_ATTENUATION = 7.0D;
+    private static final double EIKONAL_HARD_BLOCK_SHADOW_NORMALIZED_OVERRUN = 2.5D;
+    private static final double EIKONAL_SHADOW_OVERRUN_DEADZONE = 0.02D;
+    private static final double EIKONAL_MIN_TRANSMITTANCE = 1.0E-3D;
+    private static final double EIKONAL_ENVELOPE_TRANSMITTANCE_BLEND = 0.25D;
+    private static final double EIKONAL_BASELINE_SMOOTH_BLEND = 0.70D;
+    private static final double EIKONAL_VOLUMETRIC_MECHANICS_SELF_SMOOTH = 0.45D;
+    private static final double EIKONAL_CUTOFF_EDGE_START_NORMALIZED = 0.24D;
+    private static final double EIKONAL_CUTOFF_EDGE_CURVE_EXPONENT = 2.4D;
+    private static final int VOLUMETRIC_TARGET_SCAN_PARALLELISM = Math.max(
+            1,
+            Math.min(8, Runtime.getRuntime().availableProcessors() - 1)
+    );
+    private static final int VOLUMETRIC_TARGET_SCAN_MIN_SOLIDS_FOR_PARALLEL = 262_144;
+    private static final int VOLUMETRIC_TARGET_SCAN_SOLIDS_PER_TASK = 262_144;
+    private static final int VOLUMETRIC_TARGET_SCAN_MAX_TASKS = 32;
+    private static final ConcurrentHashMap<Integer, VolumetricDirectionCache> VOLUMETRIC_DIRECTION_CACHE = new ConcurrentHashMap<>();
+    private static final ForkJoinPool VOLUMETRIC_TARGET_SCAN_POOL = VOLUMETRIC_TARGET_SCAN_PARALLELISM > 1
+            ? new ForkJoinPool(VOLUMETRIC_TARGET_SCAN_PARALLELISM)
+            : null;
     private static final int[] CHILD_TRAVERSAL_OFFSETS = new int[]{0, 1, 2, 4, 3, 5, 6, 7};
     private static final int[][] CHILD_ORDER_BY_RAY_OCTANT = buildChildOrderByRayOctant();
     private static volatile SpecialBlockHandler specialBlockHandler = SpecialBlockHandler.NOOP;
@@ -198,16 +274,28 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             long splitCheckNanos,
             long entitySegmentNanos,
             long entityApplyNanos,
+            long volumetricResistanceFieldNanos,
+            long volumetricDirectionSetupNanos,
+            long volumetricPressureSolveNanos,
+            long volumetricTargetScanNanos,
+            long volumetricTargetScanPrecheckNanos,
+            long volumetricTargetScanBlendNanos,
+            long volumetricImpactApplyNanos,
+            int volumetricSampledVoxels,
+            int volumetricSampledSolids,
+            int volumetricTargetBlocks,
+            int volumetricDirectionSamples,
+            int volumetricRadialSteps,
             int estimatedSyncPackets,
             int estimatedSyncBytes,
             int smokeParticles
     ) {
     }
 
-    private static void detonate(ServerLevel level, double x, double y, double z, Entity source, LivingEntity owner,
-                                 double blastRadius, double blastPower, RandomSource random,
-                                 boolean applyWorldChanges, boolean emitEffects,
-                                 ExplosionProfileTrace trace) {
+    private static void detonateRaycast(ServerLevel level, double x, double y, double z, Entity source, LivingEntity owner,
+                                        double blastRadius, double blastPower, RandomSource random,
+                                        boolean applyWorldChanges, boolean emitEffects,
+                                        ExplosionProfileTrace trace) {
         if (blastRadius <= 1.0E-9D || blastPower <= 1.0E-9D) {
             return;
         }
@@ -274,6 +362,1940 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
     }
 
+    private static void detonateVolumetric(ServerLevel level, double x, double y, double z, Entity source, LivingEntity owner,
+                                           double blastRadius, double totalEnergy,
+                                           boolean applyWorldChanges, boolean emitEffects,
+                                           ExplosionProfileTrace trace) {
+        if (blastRadius <= 1.0E-9D || totalEnergy <= VOLUMETRIC_MIN_ENERGY) {
+            return;
+        }
+
+        if (emitEffects) {
+            emitExplosionEffects(level, x, y, z, level.random);
+        }
+
+        long blockResolveStart = trace != null ? System.nanoTime() : 0L;
+        Runnable propagationPass = () -> runVolumetricPropagation(
+                level,
+                x,
+                y,
+                z,
+                blastRadius,
+                totalEnergy,
+                source,
+                owner,
+                applyWorldChanges,
+                trace
+        );
+        if (applyWorldChanges) {
+            KrakkDamageRuntime.runBatchedSync(level, propagationPass);
+        } else {
+            propagationPass.run();
+        }
+        if (trace != null) {
+            trace.blockResolveNanos += (System.nanoTime() - blockResolveStart);
+            if (applyWorldChanges) {
+                trace.syncPacketsEstimated = trace.brokenBlocks + trace.damagedBlocks;
+            } else {
+                trace.syncPacketsEstimated = trace.predictedBrokenBlocks + trace.predictedDamagedBlocks;
+            }
+            trace.syncBytesEstimated = trace.syncPacketsEstimated * estimateDamageSyncPayloadBytes(level.dimension().location());
+        }
+    }
+
+    private static void detonateEikonal(ServerLevel level, double x, double y, double z, Entity source, LivingEntity owner,
+                                        double blastRadius, double totalEnergy,
+                                        boolean applyWorldChanges, boolean emitEffects,
+                                        ExplosionProfileTrace trace) {
+        if (totalEnergy <= VOLUMETRIC_MIN_ENERGY) {
+            return;
+        }
+
+        if (emitEffects) {
+            emitExplosionEffects(level, x, y, z, level.random);
+        }
+
+        long blockResolveStart = trace != null ? System.nanoTime() : 0L;
+        Runnable propagationPass = () -> runEikonalPropagation(
+                level,
+                x,
+                y,
+                z,
+                blastRadius,
+                totalEnergy,
+                source,
+                owner,
+                applyWorldChanges,
+                trace
+        );
+        if (applyWorldChanges) {
+            KrakkDamageRuntime.runBatchedSync(level, propagationPass);
+        } else {
+            propagationPass.run();
+        }
+        if (trace != null) {
+            trace.blockResolveNanos += (System.nanoTime() - blockResolveStart);
+            if (applyWorldChanges) {
+                trace.syncPacketsEstimated = trace.brokenBlocks + trace.damagedBlocks;
+            } else {
+                trace.syncPacketsEstimated = trace.predictedBrokenBlocks + trace.predictedDamagedBlocks;
+            }
+            trace.syncBytesEstimated = trace.syncPacketsEstimated * estimateDamageSyncPayloadBytes(level.dimension().location());
+        }
+    }
+
+    private static void runEikonalPropagation(ServerLevel level,
+                                              double centerX,
+                                              double centerY,
+                                              double centerZ,
+                                              double blastRadius,
+                                              double totalEnergy,
+                                              Entity source,
+                                              LivingEntity owner,
+                                              boolean applyWorldChanges,
+                                              ExplosionProfileTrace trace) {
+        BlockPos centerPos = BlockPos.containing(centerX, centerY, centerZ);
+        if (!level.isInWorldBounds(centerPos)) {
+            return;
+        }
+
+        boolean energyLimitedRadius = blastRadius <= 1.0E-9D;
+        double resolvedRadius = energyLimitedRadius
+                ? resolveEikonalRadiusFromEnergyCutoff(totalEnergy)
+                : Math.max(1.0D, blastRadius);
+        double radiusSq = resolvedRadius * resolvedRadius;
+        int minX = Mth.floor(centerX - resolvedRadius);
+        int maxX = Mth.ceil(centerX + resolvedRadius);
+        int minY = Mth.floor(centerY - resolvedRadius);
+        int maxY = Mth.ceil(centerY + resolvedRadius);
+        int minZ = Mth.floor(centerZ - resolvedRadius);
+        int maxZ = Mth.ceil(centerZ + resolvedRadius);
+
+        Int2DoubleOpenHashMap resistanceCostCache = new Int2DoubleOpenHashMap(256);
+        resistanceCostCache.defaultReturnValue(Double.NaN);
+        long fieldStart = trace != null ? System.nanoTime() : 0L;
+        EikonalField eikonalField = buildEikonalField(
+                level,
+                centerX,
+                centerY,
+                centerZ,
+                minX,
+                maxX,
+                minY,
+                maxY,
+                minZ,
+                maxZ,
+                radiusSq,
+                resistanceCostCache
+        );
+        if (trace != null) {
+            trace.volumetricResistanceFieldNanos += (System.nanoTime() - fieldStart);
+            trace.volumetricSampledVoxels += eikonalField.sampledVoxelCount();
+            trace.volumetricSampledSolids += eikonalField.solidPositions().size();
+        }
+        if (eikonalField.sampledVoxelCount() <= 0 || eikonalField.solidPositions().isEmpty()) {
+            return;
+        }
+
+        long solveStart = trace != null ? System.nanoTime() : 0L;
+        EikonalSolveResult solveResult = solveEikonalArrivalTimes(eikonalField, centerX, centerY, centerZ, Float.NaN, 1.0F);
+        EikonalSolveResult airSolveResult = solveEikonalArrivalTimes(eikonalField, centerX, centerY, centerZ, (float) EIKONAL_AIR_SLOWNESS, 1.0F);
+        EikonalSolveResult shadowSolveResult = solveEikonalArrivalTimes(
+                eikonalField,
+                centerX,
+                centerY,
+                centerZ,
+                Float.NaN,
+                (float) EIKONAL_SHADOW_SOLID_SLOWNESS_SCALE
+        );
+        if (trace != null) {
+            trace.volumetricPressureSolveNanos += (System.nanoTime() - solveStart);
+            trace.volumetricRadialSteps += solveResult.sweepCycles() + airSolveResult.sweepCycles() + shadowSolveResult.sweepCycles();
+        }
+
+        float[] arrivalTimes = solveResult.arrivalTimes();
+        float[] airArrivalTimes = airSolveResult.arrivalTimes();
+        float[] shadowArrivalTimes = shadowSolveResult.arrivalTimes();
+        LongArrayList solidPositions = eikonalField.solidPositions();
+        Long2FloatOpenHashMap volumetricBaselineByPos = buildEikonalVolumetricBaselineByPos(
+                centerX,
+                centerY,
+                centerZ,
+                resolvedRadius,
+                eikonalField,
+                trace
+        );
+        LongArrayList targetPositions = new LongArrayList(Math.max(64, solidPositions.size() / 8));
+        FloatArrayList targetWeights = new FloatArrayList(Math.max(64, solidPositions.size() / 8));
+        double maxArrival = Math.max(1.0E-6D, resolvedRadius * EIKONAL_MAX_ARRIVAL_MULTIPLIER);
+        double solidWeight = 0.0D;
+        long targetScanStart = trace != null ? System.nanoTime() : 0L;
+        long targetPrecheckNanos = 0L;
+        for (int i = 0; i < solidPositions.size(); i++) {
+            long posLong = solidPositions.getLong(i);
+            long precheckStart = trace != null ? System.nanoTime() : 0L;
+            float baselineWeight = volumetricBaselineByPos.get(posLong);
+            if (!Float.isFinite(baselineWeight) || baselineWeight <= VOLUMETRIC_MIN_ENERGY) {
+                if (trace != null) {
+                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            int x = BlockPos.getX(posLong);
+            int y = BlockPos.getY(posLong);
+            int z = BlockPos.getZ(posLong);
+            int index = eikonalGridIndex(
+                    x - eikonalField.minX(),
+                    y - eikonalField.minY(),
+                    z - eikonalField.minZ(),
+                    eikonalField.sizeY(),
+                    eikonalField.sizeZ()
+            );
+            double arrival = arrivalTimes[index];
+            if (!Double.isFinite(arrival) || arrival > maxArrival) {
+                if (trace != null) {
+                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            double normalized = 1.0D - (arrival / maxArrival);
+            if (normalized <= 0.0D) {
+                if (trace != null) {
+                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            double airArrival = airArrivalTimes[index];
+            if (!Double.isFinite(airArrival)) {
+                if (trace != null) {
+                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            double resistanceOverrun = Math.max(0.0D, arrival - airArrival);
+            double effectiveOverrun = Math.max(0.0D, resistanceOverrun - EIKONAL_OVERRUN_DEADZONE);
+            double normalizedOverrun = effectiveOverrun / Math.max(1.0D, airArrival);
+            if (normalizedOverrun >= EIKONAL_HARD_BLOCK_NORMALIZED_OVERRUN) {
+                if (trace != null) {
+                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            double transmittance = Math.exp(
+                    -(effectiveOverrun * EIKONAL_RESISTANCE_ATTENUATION_PER_OVERRUN)
+                            - (normalizedOverrun * EIKONAL_RESISTANCE_NORMALIZED_ATTENUATION)
+            );
+            if (transmittance <= EIKONAL_MIN_TRANSMITTANCE) {
+                if (trace != null) {
+                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            double shadowArrival = shadowArrivalTimes[index];
+            if (!Double.isFinite(shadowArrival)) {
+                if (trace != null) {
+                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            double shadowOverrun = Math.max(0.0D, shadowArrival - arrival);
+            double effectiveShadowOverrun = Math.max(0.0D, shadowOverrun - EIKONAL_SHADOW_OVERRUN_DEADZONE);
+            double normalizedShadowOverrun = effectiveShadowOverrun / Math.max(0.25D, airArrival);
+            if (normalizedShadowOverrun >= EIKONAL_HARD_BLOCK_SHADOW_NORMALIZED_OVERRUN) {
+                if (trace != null) {
+                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            double shadowTransmittance = Math.exp(
+                    -(effectiveShadowOverrun * EIKONAL_SHADOW_ATTENUATION_PER_OVERRUN)
+                            - (normalizedShadowOverrun * EIKONAL_SHADOW_NORMALIZED_ATTENUATION)
+            );
+            if (shadowTransmittance <= EIKONAL_MIN_TRANSMITTANCE) {
+                if (trace != null) {
+                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            double eikEnvelope = Math.pow(normalized, EIKONAL_WEIGHT_EXPONENT);
+            double eikonalTransFactor = Mth.lerp(
+                    EIKONAL_ENVELOPE_TRANSMITTANCE_BLEND,
+                    1.0D,
+                    transmittance * shadowTransmittance
+            );
+            double smoothingFactor = Mth.lerp(
+                    EIKONAL_BASELINE_SMOOTH_BLEND,
+                    1.0D,
+                    eikEnvelope * eikonalTransFactor
+            );
+            double cutoffRetention = computeEikonalCutoffEdgeRetention(normalized);
+            double weight = baselineWeight * smoothingFactor * cutoffRetention;
+            if (weight <= VOLUMETRIC_MIN_ENERGY) {
+                if (trace != null) {
+                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            if (trace != null) {
+                targetPrecheckNanos += (System.nanoTime() - precheckStart);
+            }
+            targetPositions.add(posLong);
+            targetWeights.add((float) weight);
+            solidWeight += weight;
+        }
+        if (trace != null) {
+            trace.volumetricTargetScanNanos += (System.nanoTime() - targetScanStart);
+            trace.volumetricTargetScanPrecheckNanos += targetPrecheckNanos;
+        }
+        if (targetPositions.isEmpty() || solidWeight <= VOLUMETRIC_MIN_ENERGY) {
+            return;
+        }
+        if (trace != null) {
+            trace.rawImpactedBlocks += targetPositions.size();
+            trace.postAaImpactedBlocks += targetPositions.size();
+            trace.volumetricTargetBlocks += targetPositions.size();
+        }
+
+        double powerScale = computeVolumetricRadiusScale(resolvedRadius, VOLUMETRIC_MAX_POWER_RADIUS_SCALE);
+        double impactBudget = totalEnergy * VOLUMETRIC_IMPACT_POWER_PER_ENERGY * powerScale;
+        double airNormalizationScale = computeVolumetricAirNormalizationScale(solidPositions.size(), eikonalField.sampledVoxelCount());
+        double normalizationWeight = solidWeight * airNormalizationScale;
+        if (normalizationWeight <= VOLUMETRIC_MIN_ENERGY) {
+            return;
+        }
+
+        BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        long impactApplyStart = trace != null ? System.nanoTime() : 0L;
+        for (int i = 0; i < targetPositions.size(); i++) {
+            double weight = targetWeights.getFloat(i);
+            if (weight <= VOLUMETRIC_MIN_ENERGY) {
+                continue;
+            }
+            double impactPower = impactBudget * (weight / normalizationWeight);
+            applySingleBlockImpact(
+                    level,
+                    mutablePos,
+                    targetPositions.getLong(i),
+                    impactPower,
+                    source,
+                    owner,
+                    applyWorldChanges,
+                    trace
+            );
+        }
+        applyStructuralCollapsePass(
+                level,
+                centerX,
+                centerY,
+                centerZ,
+                radiusSq,
+                minX,
+                maxX,
+                minY,
+                maxY,
+                minZ,
+                maxZ,
+                solidPositions,
+                source,
+                owner,
+                applyWorldChanges,
+                trace
+        );
+        if (trace != null) {
+            trace.volumetricImpactApplyNanos += (System.nanoTime() - impactApplyStart);
+        }
+    }
+
+    private static EikonalField buildEikonalField(ServerLevel level,
+                                                  double centerX,
+                                                  double centerY,
+                                                  double centerZ,
+                                                  int minX,
+                                                  int maxX,
+                                                  int minY,
+                                                  int maxY,
+                                                  int minZ,
+                                                  int maxZ,
+                                                  double radiusSq,
+                                                  Int2DoubleOpenHashMap resistanceCostCache) {
+        int sizeX = maxX - minX + 1;
+        int sizeY = maxY - minY + 1;
+        int sizeZ = maxZ - minZ + 1;
+        long volumeLong = (long) sizeX * (long) sizeY * (long) sizeZ;
+        if (volumeLong <= 0L || volumeLong > Integer.MAX_VALUE - 8L) {
+            return new EikonalField(minX, minY, minZ, sizeX, sizeY, sizeZ, 0, new float[1], new LongArrayList());
+        }
+        int volume = (int) volumeLong;
+        float[] slowness = new float[Math.max(1, volume)];
+        LongArrayList solidPositions = new LongArrayList(Math.max(64, volume / 8));
+        BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        int sampledVoxelCount = 0;
+        for (int x = minX; x <= maxX; x++) {
+            for (int y = minY; y <= maxY; y++) {
+                for (int z = minZ; z <= maxZ; z++) {
+                    double dx = (x + 0.5D) - centerX;
+                    double dy = (y + 0.5D) - centerY;
+                    double dz = (z + 0.5D) - centerZ;
+                    double distSq = (dx * dx) + (dy * dy) + (dz * dz);
+                    if (distSq > radiusSq) {
+                        continue;
+                    }
+                    mutablePos.set(x, y, z);
+                    if (!level.isInWorldBounds(mutablePos)) {
+                        continue;
+                    }
+                    sampledVoxelCount++;
+                    int index = eikonalGridIndex(x - minX, y - minY, z - minZ, sizeY, sizeZ);
+                    BlockState blockState = level.getBlockState(mutablePos);
+                    if (blockState.isAir()) {
+                        slowness[index] = (float) EIKONAL_AIR_SLOWNESS;
+                        continue;
+                    }
+                    double resistance = getCachedResistanceCost(resistanceCostCache, blockState);
+                    slowness[index] = (float) (EIKONAL_AIR_SLOWNESS + (resistance * EIKONAL_SOLID_SLOWNESS_SCALE));
+                    solidPositions.add(mutablePos.asLong());
+                }
+            }
+        }
+        return new EikonalField(minX, minY, minZ, sizeX, sizeY, sizeZ, sampledVoxelCount, slowness, solidPositions);
+    }
+
+    private static Long2FloatOpenHashMap buildEikonalVolumetricBaselineByPos(double centerX,
+                                                                              double centerY,
+                                                                              double centerZ,
+                                                                              double resolvedRadius,
+                                                                              EikonalField eikonalField,
+                                                                              ExplosionProfileTrace trace) {
+        LongArrayList solidPositions = eikonalField.solidPositions();
+        Long2FloatOpenHashMap empty = new Long2FloatOpenHashMap(16);
+        empty.defaultReturnValue(Float.NaN);
+        if (solidPositions.isEmpty()) {
+            return empty;
+        }
+
+        float[] fieldSlowness = eikonalField.slowness();
+        int fieldMinX = eikonalField.minX();
+        int fieldMinY = eikonalField.minY();
+        int fieldMinZ = eikonalField.minZ();
+        int fieldSizeX = eikonalField.sizeX();
+        int fieldSizeY = eikonalField.sizeY();
+        int fieldSizeZ = eikonalField.sizeZ();
+        float airSlowness = (float) EIKONAL_AIR_SLOWNESS;
+        float resistanceScaleInv = (float) (1.0D / Math.max(1.0E-6D, EIKONAL_SOLID_SLOWNESS_SCALE));
+
+        long directionSetupStart = trace != null ? System.nanoTime() : 0L;
+        double pointScale = computeVolumetricRadiusScale(resolvedRadius, VOLUMETRIC_MAX_POINT_RADIUS_SCALE);
+        int directionCount = computeVolumetricDirectionSampleCount(resolvedRadius, pointScale);
+        VolumetricDirectionCache directionCache = getVolumetricDirectionCache(directionCount);
+        double[] dirX = directionCache.dirX();
+        double[] dirY = directionCache.dirY();
+        double[] dirZ = directionCache.dirZ();
+        int[][] directionNeighbors = directionCache.neighbors();
+        int radialSteps = Math.max(1, Mth.ceil(resolvedRadius / VOLUMETRIC_DEFORM_SAMPLE_STEP));
+        double radialStepSize = resolvedRadius / radialSteps;
+        float[] pressureByShell = new float[(radialSteps + 1) * directionCount];
+        Arrays.fill(pressureByShell, 0, directionCount, 1.0F);
+        float[] maxPressureByShell = new float[radialSteps + 1];
+        maxPressureByShell[0] = 1.0F;
+        float[] previousPressure = new float[directionCount];
+        Arrays.fill(previousPressure, 1.0F);
+        float[] rawPressure = new float[directionCount];
+        float[] currentPressure = new float[directionCount];
+        double perStepAirDecay = Mth.clamp(VOLUMETRIC_PRESSURE_AIR_DECAY_PER_BLOCK * radialStepSize, 0.0D, 0.95D);
+        double perStepRecovery = Math.max(0.0D, VOLUMETRIC_PRESSURE_RECOVERY_PER_BLOCK * radialStepSize);
+        if (trace != null) {
+            trace.volumetricDirectionSetupNanos += (System.nanoTime() - directionSetupStart);
+            trace.volumetricDirectionSamples += directionCount;
+            trace.volumetricRadialSteps += radialSteps;
+        }
+
+        long pressureSolveStart = trace != null ? System.nanoTime() : 0L;
+        for (int shell = 1; shell <= radialSteps; shell++) {
+            double t = shell * radialStepSize;
+            for (int i = 0; i < directionCount; i++) {
+                int sampleX = Mth.floor(centerX + (dirX[i] * t));
+                int sampleY = Mth.floor(centerY + (dirY[i] * t));
+                int sampleZ = Mth.floor(centerZ + (dirZ[i] * t));
+                int sampleXOffset = sampleX - fieldMinX;
+                int sampleYOffset = sampleY - fieldMinY;
+                int sampleZOffset = sampleZ - fieldMinZ;
+                float sampleResistance = 0.0F;
+                if (sampleXOffset >= 0
+                        && sampleXOffset < fieldSizeX
+                        && sampleYOffset >= 0
+                        && sampleYOffset < fieldSizeY
+                        && sampleZOffset >= 0
+                        && sampleZOffset < fieldSizeZ) {
+                    int sampleIndex = eikonalGridIndex(sampleXOffset, sampleYOffset, sampleZOffset, fieldSizeY, fieldSizeZ);
+                    float sampleSlowness = fieldSlowness[sampleIndex];
+                    if (sampleSlowness > airSlowness) {
+                        sampleResistance = (sampleSlowness - airSlowness) * resistanceScaleInv;
+                    }
+                }
+                double transmitted = previousPressure[i] * (1.0D - perStepAirDecay);
+                transmitted -= sampleResistance * VOLUMETRIC_PRESSURE_RESISTANCE_LOSS_SCALE * radialStepSize;
+                rawPressure[i] = (float) Mth.clamp(transmitted, 0.0D, 1.0D);
+            }
+
+            int rowOffset = shell * directionCount;
+            float shellMaxPressure = 0.0F;
+            for (int i = 0; i < directionCount; i++) {
+                int[] neighbors = directionNeighbors[i];
+                double neighborPressure = 0.0D;
+                int validNeighbors = 0;
+                for (int neighborIndex : neighbors) {
+                    if (neighborIndex < 0) {
+                        continue;
+                    }
+                    neighborPressure += rawPressure[neighborIndex];
+                    validNeighbors++;
+                }
+                double neighborAverage = validNeighbors > 0 ? (neighborPressure / validNeighbors) : rawPressure[i];
+                double diffusedPressure = Mth.lerp(VOLUMETRIC_PRESSURE_DIFFUSION, rawPressure[i], neighborAverage);
+                double recoveredPressure = Math.min(diffusedPressure, previousPressure[i] + perStepRecovery);
+                currentPressure[i] = (float) Mth.clamp(recoveredPressure, 0.0D, 1.0D);
+                pressureByShell[rowOffset + i] = currentPressure[i];
+                if (currentPressure[i] > shellMaxPressure) {
+                    shellMaxPressure = currentPressure[i];
+                }
+            }
+            maxPressureByShell[shell] = shellMaxPressure;
+
+            float[] swap = previousPressure;
+            previousPressure = currentPressure;
+            currentPressure = swap;
+        }
+        if (trace != null) {
+            trace.volumetricPressureSolveNanos += (System.nanoTime() - pressureSolveStart);
+        }
+
+        VolumetricTargetScanContext targetScanContext = new VolumetricTargetScanContext(
+                centerX,
+                centerY,
+                centerZ,
+                resolvedRadius,
+                radialStepSize,
+                radialSteps,
+                pressureByShell,
+                maxPressureByShell,
+                directionCount,
+                dirX,
+                dirY,
+                dirZ
+        );
+        long targetScanStart = trace != null ? System.nanoTime() : 0L;
+        VolumetricTargetScanResult targetScanResult = scanVolumetricTargets(
+                solidPositions,
+                targetScanContext,
+                false,
+                trace != null
+        );
+        if (trace != null) {
+            trace.volumetricTargetScanNanos += (System.nanoTime() - targetScanStart);
+            trace.volumetricTargetScanPrecheckNanos += targetScanResult.precheckNanos();
+            trace.volumetricTargetScanBlendNanos += targetScanResult.blendNanos();
+        }
+
+        LongArrayList targetPositions = targetScanResult.targetPositions();
+        FloatArrayList targetWeights = targetScanResult.targetWeights();
+        Long2FloatOpenHashMap baselineByPos = new Long2FloatOpenHashMap(Math.max(64, (int) Math.ceil(targetPositions.size() / 0.75D)));
+        baselineByPos.defaultReturnValue(Float.NaN);
+        for (int i = 0; i < targetPositions.size(); i++) {
+            baselineByPos.put(targetPositions.getLong(i), targetWeights.getFloat(i));
+        }
+        return smoothEikonalVolumetricMechanics(baselineByPos, solidPositions);
+    }
+
+    private static Long2FloatOpenHashMap smoothEikonalVolumetricMechanics(Long2FloatOpenHashMap pressureByPos,
+                                                                          LongArrayList solidPositions) {
+        Long2FloatOpenHashMap smoothed = new Long2FloatOpenHashMap(Math.max(64, (int) Math.ceil(pressureByPos.size() / 0.75D)));
+        smoothed.defaultReturnValue(Float.NaN);
+        double selfWeight = Mth.clamp(EIKONAL_VOLUMETRIC_MECHANICS_SELF_SMOOTH, 0.0D, 1.0D);
+        for (int i = 0; i < solidPositions.size(); i++) {
+            long posLong = solidPositions.getLong(i);
+            float self = pressureByPos.get(posLong);
+            if (!Float.isFinite(self)) {
+                continue;
+            }
+            int x = BlockPos.getX(posLong);
+            int y = BlockPos.getY(posLong);
+            int z = BlockPos.getZ(posLong);
+            double neighborSum = 0.0D;
+            int neighborCount = 0;
+            float px = pressureByPos.get(BlockPos.asLong(x + 1, y, z));
+            if (Float.isFinite(px)) {
+                neighborSum += px;
+                neighborCount++;
+            }
+            float nx = pressureByPos.get(BlockPos.asLong(x - 1, y, z));
+            if (Float.isFinite(nx)) {
+                neighborSum += nx;
+                neighborCount++;
+            }
+            float py = pressureByPos.get(BlockPos.asLong(x, y + 1, z));
+            if (Float.isFinite(py)) {
+                neighborSum += py;
+                neighborCount++;
+            }
+            float ny = pressureByPos.get(BlockPos.asLong(x, y - 1, z));
+            if (Float.isFinite(ny)) {
+                neighborSum += ny;
+                neighborCount++;
+            }
+            float pz = pressureByPos.get(BlockPos.asLong(x, y, z + 1));
+            if (Float.isFinite(pz)) {
+                neighborSum += pz;
+                neighborCount++;
+            }
+            float nz = pressureByPos.get(BlockPos.asLong(x, y, z - 1));
+            if (Float.isFinite(nz)) {
+                neighborSum += nz;
+                neighborCount++;
+            }
+            double neighborAverage = neighborCount > 0 ? (neighborSum / neighborCount) : self;
+            double value = (self * selfWeight) + (neighborAverage * (1.0D - selfWeight));
+            smoothed.put(posLong, (float) Mth.clamp(value, 0.0D, 1.0D));
+        }
+        return smoothed;
+    }
+
+    private static double computeEikonalCutoffEdgeRetention(double normalizedArrival) {
+        double normalized = Mth.clamp(normalizedArrival, 0.0D, 1.0D);
+        double edgeStart = Mth.clamp(EIKONAL_CUTOFF_EDGE_START_NORMALIZED, 1.0E-4D, 1.0D);
+        if (normalized >= edgeStart) {
+            return 1.0D;
+        }
+        double edgeProgress = normalized / edgeStart;
+        return Math.pow(Math.max(0.0D, edgeProgress), EIKONAL_CUTOFF_EDGE_CURVE_EXPONENT);
+    }
+
+    private static EikonalSolveResult solveEikonalArrivalTimes(EikonalField field,
+                                                               double centerX,
+                                                               double centerY,
+                                                               double centerZ,
+                                                               float uniformSlownessOverride,
+                                                               float solidSlownessScale) {
+        float[] arrivalTimes = new float[field.slowness().length];
+        Arrays.fill(arrivalTimes, Float.POSITIVE_INFINITY);
+        BitSet sourceMask = new BitSet(arrivalTimes.length);
+        int sourceCount = initializeEikonalSources(
+                arrivalTimes,
+                sourceMask,
+                field,
+                centerX,
+                centerY,
+                centerZ,
+                uniformSlownessOverride,
+                solidSlownessScale
+        );
+        if (sourceCount <= 0) {
+            return new EikonalSolveResult(arrivalTimes, 0);
+        }
+
+        int sweepCycles = 0;
+        int maxSweepCycles = computeEikonalMaxSweepCycles(field);
+        for (int cycle = 0; cycle < maxSweepCycles; cycle++) {
+            double maxDelta = 0.0D;
+            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, field, sourceMask, true, true, true, uniformSlownessOverride, solidSlownessScale));
+            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, field, sourceMask, true, true, false, uniformSlownessOverride, solidSlownessScale));
+            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, field, sourceMask, true, false, true, uniformSlownessOverride, solidSlownessScale));
+            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, field, sourceMask, true, false, false, uniformSlownessOverride, solidSlownessScale));
+            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, field, sourceMask, false, true, true, uniformSlownessOverride, solidSlownessScale));
+            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, field, sourceMask, false, true, false, uniformSlownessOverride, solidSlownessScale));
+            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, field, sourceMask, false, false, true, uniformSlownessOverride, solidSlownessScale));
+            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, field, sourceMask, false, false, false, uniformSlownessOverride, solidSlownessScale));
+            sweepCycles++;
+            if (maxDelta <= EIKONAL_CONVERGENCE_EPSILON) {
+                break;
+            }
+        }
+        return new EikonalSolveResult(arrivalTimes, sweepCycles);
+    }
+
+    private static int initializeEikonalSources(float[] arrivalTimes,
+                                                BitSet sourceMask,
+                                                EikonalField field,
+                                                double centerX,
+                                                double centerY,
+                                                double centerZ,
+                                                float uniformSlownessOverride,
+                                                float solidSlownessScale) {
+        int baseX = Mth.floor(centerX) - field.minX();
+        int baseY = Mth.floor(centerY) - field.minY();
+        int baseZ = Mth.floor(centerZ) - field.minZ();
+        int minX = Math.max(0, baseX - 1);
+        int maxX = Math.min(field.sizeX() - 1, baseX + 1);
+        int minY = Math.max(0, baseY - 1);
+        int maxY = Math.min(field.sizeY() - 1, baseY + 1);
+        int minZ = Math.max(0, baseZ - 1);
+        int maxZ = Math.min(field.sizeZ() - 1, baseZ + 1);
+        int sourceCount = 0;
+        for (int x = minX; x <= maxX; x++) {
+            for (int y = minY; y <= maxY; y++) {
+                for (int z = minZ; z <= maxZ; z++) {
+                    int index = eikonalGridIndex(x, y, z, field.sizeY(), field.sizeZ());
+                    float cellSlowness = resolvedEikonalSlowness(field.slowness(), index, uniformSlownessOverride, solidSlownessScale);
+                    if (cellSlowness <= 0.0F) {
+                        continue;
+                    }
+                    double worldX = field.minX() + x + 0.5D;
+                    double worldY = field.minY() + y + 0.5D;
+                    double worldZ = field.minZ() + z + 0.5D;
+                    double dx = worldX - centerX;
+                    double dy = worldY - centerY;
+                    double dz = worldZ - centerZ;
+                    double arrival = Math.sqrt((dx * dx) + (dy * dy) + (dz * dz)) * cellSlowness;
+                    if (arrival + 1.0E-6D < arrivalTimes[index]) {
+                        if (!sourceMask.get(index)) {
+                            sourceMask.set(index);
+                            sourceCount++;
+                        }
+                        arrivalTimes[index] = (float) arrival;
+                    }
+                }
+            }
+        }
+        if (sourceCount > 0) {
+            return sourceCount;
+        }
+        int seedIndex = resolveEikonalSeedIndex(field, centerX, centerY, centerZ);
+        if (seedIndex >= 0) {
+            arrivalTimes[seedIndex] = 0.0F;
+            sourceMask.set(seedIndex);
+            return 1;
+        }
+        return 0;
+    }
+
+    private static int computeEikonalMaxSweepCycles(EikonalField field) {
+        int longestAxis = Math.max(field.sizeX(), Math.max(field.sizeY(), field.sizeZ()));
+        int growthCycles = Math.max(0, Mth.ceil((longestAxis - 32) / 12.0D));
+        return Mth.clamp(EIKONAL_BASE_SWEEP_CYCLES + growthCycles, EIKONAL_BASE_SWEEP_CYCLES, EIKONAL_MAX_SWEEP_CYCLES);
+    }
+
+    private static int resolveEikonalSeedIndex(EikonalField field, double centerX, double centerY, double centerZ) {
+        int seedX = Mth.clamp(Mth.floor(centerX), field.minX(), field.minX() + field.sizeX() - 1);
+        int seedY = Mth.clamp(Mth.floor(centerY), field.minY(), field.minY() + field.sizeY() - 1);
+        int seedZ = Mth.clamp(Mth.floor(centerZ), field.minZ(), field.minZ() + field.sizeZ() - 1);
+        int seedIndex = eikonalGridIndex(seedX - field.minX(), seedY - field.minY(), seedZ - field.minZ(), field.sizeY(), field.sizeZ());
+        if (field.slowness()[seedIndex] > 0.0F) {
+            return seedIndex;
+        }
+
+        double bestDistanceSq = Double.POSITIVE_INFINITY;
+        int bestIndex = -1;
+        for (int x = 0; x < field.sizeX(); x++) {
+            for (int y = 0; y < field.sizeY(); y++) {
+                for (int z = 0; z < field.sizeZ(); z++) {
+                    int index = eikonalGridIndex(x, y, z, field.sizeY(), field.sizeZ());
+                    if (field.slowness()[index] <= 0.0F) {
+                        continue;
+                    }
+                    double worldX = field.minX() + x + 0.5D;
+                    double worldY = field.minY() + y + 0.5D;
+                    double worldZ = field.minZ() + z + 0.5D;
+                    double dx = worldX - centerX;
+                    double dy = worldY - centerY;
+                    double dz = worldZ - centerZ;
+                    double distSq = (dx * dx) + (dy * dy) + (dz * dz);
+                    if (distSq < bestDistanceSq) {
+                        bestDistanceSq = distSq;
+                        bestIndex = index;
+                    }
+                }
+            }
+        }
+        return bestIndex;
+    }
+
+    private static double sweepEikonalPass(float[] arrivalTimes,
+                                           EikonalField field,
+                                           BitSet sourceMask,
+                                           boolean xForward,
+                                           boolean yForward,
+                                           boolean zForward,
+                                           float uniformSlownessOverride,
+                                           float solidSlownessScale) {
+        int sizeX = field.sizeX();
+        int sizeY = field.sizeY();
+        int sizeZ = field.sizeZ();
+        int strideX = sizeY * sizeZ;
+        int strideY = sizeZ;
+        float[] slowness = field.slowness();
+        int xStart = xForward ? 0 : sizeX - 1;
+        int xEnd = xForward ? sizeX : -1;
+        int xStep = xForward ? 1 : -1;
+        int yStart = yForward ? 0 : sizeY - 1;
+        int yEnd = yForward ? sizeY : -1;
+        int yStep = yForward ? 1 : -1;
+        int zStart = zForward ? 0 : sizeZ - 1;
+        int zEnd = zForward ? sizeZ : -1;
+        int zStep = zForward ? 1 : -1;
+        double maxDelta = 0.0D;
+        for (int x = xStart; x != xEnd; x += xStep) {
+            int baseX = x * strideX;
+            for (int y = yStart; y != yEnd; y += yStep) {
+                int base = baseX + (y * strideY);
+                for (int z = zStart; z != zEnd; z += zStep) {
+                    int index = base + z;
+                    float cellSlowness = resolvedEikonalSlowness(slowness, index, uniformSlownessOverride, solidSlownessScale);
+                    if (sourceMask.get(index) || cellSlowness <= 0.0F) {
+                        continue;
+                    }
+                    double candidate = solveEikonalCell(
+                            arrivalTimes,
+                            slowness,
+                            uniformSlownessOverride,
+                            solidSlownessScale,
+                            index,
+                            x,
+                            y,
+                            z,
+                            sizeX,
+                            sizeY,
+                            sizeZ,
+                            strideX,
+                            strideY
+                    );
+                    if (!Double.isFinite(candidate)) {
+                        continue;
+                    }
+                    double previous = arrivalTimes[index];
+                    if (candidate + 1.0E-9D < previous) {
+                        arrivalTimes[index] = (float) candidate;
+                        if (Double.isFinite(previous)) {
+                            maxDelta = Math.max(maxDelta, previous - candidate);
+                        } else {
+                            maxDelta = Math.max(maxDelta, candidate);
+                        }
+                    }
+                }
+            }
+        }
+        return maxDelta;
+    }
+
+    private static double solveEikonalCell(float[] arrivalTimes,
+                                           float[] slowness,
+                                           float uniformSlownessOverride,
+                                           float solidSlownessScale,
+                                           int index,
+                                           int x,
+                                           int y,
+                                           int z,
+                                           int sizeX,
+                                           int sizeY,
+                                           int sizeZ,
+                                           int strideX,
+                                           int strideY) {
+        double a = minEikonalAxisNeighbor(
+                arrivalTimes,
+                slowness,
+                uniformSlownessOverride,
+                solidSlownessScale,
+                x > 0 ? index - strideX : -1,
+                x + 1 < sizeX ? index + strideX : -1
+        );
+        double b = minEikonalAxisNeighbor(
+                arrivalTimes,
+                slowness,
+                uniformSlownessOverride,
+                solidSlownessScale,
+                y > 0 ? index - strideY : -1,
+                y + 1 < sizeY ? index + strideY : -1
+        );
+        double c = minEikonalAxisNeighbor(
+                arrivalTimes,
+                slowness,
+                uniformSlownessOverride,
+                solidSlownessScale,
+                z > 0 ? index - 1 : -1,
+                z + 1 < sizeZ ? index + 1 : -1
+        );
+        if (!Double.isFinite(a) && !Double.isFinite(b) && !Double.isFinite(c)) {
+            return Double.POSITIVE_INFINITY;
+        }
+        return solveEikonalDistance(a, b, c, resolvedEikonalSlowness(slowness, index, uniformSlownessOverride, solidSlownessScale));
+    }
+
+    private static double minEikonalAxisNeighbor(float[] arrivalTimes,
+                                                 float[] slowness,
+                                                 float uniformSlownessOverride,
+                                                 float solidSlownessScale,
+                                                 int negativeIndex,
+                                                 int positiveIndex) {
+        double min = Double.POSITIVE_INFINITY;
+        if (negativeIndex >= 0 && resolvedEikonalSlowness(slowness, negativeIndex, uniformSlownessOverride, solidSlownessScale) > 0.0F) {
+            min = Math.min(min, arrivalTimes[negativeIndex]);
+        }
+        if (positiveIndex >= 0 && resolvedEikonalSlowness(slowness, positiveIndex, uniformSlownessOverride, solidSlownessScale) > 0.0F) {
+            min = Math.min(min, arrivalTimes[positiveIndex]);
+        }
+        return min;
+    }
+
+    private static float resolvedEikonalSlowness(float[] slowness, int index, float uniformSlownessOverride, float solidSlownessScale) {
+        float baseSlowness = slowness[index];
+        if (baseSlowness <= 0.0F) {
+            return 0.0F;
+        }
+        if (Float.isFinite(uniformSlownessOverride) && uniformSlownessOverride > 0.0F) {
+            return uniformSlownessOverride;
+        }
+        float resolvedScale = Float.isFinite(solidSlownessScale) && solidSlownessScale > 0.0F ? solidSlownessScale : 1.0F;
+        if (Math.abs(resolvedScale - 1.0F) <= 1.0E-6F) {
+            return baseSlowness;
+        }
+        float airSlowness = (float) EIKONAL_AIR_SLOWNESS;
+        float solidOverrun = Math.max(0.0F, baseSlowness - airSlowness);
+        if (solidOverrun <= 1.0E-6F) {
+            return baseSlowness;
+        }
+        return airSlowness + (solidOverrun * resolvedScale);
+    }
+
+    private static double solveEikonalDistance(double a, double b, double c, double slowness) {
+        double t0 = a;
+        double t1 = b;
+        double t2 = c;
+        if (t0 > t1) {
+            double swap = t0;
+            t0 = t1;
+            t1 = swap;
+        }
+        if (t1 > t2) {
+            double swap = t1;
+            t1 = t2;
+            t2 = swap;
+        }
+        if (t0 > t1) {
+            double swap = t0;
+            t0 = t1;
+            t1 = swap;
+        }
+        if (!Double.isFinite(t0)) {
+            return Double.POSITIVE_INFINITY;
+        }
+
+        double s = Math.max(1.0E-6D, slowness);
+        if (!Double.isFinite(t1)) {
+            return t0 + s;
+        }
+        double result = t0 + s;
+        if (result > t1) {
+            double discriminant2 = (2.0D * s * s) - square(t0 - t1);
+            if (discriminant2 > 0.0D) {
+                result = (t0 + t1 + Math.sqrt(discriminant2)) * 0.5D;
+            } else {
+                result = t1 + s;
+            }
+            if (Double.isFinite(t2) && result > t2) {
+                double discriminant3 = (3.0D * s * s)
+                        - square(t0 - t1)
+                        - square(t0 - t2)
+                        - square(t1 - t2);
+                if (discriminant3 > 0.0D) {
+                    result = (t0 + t1 + t2 + Math.sqrt(discriminant3)) / 3.0D;
+                } else {
+                    result = t2 + s;
+                }
+            }
+        }
+        return result;
+    }
+
+    private static double square(double value) {
+        return value * value;
+    }
+
+    private static int eikonalGridIndex(int xOffset, int yOffset, int zOffset, int sizeY, int sizeZ) {
+        return ((xOffset * sizeY) + yOffset) * sizeZ + zOffset;
+    }
+
+    private static void applyStructuralCollapsePass(ServerLevel level,
+                                                    double centerX,
+                                                    double centerY,
+                                                    double centerZ,
+                                                    double radiusSq,
+                                                    int minX,
+                                                    int maxX,
+                                                    int minY,
+                                                    int maxY,
+                                                    int minZ,
+                                                    int maxZ,
+                                                    LongArrayList candidateSolidPositions,
+                                                    Entity source,
+                                                    LivingEntity owner,
+                                                    boolean applyWorldChanges,
+                                                    ExplosionProfileTrace trace) {
+        if (!applyWorldChanges && trace == null) {
+            return;
+        }
+        if (candidateSolidPositions.isEmpty()) {
+            return;
+        }
+
+        int sizeX = maxX - minX + 1;
+        int sizeY = maxY - minY + 1;
+        int sizeZ = maxZ - minZ + 1;
+        long volumeLong = (long) sizeX * (long) sizeY * (long) sizeZ;
+        if (volumeLong <= 0L || volumeLong > STRUCTURAL_COLLAPSE_MAX_VOXELS) {
+            return;
+        }
+
+        int yzStride = sizeY * sizeZ;
+        BitSet unsupportedMask = new BitSet((int) volumeLong);
+        IntArrayList bfsQueue = new IntArrayList(Math.max(64, candidateSolidPositions.size() / 32));
+        BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        for (int i = 0; i < candidateSolidPositions.size(); i++) {
+            long posLong = candidateSolidPositions.getLong(i);
+            int x = BlockPos.getX(posLong);
+            int y = BlockPos.getY(posLong);
+            int z = BlockPos.getZ(posLong);
+            if (x < minX || x > maxX || y < minY || y > maxY || z < minZ || z > maxZ) {
+                continue;
+            }
+
+            int index = eikonalGridIndex(x - minX, y - minY, z - minZ, sizeY, sizeZ);
+            if (unsupportedMask.get(index)) {
+                continue;
+            }
+
+            mutablePos.set(x, y, z);
+            if (level.getBlockState(mutablePos).isAir()) {
+                continue;
+            }
+
+            unsupportedMask.set(index);
+            if (isStructuralBoundaryVoxel(x, y, z, centerX, centerY, centerZ, radiusSq)) {
+                unsupportedMask.clear(index);
+                bfsQueue.add(index);
+            }
+        }
+
+        for (int head = 0; head < bfsQueue.size(); head++) {
+            int index = bfsQueue.getInt(head);
+            int xOffset = index / yzStride;
+            int rem = index - (xOffset * yzStride);
+            int yOffset = rem / sizeZ;
+            int zOffset = rem - (yOffset * sizeZ);
+
+            if (xOffset > 0) {
+                int neighbor = index - yzStride;
+                if (unsupportedMask.get(neighbor)) {
+                    unsupportedMask.clear(neighbor);
+                    bfsQueue.add(neighbor);
+                }
+            }
+            if (xOffset + 1 < sizeX) {
+                int neighbor = index + yzStride;
+                if (unsupportedMask.get(neighbor)) {
+                    unsupportedMask.clear(neighbor);
+                    bfsQueue.add(neighbor);
+                }
+            }
+            if (yOffset > 0) {
+                int neighbor = index - sizeZ;
+                if (unsupportedMask.get(neighbor)) {
+                    unsupportedMask.clear(neighbor);
+                    bfsQueue.add(neighbor);
+                }
+            }
+            if (yOffset + 1 < sizeY) {
+                int neighbor = index + sizeZ;
+                if (unsupportedMask.get(neighbor)) {
+                    unsupportedMask.clear(neighbor);
+                    bfsQueue.add(neighbor);
+                }
+            }
+            if (zOffset > 0) {
+                int neighbor = index - 1;
+                if (unsupportedMask.get(neighbor)) {
+                    unsupportedMask.clear(neighbor);
+                    bfsQueue.add(neighbor);
+                }
+            }
+            if (zOffset + 1 < sizeZ) {
+                int neighbor = index + 1;
+                if (unsupportedMask.get(neighbor)) {
+                    unsupportedMask.clear(neighbor);
+                    bfsQueue.add(neighbor);
+                }
+            }
+        }
+
+        if (unsupportedMask.isEmpty()) {
+            return;
+        }
+
+        BlockPos.MutableBlockPos collapsePos = new BlockPos.MutableBlockPos();
+        for (int index = unsupportedMask.nextSetBit(0); index >= 0; index = unsupportedMask.nextSetBit(index + 1)) {
+            int xOffset = index / yzStride;
+            int rem = index - (xOffset * yzStride);
+            int yOffset = rem / sizeZ;
+            int zOffset = rem - (yOffset * sizeZ);
+            long posLong = BlockPos.asLong(minX + xOffset, minY + yOffset, minZ + zOffset);
+            applySingleBlockImpact(
+                    level,
+                    collapsePos,
+                    posLong,
+                    STRUCTURAL_COLLAPSE_IMPACT_POWER,
+                    source,
+                    owner,
+                    applyWorldChanges,
+                    trace
+            );
+        }
+    }
+
+    private static boolean isStructuralBoundaryVoxel(int x,
+                                                     int y,
+                                                     int z,
+                                                     double centerX,
+                                                     double centerY,
+                                                     double centerZ,
+                                                     double radiusSq) {
+        double cx = (x + 0.5D) - centerX;
+        double cy = (y + 0.5D) - centerY;
+        double cz = (z + 0.5D) - centerZ;
+        if ((square(cx + 1.0D) + square(cy) + square(cz)) > radiusSq) {
+            return true;
+        }
+        if ((square(cx - 1.0D) + square(cy) + square(cz)) > radiusSq) {
+            return true;
+        }
+        if ((square(cx) + square(cy + 1.0D) + square(cz)) > radiusSq) {
+            return true;
+        }
+        if ((square(cx) + square(cy - 1.0D) + square(cz)) > radiusSq) {
+            return true;
+        }
+        if ((square(cx) + square(cy) + square(cz + 1.0D)) > radiusSq) {
+            return true;
+        }
+        return (square(cx) + square(cy) + square(cz - 1.0D)) > radiusSq;
+    }
+
+    private static void runVolumetricPropagation(ServerLevel level,
+                                                 double centerX,
+                                                 double centerY,
+                                                 double centerZ,
+                                                 double blastRadius,
+                                                 double totalEnergy,
+                                                 Entity source,
+                                                 LivingEntity owner,
+                                                 boolean applyWorldChanges,
+                                                 ExplosionProfileTrace trace) {
+        BlockPos centerPos = BlockPos.containing(centerX, centerY, centerZ);
+        if (!level.isInWorldBounds(centerPos)) {
+            return;
+        }
+
+        double resolvedRadius = Mth.clamp(blastRadius, 1.0D, VOLUMETRIC_MAX_RADIUS);
+        double radiusSq = resolvedRadius * resolvedRadius;
+        int minX = Mth.floor(centerX - resolvedRadius);
+        int maxX = Mth.ceil(centerX + resolvedRadius);
+        int minY = Mth.floor(centerY - resolvedRadius);
+        int maxY = Mth.ceil(centerY + resolvedRadius);
+        int minZ = Mth.floor(centerZ - resolvedRadius);
+        int maxZ = Mth.ceil(centerZ + resolvedRadius);
+        Int2DoubleOpenHashMap resistanceCostCache = new Int2DoubleOpenHashMap(256);
+        resistanceCostCache.defaultReturnValue(Double.NaN);
+        long resistanceFieldStart = trace != null ? System.nanoTime() : 0L;
+        VolumetricResistanceField resistanceFieldData = buildVolumetricResistanceField(
+                level,
+                centerX,
+                centerY,
+                centerZ,
+                minX,
+                maxX,
+                minY,
+                maxY,
+                minZ,
+                maxZ,
+                radiusSq,
+                resistanceCostCache
+        );
+        Long2FloatOpenHashMap resistanceField = resistanceFieldData.resistanceByPos();
+        LongArrayList solidPositions = resistanceFieldData.solidPositions();
+        int sampledVoxelCount = resistanceFieldData.sampledVoxelCount();
+        if (trace != null) {
+            trace.volumetricResistanceFieldNanos += (System.nanoTime() - resistanceFieldStart);
+        }
+        if (resistanceField.isEmpty()) {
+            return;
+        }
+
+        long directionSetupStart = trace != null ? System.nanoTime() : 0L;
+        double pointScale = computeVolumetricRadiusScale(resolvedRadius, VOLUMETRIC_MAX_POINT_RADIUS_SCALE);
+        int directionCount = computeVolumetricDirectionSampleCount(resolvedRadius, pointScale);
+        VolumetricDirectionCache directionCache = getVolumetricDirectionCache(directionCount);
+        double[] dirX = directionCache.dirX();
+        double[] dirY = directionCache.dirY();
+        double[] dirZ = directionCache.dirZ();
+        int[][] directionNeighbors = directionCache.neighbors();
+        int radialSteps = Math.max(1, Mth.ceil(resolvedRadius / VOLUMETRIC_DEFORM_SAMPLE_STEP));
+        double radialStepSize = resolvedRadius / radialSteps;
+        float[] pressureByShell = new float[(radialSteps + 1) * directionCount];
+        Arrays.fill(pressureByShell, 0, directionCount, 1.0F);
+        float[] maxPressureByShell = new float[radialSteps + 1];
+        maxPressureByShell[0] = 1.0F;
+        float[] previousPressure = new float[directionCount];
+        Arrays.fill(previousPressure, 1.0F);
+        float[] rawPressure = new float[directionCount];
+        float[] currentPressure = new float[directionCount];
+        double perStepAirDecay = Mth.clamp(VOLUMETRIC_PRESSURE_AIR_DECAY_PER_BLOCK * radialStepSize, 0.0D, 0.95D);
+        double perStepRecovery = Math.max(0.0D, VOLUMETRIC_PRESSURE_RECOVERY_PER_BLOCK * radialStepSize);
+        if (trace != null) {
+            trace.volumetricDirectionSetupNanos += (System.nanoTime() - directionSetupStart);
+            trace.volumetricDirectionSamples += directionCount;
+            trace.volumetricRadialSteps += radialSteps;
+        }
+
+        long pressureSolveStart = trace != null ? System.nanoTime() : 0L;
+        for (int shell = 1; shell <= radialSteps; shell++) {
+            double t = shell * radialStepSize;
+            for (int i = 0; i < directionCount; i++) {
+                int sampleX = Mth.floor(centerX + (dirX[i] * t));
+                int sampleY = Mth.floor(centerY + (dirY[i] * t));
+                int sampleZ = Mth.floor(centerZ + (dirZ[i] * t));
+                long samplePosLong = BlockPos.asLong(sampleX, sampleY, sampleZ);
+                float sampleResistance = resistanceField.get(samplePosLong);
+                double transmitted = previousPressure[i] * (1.0D - perStepAirDecay);
+                transmitted -= sampleResistance * VOLUMETRIC_PRESSURE_RESISTANCE_LOSS_SCALE * radialStepSize;
+                rawPressure[i] = (float) Mth.clamp(transmitted, 0.0D, 1.0D);
+            }
+
+            int rowOffset = shell * directionCount;
+            float shellMaxPressure = 0.0F;
+            for (int i = 0; i < directionCount; i++) {
+                int[] neighbors = directionNeighbors[i];
+                double neighborPressure = 0.0D;
+                int validNeighbors = 0;
+                for (int neighborIndex : neighbors) {
+                    if (neighborIndex < 0) {
+                        continue;
+                    }
+                    neighborPressure += rawPressure[neighborIndex];
+                    validNeighbors++;
+                }
+                double neighborAverage = validNeighbors > 0 ? (neighborPressure / validNeighbors) : rawPressure[i];
+                double diffusedPressure = Mth.lerp(VOLUMETRIC_PRESSURE_DIFFUSION, rawPressure[i], neighborAverage);
+                double recoveredPressure = Math.min(diffusedPressure, previousPressure[i] + perStepRecovery);
+                currentPressure[i] = (float) Mth.clamp(recoveredPressure, 0.0D, 1.0D);
+                pressureByShell[rowOffset + i] = currentPressure[i];
+                if (currentPressure[i] > shellMaxPressure) {
+                    shellMaxPressure = currentPressure[i];
+                }
+            }
+            maxPressureByShell[shell] = shellMaxPressure;
+
+            float[] swap = previousPressure;
+            previousPressure = currentPressure;
+            currentPressure = swap;
+        }
+        if (trace != null) {
+            trace.volumetricPressureSolveNanos += (System.nanoTime() - pressureSolveStart);
+        }
+
+        if (trace != null) {
+            trace.initialRays = directionCount;
+            trace.processedRays += directionCount;
+        }
+        LongArrayList targetPositions;
+        FloatArrayList targetWeights;
+        double solidWeight = 0.0D;
+        int sampledSolidCount = solidPositions.size();
+        long targetScanStart = trace != null ? System.nanoTime() : 0L;
+        VolumetricTargetScanContext targetScanContext = new VolumetricTargetScanContext(
+                centerX,
+                centerY,
+                centerZ,
+                resolvedRadius,
+                radialStepSize,
+                radialSteps,
+                pressureByShell,
+                maxPressureByShell,
+                directionCount,
+                dirX,
+                dirY,
+                dirZ
+        );
+        VolumetricTargetScanResult targetScanResult = scanVolumetricTargets(
+                solidPositions,
+                targetScanContext,
+                true,
+                trace != null
+        );
+        targetPositions = targetScanResult.targetPositions();
+        targetWeights = targetScanResult.targetWeights();
+        for (int i = 0; i < targetWeights.size(); i++) {
+            solidWeight += targetWeights.getFloat(i);
+        }
+        if (trace != null) {
+            trace.volumetricTargetScanNanos += (System.nanoTime() - targetScanStart);
+            trace.volumetricTargetScanPrecheckNanos += targetScanResult.precheckNanos();
+            trace.volumetricTargetScanBlendNanos += targetScanResult.blendNanos();
+            trace.volumetricSampledVoxels += sampledVoxelCount;
+            trace.volumetricSampledSolids += sampledSolidCount;
+        }
+
+        if (targetPositions.isEmpty()
+                || solidWeight <= VOLUMETRIC_MIN_ENERGY
+                || sampledSolidCount <= 0
+                || sampledVoxelCount <= 0) {
+            return;
+        }
+        if (trace != null) {
+            trace.rawImpactedBlocks += targetPositions.size();
+            trace.postAaImpactedBlocks += targetPositions.size();
+            trace.volumetricTargetBlocks += targetPositions.size();
+        }
+
+        double powerScale = computeVolumetricRadiusScale(resolvedRadius, VOLUMETRIC_MAX_POWER_RADIUS_SCALE);
+        double impactBudget = totalEnergy * VOLUMETRIC_IMPACT_POWER_PER_ENERGY * powerScale;
+        double airNormalizationScale = computeVolumetricAirNormalizationScale(sampledSolidCount, sampledVoxelCount);
+        double normalizationWeight = solidWeight * airNormalizationScale;
+        BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        long impactApplyStart = trace != null ? System.nanoTime() : 0L;
+        for (int i = 0; i < targetPositions.size(); i++) {
+            double weight = targetWeights.getFloat(i);
+            if (weight <= VOLUMETRIC_MIN_ENERGY) {
+                continue;
+            }
+            double impactPower = impactBudget * (weight / normalizationWeight);
+            applySingleBlockImpact(
+                    level,
+                    mutablePos,
+                    targetPositions.getLong(i),
+                    impactPower,
+                    source,
+                    owner,
+                    applyWorldChanges,
+                    trace
+            );
+        }
+        applyStructuralCollapsePass(
+                level,
+                centerX,
+                centerY,
+                centerZ,
+                radiusSq,
+                minX,
+                maxX,
+                minY,
+                maxY,
+                minZ,
+                maxZ,
+                solidPositions,
+                source,
+                owner,
+                applyWorldChanges,
+                trace
+        );
+        if (trace != null) {
+            trace.volumetricImpactApplyNanos += (System.nanoTime() - impactApplyStart);
+        }
+    }
+
+    private static VolumetricResistanceField buildVolumetricResistanceField(ServerLevel level,
+                                                                            double centerX,
+                                                                            double centerY,
+                                                                            double centerZ,
+                                                                            int minX,
+                                                                            int maxX,
+                                                                            int minY,
+                                                                            int maxY,
+                                                                            int minZ,
+                                                                            int maxZ,
+                                                                            double radiusSq,
+                                                                            Int2DoubleOpenHashMap resistanceCostCache) {
+        BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        int estimatedEntries = estimateVolumetricResistanceFieldEntries(radiusSq);
+        Long2FloatOpenHashMap resistanceField = new Long2FloatOpenHashMap(estimatedEntries);
+        resistanceField.defaultReturnValue(0.0F);
+        LongArrayList solidPositions = new LongArrayList(Math.max(64, (int) Math.ceil(estimatedEntries * 0.75D)));
+        int sampledVoxelCount = 0;
+        for (int x = minX; x <= maxX; x++) {
+            for (int y = minY; y <= maxY; y++) {
+                for (int z = minZ; z <= maxZ; z++) {
+                    double dx = (x + 0.5D) - centerX;
+                    double dy = (y + 0.5D) - centerY;
+                    double dz = (z + 0.5D) - centerZ;
+                    double distSq = (dx * dx) + (dy * dy) + (dz * dz);
+                    if (distSq > radiusSq) {
+                        continue;
+                    }
+                    mutablePos.set(x, y, z);
+                    if (!level.isInWorldBounds(mutablePos)) {
+                        continue;
+                    }
+                    sampledVoxelCount++;
+                    BlockState blockState = level.getBlockState(mutablePos);
+                    if (blockState.isAir()) {
+                        continue;
+                    }
+                    long posLong = mutablePos.asLong();
+                    resistanceField.put(posLong, (float) getCachedResistanceCost(resistanceCostCache, blockState));
+                    solidPositions.add(posLong);
+                }
+            }
+        }
+
+        if (solidPositions.isEmpty()) {
+            Long2FloatOpenHashMap empty = new Long2FloatOpenHashMap(16);
+            empty.defaultReturnValue(0.0F);
+            return new VolumetricResistanceField(empty, new LongArrayList(), sampledVoxelCount);
+        }
+        return new VolumetricResistanceField(resistanceField, solidPositions, sampledVoxelCount);
+    }
+
+    private static int estimateVolumetricResistanceFieldEntries(double radiusSq) {
+        double clampedRadiusSq = Math.max(0.0D, radiusSq);
+        double radius = Math.sqrt(clampedRadiusSq);
+        double sphereVolume = (4.0D / 3.0D) * Math.PI * radius * radius * radius;
+        double estimatedSolidCount = Math.max(1.0D, sphereVolume * VOLUMETRIC_RESISTANCE_FIELD_PREALLOC_SOLID_FRACTION);
+        return Math.max(64, (int) Math.min(Integer.MAX_VALUE - 8L, Math.ceil(estimatedSolidCount / 0.75D)));
+    }
+
+    private static VolumetricTargetScanResult scanVolumetricTargets(LongArrayList solidPositions,
+                                                                     VolumetricTargetScanContext context,
+                                                                     boolean allowParallel,
+                                                                     boolean profileSubstages) {
+        int solidCount = solidPositions.size();
+        int taskCount = resolveVolumetricTargetScanTaskCount(solidCount);
+        if (!allowParallel || taskCount <= 1 || VOLUMETRIC_TARGET_SCAN_POOL == null) {
+            return scanVolumetricTargetScanChunk(solidPositions, 0, solidCount, context, profileSubstages);
+        }
+
+        int chunkSize = (solidCount + taskCount - 1) / taskCount;
+        ArrayList<Future<VolumetricTargetScanResult>> futures = new ArrayList<>(taskCount);
+        for (int taskIndex = 0; taskIndex < taskCount; taskIndex++) {
+            int startIndex = taskIndex * chunkSize;
+            int endIndex = Math.min(solidCount, startIndex + chunkSize);
+            if (startIndex >= endIndex) {
+                break;
+            }
+            final int chunkStart = startIndex;
+            final int chunkEnd = endIndex;
+            futures.add(VOLUMETRIC_TARGET_SCAN_POOL.submit(
+                    () -> scanVolumetricTargetScanChunk(solidPositions, chunkStart, chunkEnd, context, profileSubstages)
+            ));
+        }
+
+        LongArrayList mergedPositions = new LongArrayList(Math.max(64, solidCount / 8));
+        FloatArrayList mergedWeights = new FloatArrayList(Math.max(64, solidCount / 8));
+        long precheckNanos = 0L;
+        long blendNanos = 0L;
+        try {
+            for (Future<VolumetricTargetScanResult> future : futures) {
+                VolumetricTargetScanResult chunkResult = future.get();
+                precheckNanos = Math.max(precheckNanos, chunkResult.precheckNanos());
+                blendNanos = Math.max(blendNanos, chunkResult.blendNanos());
+                LongArrayList chunkPositions = chunkResult.targetPositions();
+                FloatArrayList chunkWeights = chunkResult.targetWeights();
+                for (int i = 0; i < chunkPositions.size(); i++) {
+                    mergedPositions.add(chunkPositions.getLong(i));
+                    mergedWeights.add(chunkWeights.getFloat(i));
+                }
+            }
+            return new VolumetricTargetScanResult(mergedPositions, mergedWeights, precheckNanos, blendNanos);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            cancelVolumetricTargetScanFutures(futures);
+        } catch (ExecutionException exception) {
+            cancelVolumetricTargetScanFutures(futures);
+        }
+        return scanVolumetricTargetScanChunk(solidPositions, 0, solidCount, context, profileSubstages);
+    }
+
+    private static VolumetricTargetScanResult scanVolumetricTargetScanChunk(LongArrayList solidPositions,
+                                                                            int startInclusive,
+                                                                            int endExclusive,
+                                                                            VolumetricTargetScanContext context,
+                                                                            boolean profileSubstages) {
+        int expectedTargets = Math.max(16, (endExclusive - startInclusive) / 8);
+        LongArrayList targetPositions = new LongArrayList(expectedTargets);
+        FloatArrayList targetWeights = new FloatArrayList(expectedTargets);
+        long precheckNanos = 0L;
+        long blendNanos = 0L;
+        for (int i = startInclusive; i < endExclusive; i++) {
+            long posLong = solidPositions.getLong(i);
+            int x = BlockPos.getX(posLong);
+            int y = BlockPos.getY(posLong);
+            int z = BlockPos.getZ(posLong);
+            long precheckStart = profileSubstages ? System.nanoTime() : 0L;
+
+            double dx = (x + 0.5D) - context.centerX();
+            double dy = (y + 0.5D) - context.centerY();
+            double dz = (z + 0.5D) - context.centerZ();
+            double distSq = (dx * dx) + (dy * dy) + (dz * dz);
+            double dist = Math.sqrt(distSq);
+            double shellPosition = dist / Math.max(context.radialStepSize(), 1.0E-9D);
+            double nx;
+            double ny;
+            double nz;
+            if (dist <= 1.0E-9D) {
+                nx = 0.0D;
+                ny = 1.0D;
+                nz = 0.0D;
+            } else {
+                nx = dx / dist;
+                ny = dy / dist;
+                nz = dz / dist;
+            }
+            double radialFraction = dist / Math.max(context.resolvedRadius(), 1.0E-9D);
+            if (radialFraction >= VOLUMETRIC_EDGE_SPIKE_START_FRACTION) {
+                double edgeRadiusScale = computeVolumetricEdgeRadiusScale(
+                        context.centerX(),
+                        context.centerY(),
+                        context.centerZ(),
+                        radialFraction,
+                        nx,
+                        ny,
+                        nz
+                );
+                radialFraction = dist / Math.max(context.resolvedRadius() * edgeRadiusScale, 1.0E-9D);
+            }
+            if (radialFraction >= 1.0D) {
+                if (profileSubstages) {
+                    precheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            radialFraction = Mth.clamp(radialFraction, 0.0D, 1.0D);
+            double centerGradient = 1.0D - radialFraction;
+            double edgeGradient = Math.pow(radialFraction, VOLUMETRIC_EDGE_POINT_BIAS_EXPONENT);
+            double gradient = Mth.lerp(VOLUMETRIC_EDGE_POINT_BIAS_BLEND, centerGradient, edgeGradient);
+            if (gradient <= 0.0D) {
+                if (profileSubstages) {
+                    precheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+
+            double outerSmoothFactor = radialFraction <= VOLUMETRIC_OUTER_SMOOTHING_FULL_WEIGHT_FRACTION
+                    ? 1.0D
+                    : computeVolumetricOuterSmoothFactor(radialFraction, x, y, z);
+            double maxWeight = gradient * outerSmoothFactor;
+            if (maxWeight <= VOLUMETRIC_MIN_ENERGY) {
+                if (profileSubstages) {
+                    precheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+
+            double clampedShell = Mth.clamp(shellPosition, 0.0D, context.radialSteps());
+            int lowerShell = Mth.floor(clampedShell);
+            int upperShell = Math.min(context.radialSteps(), lowerShell + 1);
+            double shellAlpha = clampedShell - lowerShell;
+            double shellPressureUpper = Mth.lerp(
+                    shellAlpha,
+                    context.maxPressureByShell()[lowerShell],
+                    context.maxPressureByShell()[upperShell]
+            );
+            if ((maxWeight * shellPressureUpper) <= VOLUMETRIC_MIN_ENERGY) {
+                if (profileSubstages) {
+                    precheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+
+            if (profileSubstages) {
+                precheckNanos += (System.nanoTime() - precheckStart);
+            }
+
+            long blendStart = profileSubstages ? System.nanoTime() : 0L;
+            double localPressure = sampleBlendedVolumetricPressure(
+                    context.pressureByShell(),
+                    context.directionCount(),
+                    lowerShell * context.directionCount(),
+                    upperShell * context.directionCount(),
+                    shellAlpha,
+                    nx,
+                    ny,
+                    nz,
+                    context.dirX(),
+                    context.dirY(),
+                    context.dirZ()
+            );
+            double pressureFactor = Mth.clamp(localPressure, 0.0D, 1.0D);
+            double weight = maxWeight * pressureFactor;
+            if (profileSubstages) {
+                blendNanos += (System.nanoTime() - blendStart);
+            }
+            if (weight <= VOLUMETRIC_MIN_ENERGY) {
+                continue;
+            }
+
+            targetPositions.add(posLong);
+            targetWeights.add((float) weight);
+        }
+        return new VolumetricTargetScanResult(targetPositions, targetWeights, precheckNanos, blendNanos);
+    }
+
+    private static int resolveVolumetricTargetScanTaskCount(int solidCount) {
+        if (VOLUMETRIC_TARGET_SCAN_POOL == null || solidCount < VOLUMETRIC_TARGET_SCAN_MIN_SOLIDS_FOR_PARALLEL) {
+            return 1;
+        }
+        int tasksBySize = Math.max(1, (solidCount + VOLUMETRIC_TARGET_SCAN_SOLIDS_PER_TASK - 1) / VOLUMETRIC_TARGET_SCAN_SOLIDS_PER_TASK);
+        int tasksByWorkers = Math.max(1, VOLUMETRIC_TARGET_SCAN_PARALLELISM * 2);
+        int taskCount = Math.min(tasksBySize, tasksByWorkers);
+        return Math.max(1, Math.min(VOLUMETRIC_TARGET_SCAN_MAX_TASKS, taskCount));
+    }
+
+    private static void cancelVolumetricTargetScanFutures(List<Future<VolumetricTargetScanResult>> futures) {
+        for (Future<VolumetricTargetScanResult> future : futures) {
+            future.cancel(true);
+        }
+    }
+
+    private static int computeVolumetricDirectionSampleCount(double radius, double pointScale) {
+        int computed = (int) Math.round(VOLUMETRIC_DIRECTION_SAMPLES_PER_RADIUS2 * radius * radius * pointScale);
+        return Mth.clamp(computed, VOLUMETRIC_MIN_DIRECTION_SAMPLES, VOLUMETRIC_MAX_DIRECTION_SAMPLES);
+    }
+
+    private static double computeVolumetricAirNormalizationScale(int solidCount, int sampledVoxelCount) {
+        if (solidCount <= 0 || sampledVoxelCount <= 0) {
+            return 1.0D;
+        }
+        double solidFraction = Mth.clamp(solidCount / (double) sampledVoxelCount, 1.0E-3D, 1.0D);
+        double inverseFraction = 1.0D / solidFraction;
+        double blended = Mth.lerp(VOLUMETRIC_AIR_DISTRIBUTION_BLEND, 1.0D, inverseFraction);
+        return Mth.clamp(blended, 1.0D, VOLUMETRIC_MAX_AIR_NORMALIZATION_SCALE);
+    }
+
+    private static VolumetricDirectionCache getVolumetricDirectionCache(int directionCount) {
+        return VOLUMETRIC_DIRECTION_CACHE.computeIfAbsent(directionCount, count -> {
+            double[] dirX = new double[count];
+            double[] dirY = new double[count];
+            double[] dirZ = new double[count];
+            for (int i = 0; i < count; i++) {
+                Direction direction = fibonacciDirection(i, count);
+                dirX[i] = direction.x;
+                dirY[i] = direction.y;
+                dirZ[i] = direction.z;
+            }
+            int[][] neighbors = computeVolumetricDirectionNeighbors(
+                    dirX,
+                    dirY,
+                    dirZ,
+                    VOLUMETRIC_DIRECTION_NEIGHBOR_COUNT
+            );
+            return new VolumetricDirectionCache(dirX, dirY, dirZ, neighbors);
+        });
+    }
+
+    private static double computeVolumetricRadiusScale(double radius, double maxScale) {
+        double normalized = radius / VOLUMETRIC_RADIUS_SCALE_BASE;
+        return Mth.clamp(normalized, 1.0D, maxScale);
+    }
+
+    private static double computeVolumetricOuterSmoothFactor(double radialFraction, int x, int y, int z) {
+        double smoothingRatio = VOLUMETRIC_OUTER_SMOOTHING_RATIO
+                + (sampleVolumetricOuterSmoothingVariance(x, y, z) * VOLUMETRIC_OUTER_SMOOTHING_VARIANCE);
+        smoothingRatio = Mth.clamp(smoothingRatio, 0.01D, 0.20D);
+        double start = 1.0D - smoothingRatio;
+        if (radialFraction <= start) {
+            return 1.0D;
+        }
+        double t = Mth.clamp((radialFraction - start) / Math.max(smoothingRatio, 1.0E-9D), 0.0D, 1.0D);
+        double smoothStep = t * t * (3.0D - (2.0D * t));
+        return 1.0D - smoothStep;
+    }
+
+    private static double computeVolumetricEdgeRadiusScale(double centerX,
+                                                           double centerY,
+                                                           double centerZ,
+                                                           double radialFraction,
+                                                           double nx,
+                                                           double ny,
+                                                           double nz) {
+        int qx = Mth.floor((nx + 1.0D) * VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION);
+        int qy = Mth.floor((ny + 1.0D) * VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION);
+        int qz = Mth.floor((nz + 1.0D) * VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION);
+        int cx = Mth.floor(centerX * 2.0D);
+        int cy = Mth.floor(centerY * 2.0D);
+        int cz = Mth.floor(centerZ * 2.0D);
+
+        double primary = sampleVolumetricEdgeSpikeNoise(qx, qy, qz, cx, cy, cz);
+        double secondary = sampleVolumetricEdgeSpikeNoise((qx * 2) + 17, (qy * 2) + 31, (qz * 2) + 47, cx, cy, cz);
+        double noise = Mth.clamp((primary * 0.72D) + (secondary * 0.28D), 0.0D, 1.0D);
+        double outerSpan = Math.max(1.0E-6D, 1.0D - VOLUMETRIC_EDGE_SPIKE_START_FRACTION);
+        double edgeProgress = Mth.clamp((radialFraction - VOLUMETRIC_EDGE_SPIKE_START_FRACTION) / outerSpan, 0.0D, 1.0D);
+        double smoothStep = edgeProgress * edgeProgress * (3.0D - (2.0D * edgeProgress));
+        double ramp = Math.pow(smoothStep, VOLUMETRIC_EDGE_SPIKE_RAMP_EXPONENT);
+        double strength = Mth.lerp(ramp, VOLUMETRIC_EDGE_SPIKE_MIN_STRENGTH, 1.0D);
+        double reduction = VOLUMETRIC_EDGE_SPIKE_MAX_REDUCTION
+                * strength
+                * Math.pow(noise, VOLUMETRIC_EDGE_SPIKE_REDUCTION_EXPONENT);
+        return Mth.clamp(1.0D - reduction, 0.55D, 1.0D);
+    }
+
+    private static double sampleVolumetricEdgeSpikeNoise(int x, int y, int z, int cx, int cy, int cz) {
+        long hash = 0xD6E8FEB86659FD93L;
+        hash ^= ((long) x) * 0x9E3779B97F4A7C15L;
+        hash ^= ((long) y) * 0xC2B2AE3D27D4EB4FL;
+        hash ^= ((long) z) * 0x165667B19E3779F9L;
+        hash ^= ((long) cx) * 0x94D049BB133111EBL;
+        hash ^= ((long) cy) * 0xFF51AFD7ED558CCDL;
+        hash ^= ((long) cz) * 0xC4CEB9FE1A85EC53L;
+        hash ^= (hash >>> 33);
+        hash *= 0xFF51AFD7ED558CCDL;
+        hash ^= (hash >>> 33);
+        hash *= 0xC4CEB9FE1A85EC53L;
+        hash ^= (hash >>> 33);
+        return ((hash >>> 11) & 0x1FFFFFL) / 2097151.0D;
+    }
+
+    private static double sampleVolumetricOuterSmoothingVariance(int x, int y, int z) {
+        long hash = 0x9E3779B97F4A7C15L;
+        hash ^= ((long) x) * 0xC2B2AE3D27D4EB4FL;
+        hash ^= ((long) y) * 0x165667B19E3779F9L;
+        hash ^= ((long) z) * 0x85EBCA77C2B2AE63L;
+        hash ^= (hash >>> 33);
+        hash *= 0xFF51AFD7ED558CCDL;
+        hash ^= (hash >>> 33);
+        hash *= 0xC4CEB9FE1A85EC53L;
+        hash ^= (hash >>> 33);
+        double unit = ((hash >>> 11) & 0x1FFFFFL) / 2097151.0D;
+        return (unit * 2.0D) - 1.0D;
+    }
+
+    private static double sampleBlendedVolumetricPressure(float[] pressureByShell,
+                                                          int directionCount,
+                                                          int lowerRowOffset,
+                                                          int upperRowOffset,
+                                                          double shellAlpha,
+                                                          double nx,
+                                                          double ny,
+                                                          double nz,
+                                                          double[] dirX,
+                                                          double[] dirY,
+                                                          double[] dirZ) {
+        int blendCount = Math.min(VOLUMETRIC_DIRECTION_BLEND_COUNT, directionCount);
+        int best0 = -1;
+        int best1 = -1;
+        int best2 = -1;
+        int best3 = -1;
+        int best4 = -1;
+        int best5 = -1;
+        int best6 = -1;
+        int best7 = -1;
+        double dot0 = -Double.MAX_VALUE;
+        double dot1 = -Double.MAX_VALUE;
+        double dot2 = -Double.MAX_VALUE;
+        double dot3 = -Double.MAX_VALUE;
+        double dot4 = -Double.MAX_VALUE;
+        double dot5 = -Double.MAX_VALUE;
+        double dot6 = -Double.MAX_VALUE;
+        double dot7 = -Double.MAX_VALUE;
+        for (int i = 0; i < directionCount; i++) {
+            double dot = (nx * dirX[i]) + (ny * dirY[i]) + (nz * dirZ[i]);
+            if (dot > dot0) {
+                dot7 = dot6;
+                best7 = best6;
+                dot6 = dot5;
+                best6 = best5;
+                dot5 = dot4;
+                best5 = best4;
+                dot4 = dot3;
+                best4 = best3;
+                dot3 = dot2;
+                best3 = best2;
+                dot2 = dot1;
+                best2 = best1;
+                dot1 = dot0;
+                best1 = best0;
+                dot0 = dot;
+                best0 = i;
+            } else if (dot > dot1) {
+                dot7 = dot6;
+                best7 = best6;
+                dot6 = dot5;
+                best6 = best5;
+                dot5 = dot4;
+                best5 = best4;
+                dot4 = dot3;
+                best4 = best3;
+                dot3 = dot2;
+                best3 = best2;
+                dot2 = dot1;
+                best2 = best1;
+                dot1 = dot;
+                best1 = i;
+            } else if (dot > dot2) {
+                dot7 = dot6;
+                best7 = best6;
+                dot6 = dot5;
+                best6 = best5;
+                dot5 = dot4;
+                best5 = best4;
+                dot4 = dot3;
+                best4 = best3;
+                dot3 = dot2;
+                best3 = best2;
+                dot2 = dot;
+                best2 = i;
+            } else if (dot > dot3) {
+                dot7 = dot6;
+                best7 = best6;
+                dot6 = dot5;
+                best6 = best5;
+                dot5 = dot4;
+                best5 = best4;
+                dot4 = dot3;
+                best4 = best3;
+                dot3 = dot;
+                best3 = i;
+            } else if (dot > dot4) {
+                dot7 = dot6;
+                best7 = best6;
+                dot6 = dot5;
+                best6 = best5;
+                dot5 = dot4;
+                best5 = best4;
+                dot4 = dot;
+                best4 = i;
+            } else if (dot > dot5) {
+                dot7 = dot6;
+                best7 = best6;
+                dot6 = dot5;
+                best6 = best5;
+                dot5 = dot;
+                best5 = i;
+            } else if (dot > dot6) {
+                dot7 = dot6;
+                best7 = best6;
+                dot6 = dot;
+                best6 = i;
+            } else if (dot > dot7) {
+                dot7 = dot;
+                best7 = i;
+            }
+        }
+
+        double weightedPressure = 0.0D;
+        double weightSum = 0.0D;
+        if (best0 >= 0) {
+            double weight0 = Math.pow(Math.max(0.0D, dot0), VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT);
+            if (weight0 > 0.0D) {
+                double pressure0 = Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best0], pressureByShell[upperRowOffset + best0]);
+                weightedPressure += pressure0 * weight0;
+                weightSum += weight0;
+            }
+        }
+        if (blendCount >= 2 && best1 >= 0) {
+            double weight1 = Math.pow(Math.max(0.0D, dot1), VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT);
+            if (weight1 > 0.0D) {
+                double pressure1 = Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best1], pressureByShell[upperRowOffset + best1]);
+                weightedPressure += pressure1 * weight1;
+                weightSum += weight1;
+            }
+        }
+        if (blendCount >= 3 && best2 >= 0) {
+            double weight2 = Math.pow(Math.max(0.0D, dot2), VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT);
+            if (weight2 > 0.0D) {
+                double pressure2 = Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best2], pressureByShell[upperRowOffset + best2]);
+                weightedPressure += pressure2 * weight2;
+                weightSum += weight2;
+            }
+        }
+        if (blendCount >= 4 && best3 >= 0) {
+            double weight3 = Math.pow(Math.max(0.0D, dot3), VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT);
+            if (weight3 > 0.0D) {
+                double pressure3 = Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best3], pressureByShell[upperRowOffset + best3]);
+                weightedPressure += pressure3 * weight3;
+                weightSum += weight3;
+            }
+        }
+        if (blendCount >= 5 && best4 >= 0) {
+            double weight4 = Math.pow(Math.max(0.0D, dot4), VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT);
+            if (weight4 > 0.0D) {
+                double pressure4 = Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best4], pressureByShell[upperRowOffset + best4]);
+                weightedPressure += pressure4 * weight4;
+                weightSum += weight4;
+            }
+        }
+        if (blendCount >= 6 && best5 >= 0) {
+            double weight5 = Math.pow(Math.max(0.0D, dot5), VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT);
+            if (weight5 > 0.0D) {
+                double pressure5 = Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best5], pressureByShell[upperRowOffset + best5]);
+                weightedPressure += pressure5 * weight5;
+                weightSum += weight5;
+            }
+        }
+        if (blendCount >= 7 && best6 >= 0) {
+            double weight6 = Math.pow(Math.max(0.0D, dot6), VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT);
+            if (weight6 > 0.0D) {
+                double pressure6 = Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best6], pressureByShell[upperRowOffset + best6]);
+                weightedPressure += pressure6 * weight6;
+                weightSum += weight6;
+            }
+        }
+        if (blendCount >= 8 && best7 >= 0) {
+            double weight7 = Math.pow(Math.max(0.0D, dot7), VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT);
+            if (weight7 > 0.0D) {
+                double pressure7 = Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best7], pressureByShell[upperRowOffset + best7]);
+                weightedPressure += pressure7 * weight7;
+                weightSum += weight7;
+            }
+        }
+        if (weightSum > 1.0E-9D) {
+            return weightedPressure / weightSum;
+        }
+        if (best0 >= 0) {
+            return Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best0], pressureByShell[upperRowOffset + best0]);
+        }
+        return 0.0D;
+    }
+
+    private static int[][] computeVolumetricDirectionNeighbors(double[] dirX,
+                                                               double[] dirY,
+                                                               double[] dirZ,
+                                                               int neighborCount) {
+        int directionCount = dirX.length;
+        int[][] neighbors = new int[directionCount][neighborCount];
+        for (int i = 0; i < directionCount; i++) {
+            Arrays.fill(neighbors[i], -1);
+            double[] bestDots = new double[neighborCount];
+            Arrays.fill(bestDots, -Double.MAX_VALUE);
+            for (int j = 0; j < directionCount; j++) {
+                if (i == j) {
+                    continue;
+                }
+                double dot = (dirX[i] * dirX[j]) + (dirY[i] * dirY[j]) + (dirZ[i] * dirZ[j]);
+                int insertIndex = -1;
+                for (int k = 0; k < neighborCount; k++) {
+                    if (dot > bestDots[k]) {
+                        insertIndex = k;
+                        break;
+                    }
+                }
+                if (insertIndex < 0) {
+                    continue;
+                }
+                for (int k = neighborCount - 1; k > insertIndex; k--) {
+                    bestDots[k] = bestDots[k - 1];
+                    neighbors[i][k] = neighbors[i][k - 1];
+                }
+                bestDots[insertIndex] = dot;
+                neighbors[i][insertIndex] = j;
+            }
+        }
+        return neighbors;
+    }
+
+    private static Direction fibonacciDirection(int index, int count) {
+        double t = (index + 0.5D) / count;
+        double y = 1.0D - (2.0D * t);
+        double radial = Math.sqrt(Math.max(0.0D, 1.0D - (y * y)));
+        double theta = index * GOLDEN_ANGLE;
+        double x = Math.cos(theta) * radial;
+        double z = Math.sin(theta) * radial;
+        return new Direction(x, y, z);
+    }
+
     private static void emitExplosionEffects(ServerLevel level, double x, double y, double z, RandomSource random) {
         level.playSound(
                 null,
@@ -335,7 +2357,13 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
 
         if (applyWorldChanges) {
-            KrakkImpactResult result = KrakkApi.damage().applyImpact(level, mutablePos, blockState, source, resolvedImpactPower, false);
+            var damageApi = KrakkApi.damage();
+            KrakkImpactResult result;
+            if (damageApi instanceof KrakkDamageRuntime damageRuntime) {
+                result = damageRuntime.applyImpactPrevalidated(level, mutablePos, blockState, source, resolvedImpactPower, false);
+            } else {
+                result = damageApi.applyImpact(level, mutablePos, blockState, source, resolvedImpactPower, false);
+            }
             if (trace != null) {
                 if (result.broken()) {
                     trace.brokenBlocks++;
@@ -2725,10 +4753,89 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private record Direction(double x, double y, double z) {
     }
 
+    private record VolumetricResistanceField(Long2FloatOpenHashMap resistanceByPos, LongArrayList solidPositions, int sampledVoxelCount) {
+    }
+
+    private record VolumetricDirectionCache(double[] dirX, double[] dirY, double[] dirZ, int[][] neighbors) {
+    }
+
+    private record VolumetricTargetScanContext(
+            double centerX,
+            double centerY,
+            double centerZ,
+            double resolvedRadius,
+            double radialStepSize,
+            int radialSteps,
+            float[] pressureByShell,
+            float[] maxPressureByShell,
+            int directionCount,
+            double[] dirX,
+            double[] dirY,
+            double[] dirZ
+    ) {
+    }
+
+    private record VolumetricTargetScanResult(
+            LongArrayList targetPositions,
+            FloatArrayList targetWeights,
+            long precheckNanos,
+            long blendNanos
+    ) {
+    }
+
+    private record EikonalField(
+            int minX,
+            int minY,
+            int minZ,
+            int sizeX,
+            int sizeY,
+            int sizeZ,
+            int sampledVoxelCount,
+            float[] slowness,
+            LongArrayList solidPositions
+    ) {
+    }
+
+    private record EikonalSolveResult(float[] arrivalTimes, int sweepCycles) {
+    }
+
     @Override
     public void detonate(ServerLevel level, double x, double y, double z, Entity source, LivingEntity owner, KrakkExplosionProfile profile) {
         ExplosionResolution resolution = resolveProfile(profile);
-        detonate(
+        if (resolution.mode == ExplosionMode.VOLUMETRIC) {
+            detonateVolumetric(
+                    level,
+                    x,
+                    y,
+                    z,
+                    source,
+                    owner,
+                    resolution.radius,
+                    resolution.energy,
+                    true,
+                    true,
+                    null
+            );
+            return;
+        }
+        if (resolution.mode == ExplosionMode.EIKONAL) {
+            detonateEikonal(
+                    level,
+                    x,
+                    y,
+                    z,
+                    source,
+                    owner,
+                    resolution.radius,
+                    resolution.energy,
+                    true,
+                    true,
+                    null
+            );
+            return;
+        }
+
+        detonateRaycast(
                 level,
                 x,
                 y,
@@ -2748,22 +4855,52 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                   LivingEntity owner, KrakkExplosionProfile profile, boolean applyWorldChanges, long seed) {
         ExplosionResolution resolution = resolveProfile(profile);
         ExplosionProfileTrace trace = new ExplosionProfileTrace();
-        RandomSource random = RandomSource.create(seed);
         long start = System.nanoTime();
-        detonate(
-                level,
-                x,
-                y,
-                z,
-                source,
-                owner,
-                resolution.radius,
-                resolution.power,
-                random,
-                applyWorldChanges,
-                applyWorldChanges,
-                trace
-        );
+        if (resolution.mode == ExplosionMode.VOLUMETRIC) {
+            detonateVolumetric(
+                    level,
+                    x,
+                    y,
+                    z,
+                    source,
+                    owner,
+                    resolution.radius,
+                    resolution.energy,
+                    applyWorldChanges,
+                    applyWorldChanges,
+                    trace
+            );
+        } else if (resolution.mode == ExplosionMode.EIKONAL) {
+            detonateEikonal(
+                    level,
+                    x,
+                    y,
+                    z,
+                    source,
+                    owner,
+                    resolution.radius,
+                    resolution.energy,
+                    applyWorldChanges,
+                    applyWorldChanges,
+                    trace
+            );
+        } else {
+            RandomSource random = RandomSource.create(seed);
+            detonateRaycast(
+                    level,
+                    x,
+                    y,
+                    z,
+                    source,
+                    owner,
+                    resolution.radius,
+                    resolution.power,
+                    random,
+                    applyWorldChanges,
+                    applyWorldChanges,
+                    trace
+            );
+        }
         long elapsed = System.nanoTime() - start;
         return new ExplosionProfileReport(
                 elapsed,
@@ -2799,6 +4936,18 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 trace.splitCheckNanos,
                 trace.entitySegmentNanos,
                 trace.entityApplyNanos,
+                trace.volumetricResistanceFieldNanos,
+                trace.volumetricDirectionSetupNanos,
+                trace.volumetricPressureSolveNanos,
+                trace.volumetricTargetScanNanos,
+                trace.volumetricTargetScanPrecheckNanos,
+                trace.volumetricTargetScanBlendNanos,
+                trace.volumetricImpactApplyNanos,
+                trace.volumetricSampledVoxels,
+                trace.volumetricSampledSolids,
+                trace.volumetricTargetBlocks,
+                trace.volumetricDirectionSamples,
+                trace.volumetricRadialSteps,
                 trace.syncPacketsEstimated,
                 trace.syncBytesEstimated,
                 trace.smokeParticles
@@ -2806,17 +4955,84 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     }
 
     private static ExplosionResolution resolveProfile(KrakkExplosionProfile profile) {
-        double resolvedPower;
         if (profile == null) {
-            resolvedPower = KrakkExplosionCurves.DEFAULT_IMPACT_POWER;
-        } else {
-            resolvedPower = KrakkExplosionCurves.sanitizeImpactPower(profile.impactPower());
+            double resolvedPower = KrakkExplosionCurves.DEFAULT_IMPACT_POWER;
+            double resolvedRadius = KrakkExplosionCurves.computeBlastRadius(resolvedPower);
+            return new ExplosionResolution(ExplosionMode.RAYCAST, resolvedRadius, resolvedPower, Double.NaN, false);
         }
+
+        KrakkExplosionProfile.Mode mode = profile.mode();
+        double fallbackPower = profile.impactPower();
+        if (!Double.isFinite(fallbackPower) || fallbackPower <= 0.0D) {
+            fallbackPower = KrakkExplosionCurves.DEFAULT_IMPACT_POWER;
+        } else {
+            fallbackPower = KrakkExplosionCurves.sanitizeImpactPower(fallbackPower);
+        }
+
+        if (mode == KrakkExplosionProfile.Mode.VOLUMETRIC) {
+            double resolvedRadius = sanitizeVolumetricRadius(profile.volumetricRadius(), fallbackPower);
+            double resolvedEnergy = sanitizeVolumetricEnergy(profile.volumetricEnergy(), fallbackPower, resolvedRadius);
+            return new ExplosionResolution(ExplosionMode.VOLUMETRIC, resolvedRadius, fallbackPower, resolvedEnergy, profile.debugVisuals());
+        }
+        if (mode == KrakkExplosionProfile.Mode.EIKONAL) {
+            double resolvedRadius = sanitizeEikonalRadius(profile.volumetricRadius(), fallbackPower);
+            double resolvedEnergy = sanitizeVolumetricEnergy(profile.volumetricEnergy(), fallbackPower, resolvedRadius);
+            return new ExplosionResolution(ExplosionMode.EIKONAL, resolvedRadius, fallbackPower, resolvedEnergy, profile.debugVisuals());
+        }
+
+        double resolvedPower = KrakkExplosionCurves.sanitizeImpactPower(fallbackPower);
         double resolvedRadius = KrakkExplosionCurves.computeBlastRadius(resolvedPower);
-        return new ExplosionResolution(resolvedRadius, resolvedPower);
+        return new ExplosionResolution(ExplosionMode.RAYCAST, resolvedRadius, resolvedPower, Double.NaN, profile.debugVisuals());
     }
 
-    private record ExplosionResolution(double radius, double power) {
+    private static double sanitizeVolumetricRadius(double radius, double fallbackPower) {
+        if (Double.isFinite(radius) && radius > 0.0D) {
+            return Mth.clamp(radius, 1.0D, VOLUMETRIC_MAX_RADIUS);
+        }
+        double fallbackRadius = KrakkExplosionCurves.computeBlastRadius(fallbackPower);
+        return Mth.clamp(fallbackRadius, 1.0D, VOLUMETRIC_MAX_RADIUS);
+    }
+
+    private static double sanitizeEikonalRadius(double radius, double fallbackPower) {
+        if (Double.isFinite(radius)) {
+            if (Math.abs(radius) <= 1.0E-9D) {
+                return 0.0D;
+            }
+            if (radius > 0.0D) {
+                return Math.max(1.0D, radius);
+            }
+        }
+        double fallbackRadius = KrakkExplosionCurves.computeBlastRadius(fallbackPower);
+        return Math.max(1.0D, fallbackRadius);
+    }
+
+    private static double resolveEikonalRadiusFromEnergyCutoff(double totalEnergy) {
+        double normalizedEnergy = Math.max(totalEnergy, VOLUMETRIC_MIN_ENERGY);
+        double decayPerBlock = Mth.clamp(VOLUMETRIC_PRESSURE_AIR_DECAY_PER_BLOCK, 1.0E-4D, 0.95D);
+        double logDecay = Math.log1p(-decayPerBlock);
+        double cutoffRatio = VOLUMETRIC_MIN_ENERGY / normalizedEnergy;
+        double distance = Math.log(cutoffRatio) / logDecay;
+        if (!Double.isFinite(distance)) {
+            return 1.0D;
+        }
+        return Math.max(1.0D, distance);
+    }
+
+    private static double sanitizeVolumetricEnergy(double energy, double fallbackPower, double resolvedRadius) {
+        if (Double.isFinite(energy) && energy > VOLUMETRIC_MIN_ENERGY) {
+            return energy;
+        }
+        double fallbackEnergy = fallbackPower * Math.max(1.0D, resolvedRadius);
+        return Math.max(VOLUMETRIC_MIN_ENERGY, fallbackEnergy);
+    }
+
+    private enum ExplosionMode {
+        RAYCAST,
+        VOLUMETRIC,
+        EIKONAL
+    }
+
+    private record ExplosionResolution(ExplosionMode mode, double radius, double power, double energy, boolean debugVisuals) {
     }
 
     private static final class ExplosionProfileTrace {
@@ -2850,6 +5066,18 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         private long splitCheckNanos;
         private long entitySegmentNanos;
         private long entityApplyNanos;
+        private long volumetricResistanceFieldNanos;
+        private long volumetricDirectionSetupNanos;
+        private long volumetricPressureSolveNanos;
+        private long volumetricTargetScanNanos;
+        private long volumetricTargetScanPrecheckNanos;
+        private long volumetricTargetScanBlendNanos;
+        private long volumetricImpactApplyNanos;
+        private int volumetricSampledVoxels;
+        private int volumetricSampledSolids;
+        private int volumetricTargetBlocks;
+        private int volumetricDirectionSamples;
+        private int volumetricRadialSteps;
         private int syncPacketsEstimated;
         private int syncBytesEstimated;
         private int smokeParticles;

@@ -176,12 +176,30 @@ public final class KrakkBlockDamageChunkStorage {
         }
     }
 
+    public void forEachSectionView(SectionViewConsumer consumer) {
+        for (Int2ObjectMap.Entry<SectionDamageState> entry : this.sectionsByY.int2ObjectEntrySet()) {
+            SectionDamageState section = entry.getValue();
+            if (section.damageStates.isEmpty()) {
+                continue;
+            }
+            consumer.accept(entry.getIntKey(), section.damageStates);
+        }
+    }
+
     public Short2ByteOpenHashMap snapshotSection(int sectionY) {
         SectionDamageState section = this.sectionsByY.get(sectionY);
         if (section == null || section.damageStates.isEmpty()) {
             return new Short2ByteOpenHashMap();
         }
         return section.snapshotDamageStates();
+    }
+
+    public Short2ByteOpenHashMap sectionView(int sectionY) {
+        SectionDamageState section = this.sectionsByY.get(sectionY);
+        if (section == null || section.damageStates.isEmpty()) {
+            return null;
+        }
+        return section.damageStates;
     }
 
     private void putInternal(int sectionY, short localIndex, byte damageState, long updateTick) {
@@ -232,6 +250,11 @@ public final class KrakkBlockDamageChunkStorage {
 
     @FunctionalInterface
     public interface SectionSnapshotConsumer {
+        void accept(int sectionY, Short2ByteOpenHashMap states);
+    }
+
+    @FunctionalInterface
+    public interface SectionViewConsumer {
         void accept(int sectionY, Short2ByteOpenHashMap states);
     }
 }

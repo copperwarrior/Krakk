@@ -74,6 +74,24 @@ public final class KrakkDebugCommands {
                                                         context.getSource(),
                                                         Vec3Argument.getVec3(context, "pos"),
                                                         DoubleArgumentType.getDouble(context, "power"))))))
+                        .then(Commands.literal("volexplode")
+                                .then(Commands.argument("pos", Vec3Argument.vec3())
+                                        .then(Commands.argument("radius", DoubleArgumentType.doubleArg(1.0D, 96.0D))
+                                                .then(Commands.argument("energy", DoubleArgumentType.doubleArg(0.1D, DEFAULT_MAX_POWER))
+                                                        .executes(context -> volumetricExplode(
+                                                                context.getSource(),
+                                                                Vec3Argument.getVec3(context, "pos"),
+                                                                DoubleArgumentType.getDouble(context, "radius"),
+                                                                DoubleArgumentType.getDouble(context, "energy")))))))
+                        .then(Commands.literal("eikexplode")
+                                .then(Commands.argument("pos", Vec3Argument.vec3())
+                                        .then(Commands.argument("radius", DoubleArgumentType.doubleArg(0.0D))
+                                                .then(Commands.argument("energy", DoubleArgumentType.doubleArg(0.1D, DEFAULT_MAX_POWER))
+                                                        .executes(context -> eikonalExplode(
+                                                                context.getSource(),
+                                                                Vec3Argument.getVec3(context, "pos"),
+                                                                DoubleArgumentType.getDouble(context, "radius"),
+                                                                DoubleArgumentType.getDouble(context, "energy")))))))
                         .then(Commands.literal("profexplode")
                                 .then(Commands.argument("pos", Vec3Argument.vec3())
                                         .then(Commands.argument("power", DoubleArgumentType.doubleArg(0.1D, DEFAULT_MAX_POWER))
@@ -121,6 +139,112 @@ public final class KrakkDebugCommands {
                                                                                         IntegerArgumentType.getInteger(context, "warmup"),
                                                                                         LongArgumentType.getLong(context, "seed"),
                                                                                         BoolArgumentType.getBool(context, "apply"))))))))))
+                        .then(Commands.literal("profvolexplode")
+                                .then(Commands.argument("pos", Vec3Argument.vec3())
+                                        .then(Commands.argument("radius", DoubleArgumentType.doubleArg(1.0D, 96.0D))
+                                                .then(Commands.argument("energy", DoubleArgumentType.doubleArg(0.1D, DEFAULT_MAX_POWER))
+                                                        .executes(context -> profVolumetricExplode(
+                                                                context.getSource(),
+                                                                Vec3Argument.getVec3(context, "pos"),
+                                                                DoubleArgumentType.getDouble(context, "radius"),
+                                                                DoubleArgumentType.getDouble(context, "energy"),
+                                                                DEFAULT_PROFILE_RUNS,
+                                                                DEFAULT_PROFILE_WARMUP,
+                                                                Long.MIN_VALUE,
+                                                                false))
+                                                        .then(Commands.argument("runs", IntegerArgumentType.integer(1, 200))
+                                                                .executes(context -> profVolumetricExplode(
+                                                                        context.getSource(),
+                                                                        Vec3Argument.getVec3(context, "pos"),
+                                                                        DoubleArgumentType.getDouble(context, "radius"),
+                                                                        DoubleArgumentType.getDouble(context, "energy"),
+                                                                        IntegerArgumentType.getInteger(context, "runs"),
+                                                                        DEFAULT_PROFILE_WARMUP,
+                                                                        Long.MIN_VALUE,
+                                                                        false))
+                                                                .then(Commands.argument("warmup", IntegerArgumentType.integer(0, 200))
+                                                                        .executes(context -> profVolumetricExplode(
+                                                                                context.getSource(),
+                                                                                Vec3Argument.getVec3(context, "pos"),
+                                                                                DoubleArgumentType.getDouble(context, "radius"),
+                                                                                DoubleArgumentType.getDouble(context, "energy"),
+                                                                                IntegerArgumentType.getInteger(context, "runs"),
+                                                                                IntegerArgumentType.getInteger(context, "warmup"),
+                                                                                Long.MIN_VALUE,
+                                                                                false))
+                                                                        .then(Commands.argument("seed", LongArgumentType.longArg())
+                                                                                .executes(context -> profVolumetricExplode(
+                                                                                        context.getSource(),
+                                                                                        Vec3Argument.getVec3(context, "pos"),
+                                                                                        DoubleArgumentType.getDouble(context, "radius"),
+                                                                                        DoubleArgumentType.getDouble(context, "energy"),
+                                                                                        IntegerArgumentType.getInteger(context, "runs"),
+                                                                                        IntegerArgumentType.getInteger(context, "warmup"),
+                                                                                        LongArgumentType.getLong(context, "seed"),
+                                                                                        false))
+                                                                                .then(Commands.argument("apply", BoolArgumentType.bool())
+                                                                                        .executes(context -> profVolumetricExplode(
+                                                                                                context.getSource(),
+                                                                                                Vec3Argument.getVec3(context, "pos"),
+                                                                                                DoubleArgumentType.getDouble(context, "radius"),
+                                                                                                DoubleArgumentType.getDouble(context, "energy"),
+                                                                                                IntegerArgumentType.getInteger(context, "runs"),
+                                                                                                IntegerArgumentType.getInteger(context, "warmup"),
+                                                                                                LongArgumentType.getLong(context, "seed"),
+                                                                                                BoolArgumentType.getBool(context, "apply")))))))))))
+                        .then(Commands.literal("profeikexplode")
+                                .then(Commands.argument("pos", Vec3Argument.vec3())
+                                        .then(Commands.argument("radius", DoubleArgumentType.doubleArg(0.0D))
+                                                .then(Commands.argument("energy", DoubleArgumentType.doubleArg(0.1D, DEFAULT_MAX_POWER))
+                                                        .executes(context -> profEikonalExplode(
+                                                                context.getSource(),
+                                                                Vec3Argument.getVec3(context, "pos"),
+                                                                DoubleArgumentType.getDouble(context, "radius"),
+                                                                DoubleArgumentType.getDouble(context, "energy"),
+                                                                DEFAULT_PROFILE_RUNS,
+                                                                DEFAULT_PROFILE_WARMUP,
+                                                                Long.MIN_VALUE,
+                                                                false))
+                                                        .then(Commands.argument("runs", IntegerArgumentType.integer(1, 200))
+                                                                .executes(context -> profEikonalExplode(
+                                                                        context.getSource(),
+                                                                        Vec3Argument.getVec3(context, "pos"),
+                                                                        DoubleArgumentType.getDouble(context, "radius"),
+                                                                        DoubleArgumentType.getDouble(context, "energy"),
+                                                                        IntegerArgumentType.getInteger(context, "runs"),
+                                                                        DEFAULT_PROFILE_WARMUP,
+                                                                        Long.MIN_VALUE,
+                                                                        false))
+                                                                .then(Commands.argument("warmup", IntegerArgumentType.integer(0, 200))
+                                                                        .executes(context -> profEikonalExplode(
+                                                                                context.getSource(),
+                                                                                Vec3Argument.getVec3(context, "pos"),
+                                                                                DoubleArgumentType.getDouble(context, "radius"),
+                                                                                DoubleArgumentType.getDouble(context, "energy"),
+                                                                                IntegerArgumentType.getInteger(context, "runs"),
+                                                                                IntegerArgumentType.getInteger(context, "warmup"),
+                                                                                Long.MIN_VALUE,
+                                                                                false))
+                                                                        .then(Commands.argument("seed", LongArgumentType.longArg())
+                                                                                .executes(context -> profEikonalExplode(
+                                                                                        context.getSource(),
+                                                                                        Vec3Argument.getVec3(context, "pos"),
+                                                                                        DoubleArgumentType.getDouble(context, "radius"),
+                                                                                        DoubleArgumentType.getDouble(context, "energy"),
+                                                                                        IntegerArgumentType.getInteger(context, "runs"),
+                                                                                        IntegerArgumentType.getInteger(context, "warmup"),
+                                                                                        LongArgumentType.getLong(context, "seed"),
+                                                                                        false))
+                                                                                .then(Commands.argument("apply", BoolArgumentType.bool())
+                                                                                        .executes(context -> profEikonalExplode(
+                                                                                                context.getSource(),
+                                                                                                Vec3Argument.getVec3(context, "pos"),
+                                                                                                DoubleArgumentType.getDouble(context, "radius"),
+                                                                                                DoubleArgumentType.getDouble(context, "energy"),
+                                                                                                IntegerArgumentType.getInteger(context, "runs"),
+                                                                                                IntegerArgumentType.getInteger(context, "warmup"),
+                                                                                                LongArgumentType.getLong(context, "seed"),
+                                                                                                BoolArgumentType.getBool(context, "apply")))))))))))
                         .then(Commands.literal("fillblockdamage")
                                 .then(Commands.argument("from", BlockPosArgument.blockPos())
                                         .then(Commands.argument("to", BlockPosArgument.blockPos())
@@ -287,6 +411,48 @@ public final class KrakkDebugCommands {
         return 1;
     }
 
+    private static int volumetricExplode(CommandSourceStack source, Vec3 pos, double radius, double energy) {
+        ServerLevel level = source.getLevel();
+        Entity sourceEntity = source.getEntity();
+        LivingEntity owner = sourceEntity instanceof LivingEntity living ? living : null;
+        KrakkApi.explosions().detonate(
+                level,
+                pos.x,
+                pos.y,
+                pos.z,
+                sourceEntity,
+                owner,
+                KrakkExplosionProfile.volumetricDebug(radius, energy)
+        );
+
+        source.sendSuccess(() -> Component.literal(String.format(
+                "Triggered Krakk volumetric explosion at %.2f %.2f %.2f (radius=%.2f, energy=%.2f)",
+                pos.x, pos.y, pos.z, radius, energy
+        )), true);
+        return 1;
+    }
+
+    private static int eikonalExplode(CommandSourceStack source, Vec3 pos, double radius, double energy) {
+        ServerLevel level = source.getLevel();
+        Entity sourceEntity = source.getEntity();
+        LivingEntity owner = sourceEntity instanceof LivingEntity living ? living : null;
+        KrakkApi.explosions().detonate(
+                level,
+                pos.x,
+                pos.y,
+                pos.z,
+                sourceEntity,
+                owner,
+                KrakkExplosionProfile.eikonalDebug(radius, energy)
+        );
+
+        source.sendSuccess(() -> Component.literal(String.format(
+                "Triggered Krakk eikonal explosion at %.2f %.2f %.2f (radius=%.2f, energy=%.2f)",
+                pos.x, pos.y, pos.z, radius, energy
+        )), true);
+        return 1;
+    }
+
     private static int profExplode(CommandSourceStack source, Vec3 pos, double power,
                                    int runs, int warmup, long seed, boolean apply) {
         if (!(KrakkApi.explosions() instanceof KrakkExplosionRuntime runtime)) {
@@ -303,7 +469,47 @@ public final class KrakkDebugCommands {
         ProfileAggregate aggregate = profileMode(
                 runtime, level, sourceEntity, owner, pos, profile, apply, runs, warmup, effectiveSeed
         );
-        emitProfileAggregate(source, apply, runs, warmup, effectiveSeed, aggregate);
+        emitProfileAggregate(source, "profexplode", apply, runs, warmup, effectiveSeed, aggregate);
+        return runs;
+    }
+
+    private static int profVolumetricExplode(CommandSourceStack source, Vec3 pos, double radius, double energy,
+                                             int runs, int warmup, long seed, boolean apply) {
+        if (!(KrakkApi.explosions() instanceof KrakkExplosionRuntime runtime)) {
+            source.sendFailure(Component.literal("Krakk explosion runtime does not support profiling."));
+            return 0;
+        }
+
+        ServerLevel level = source.getLevel();
+        Entity sourceEntity = source.getEntity();
+        LivingEntity owner = sourceEntity instanceof LivingEntity living ? living : null;
+        KrakkExplosionProfile profile = KrakkExplosionProfile.volumetric(radius, energy);
+        long effectiveSeed = seed != Long.MIN_VALUE ? seed : (level.getGameTime() ^ BlockPos.containing(pos).asLong());
+
+        ProfileAggregate aggregate = profileMode(
+                runtime, level, sourceEntity, owner, pos, profile, apply, runs, warmup, effectiveSeed
+        );
+        emitProfileAggregate(source, "profvolexplode", apply, runs, warmup, effectiveSeed, aggregate);
+        return runs;
+    }
+
+    private static int profEikonalExplode(CommandSourceStack source, Vec3 pos, double radius, double energy,
+                                          int runs, int warmup, long seed, boolean apply) {
+        if (!(KrakkApi.explosions() instanceof KrakkExplosionRuntime runtime)) {
+            source.sendFailure(Component.literal("Krakk explosion runtime does not support profiling."));
+            return 0;
+        }
+
+        ServerLevel level = source.getLevel();
+        Entity sourceEntity = source.getEntity();
+        LivingEntity owner = sourceEntity instanceof LivingEntity living ? living : null;
+        KrakkExplosionProfile profile = KrakkExplosionProfile.eikonal(radius, energy);
+        long effectiveSeed = seed != Long.MIN_VALUE ? seed : (level.getGameTime() ^ BlockPos.containing(pos).asLong());
+
+        ProfileAggregate aggregate = profileMode(
+                runtime, level, sourceEntity, owner, pos, profile, apply, runs, warmup, effectiveSeed
+        );
+        emitProfileAggregate(source, "profeikexplode", apply, runs, warmup, effectiveSeed, aggregate);
         return runs;
     }
 
@@ -356,6 +562,18 @@ public final class KrakkDebugCommands {
         long totalSplitCheckNanos = 0L;
         long totalEntitySegmentNanos = 0L;
         long totalEntityApplyNanos = 0L;
+        long totalVolumetricResistanceFieldNanos = 0L;
+        long totalVolumetricDirectionSetupNanos = 0L;
+        long totalVolumetricPressureSolveNanos = 0L;
+        long totalVolumetricTargetScanNanos = 0L;
+        long totalVolumetricTargetScanPrecheckNanos = 0L;
+        long totalVolumetricTargetScanBlendNanos = 0L;
+        long totalVolumetricImpactApplyNanos = 0L;
+        long totalVolumetricSampledVoxels = 0L;
+        long totalVolumetricSampledSolids = 0L;
+        long totalVolumetricTargetBlocks = 0L;
+        long totalVolumetricDirectionSamples = 0L;
+        long totalVolumetricRadialSteps = 0L;
         long totalPackets = 0L;
         long totalBytes = 0L;
 
@@ -397,6 +615,18 @@ public final class KrakkDebugCommands {
             totalSplitCheckNanos += report.splitCheckNanos();
             totalEntitySegmentNanos += report.entitySegmentNanos();
             totalEntityApplyNanos += report.entityApplyNanos();
+            totalVolumetricResistanceFieldNanos += report.volumetricResistanceFieldNanos();
+            totalVolumetricDirectionSetupNanos += report.volumetricDirectionSetupNanos();
+            totalVolumetricPressureSolveNanos += report.volumetricPressureSolveNanos();
+            totalVolumetricTargetScanNanos += report.volumetricTargetScanNanos();
+            totalVolumetricTargetScanPrecheckNanos += report.volumetricTargetScanPrecheckNanos();
+            totalVolumetricTargetScanBlendNanos += report.volumetricTargetScanBlendNanos();
+            totalVolumetricImpactApplyNanos += report.volumetricImpactApplyNanos();
+            totalVolumetricSampledVoxels += report.volumetricSampledVoxels();
+            totalVolumetricSampledSolids += report.volumetricSampledSolids();
+            totalVolumetricTargetBlocks += report.volumetricTargetBlocks();
+            totalVolumetricDirectionSamples += report.volumetricDirectionSamples();
+            totalVolumetricRadialSteps += report.volumetricRadialSteps();
             totalPackets += report.estimatedSyncPackets();
             totalBytes += report.estimatedSyncBytes();
         }
@@ -442,19 +672,33 @@ public final class KrakkDebugCommands {
                 nanosToMs(totalSplitCheckNanos / (double) runs),
                 nanosToMs(totalEntitySegmentNanos / (double) runs),
                 nanosToMs(totalEntityApplyNanos / (double) runs),
+                nanosToMs(totalVolumetricResistanceFieldNanos / (double) runs),
+                nanosToMs(totalVolumetricDirectionSetupNanos / (double) runs),
+                nanosToMs(totalVolumetricPressureSolveNanos / (double) runs),
+                nanosToMs(totalVolumetricTargetScanNanos / (double) runs),
+                nanosToMs(totalVolumetricTargetScanPrecheckNanos / (double) runs),
+                nanosToMs(totalVolumetricTargetScanBlendNanos / (double) runs),
+                nanosToMs(totalVolumetricImpactApplyNanos / (double) runs),
+                totalVolumetricSampledVoxels / (double) runs,
+                totalVolumetricSampledSolids / (double) runs,
+                totalVolumetricTargetBlocks / (double) runs,
+                totalVolumetricDirectionSamples / (double) runs,
+                totalVolumetricRadialSteps / (double) runs,
                 totalPackets / (double) runs,
                 totalBytes / (double) runs
         );
     }
 
     private static void emitProfileAggregate(CommandSourceStack source,
+                                             String commandLabel,
                                              boolean apply,
                                              int runs,
                                              int warmup,
                                              long seed,
                                              ProfileAggregate aggregate) {
         source.sendSuccess(() -> Component.literal(String.format(
-                "Krakk profexplode: apply=%s runs=%d warmup=%d seed=%d avg=%.3fms p95=%.3fms p99=%.3fms min=%.3fms max=%.3fms",
+                "Krakk %s: apply=%s runs=%d warmup=%d seed=%d avg=%.3fms p95=%.3fms p99=%.3fms min=%.3fms max=%.3fms",
+                commandLabel,
                 apply,
                 runs,
                 warmup,
@@ -501,6 +745,21 @@ public final class KrakkDebugCommands {
                 aggregate.avgEntitySegmentMs,
                 aggregate.avgEntityApplyMs
         )), false);
+        source.sendSuccess(() -> Component.literal(String.format(
+                "avgVolumetric: resistanceField=%.3fms directionSetup=%.3fms pressureSolve=%.3fms targetScan=%.3fms (precheck=%.3fms blend=%.3fms) impactApply=%.3fms sampledVoxels=%.1f sampledSolids=%.1f targets=%.1f directions=%.1f radialSteps=%.1f",
+                aggregate.avgVolumetricResistanceFieldMs,
+                aggregate.avgVolumetricDirectionSetupMs,
+                aggregate.avgVolumetricPressureSolveMs,
+                aggregate.avgVolumetricTargetScanMs,
+                aggregate.avgVolumetricTargetScanPrecheckMs,
+                aggregate.avgVolumetricTargetScanBlendMs,
+                aggregate.avgVolumetricImpactApplyMs,
+                aggregate.avgVolumetricSampledVoxels,
+                aggregate.avgVolumetricSampledSolids,
+                aggregate.avgVolumetricTargetBlocks,
+                aggregate.avgVolumetricDirectionSamples,
+                aggregate.avgVolumetricRadialSteps
+        )), false);
     }
 
     private record ProfileAggregate(
@@ -537,6 +796,18 @@ public final class KrakkDebugCommands {
             double avgSplitCheckMs,
             double avgEntitySegmentMs,
             double avgEntityApplyMs,
+            double avgVolumetricResistanceFieldMs,
+            double avgVolumetricDirectionSetupMs,
+            double avgVolumetricPressureSolveMs,
+            double avgVolumetricTargetScanMs,
+            double avgVolumetricTargetScanPrecheckMs,
+            double avgVolumetricTargetScanBlendMs,
+            double avgVolumetricImpactApplyMs,
+            double avgVolumetricSampledVoxels,
+            double avgVolumetricSampledSolids,
+            double avgVolumetricTargetBlocks,
+            double avgVolumetricDirectionSamples,
+            double avgVolumetricRadialSteps,
             double avgPackets,
             double avgBytes
     ) {

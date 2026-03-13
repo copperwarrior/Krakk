@@ -9,12 +9,14 @@
   ],
   "mixins": [
     "common.KrakkChunkAccessMixin",
+    "common.KrakkChunkHolderMixin",
     "common.KrakkChunkMapMixin",
     "common.KrakkChunkSerializerMixin",
     "common.KrakkFallingBlockEntityMixin",
     "common.KrakkLevelChunkMixin",
     "common.KrakkLevelMixin",
     "common.KrakkPistonMovingBlockEntityMixin",
+    "common.KrakkServerChunkCacheMixin",
     "common.KrakkServerPlayerGameModeMiningMixin"
   ],
   "injectors": {
