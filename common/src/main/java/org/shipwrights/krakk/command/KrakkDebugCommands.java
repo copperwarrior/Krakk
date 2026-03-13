@@ -35,6 +35,11 @@ public final class KrakkDebugCommands {
     private static final int DEFAULT_DECAY_TICKS = 24_000;
     private static final int DEFAULT_PROFILE_RUNS = 20;
     private static final int DEFAULT_PROFILE_WARMUP = 3;
+    private static final double QPROF_EIKONAL_RADIUS = 96.0D;
+    private static final double QPROF_EIKONAL_ENERGY = 1_000_000.0D;
+    private static final int QPROF_RUNS = 1;
+    private static final int QPROF_WARMUP = 0;
+    private static final long QPROF_SEED = 12_345L;
 
     private KrakkDebugCommands() {
     }
@@ -245,6 +250,18 @@ public final class KrakkDebugCommands {
                                                                                                 IntegerArgumentType.getInteger(context, "warmup"),
                                                                                                 LongArgumentType.getLong(context, "seed"),
                                                                                                 BoolArgumentType.getBool(context, "apply")))))))))))
+                        .then(Commands.literal("qprof")
+                                .executes(context -> quickProfileEikonal(context.getSource(), false))
+                                .then(Commands.argument("apply", BoolArgumentType.bool())
+                                        .executes(context -> quickProfileEikonal(
+                                                context.getSource(),
+                                                BoolArgumentType.getBool(context, "apply")))))
+                        .then(Commands.literal("resistancefieldparallel")
+                                .executes(context -> getResistanceFieldParallelSampling(context.getSource()))
+                                .then(Commands.argument("enabled", BoolArgumentType.bool())
+                                        .executes(context -> setResistanceFieldParallelSampling(
+                                                context.getSource(),
+                                                BoolArgumentType.getBool(context, "enabled")))))
                         .then(Commands.literal("fillblockdamage")
                                 .then(Commands.argument("from", BlockPosArgument.blockPos())
                                         .then(Commands.argument("to", BlockPosArgument.blockPos())
@@ -453,6 +470,22 @@ public final class KrakkDebugCommands {
         return 1;
     }
 
+    private static int getResistanceFieldParallelSampling(CommandSourceStack source) {
+        boolean enabled = KrakkExplosionRuntime.isParallelResistanceFieldSamplingEnabled();
+        source.sendSuccess(() -> Component.literal(
+                "Resistance-field off-thread sampling is " + (enabled ? "enabled" : "disabled")
+        ), false);
+        return 1;
+    }
+
+    private static int setResistanceFieldParallelSampling(CommandSourceStack source, boolean enabled) {
+        boolean resolved = KrakkExplosionRuntime.setParallelResistanceFieldSamplingEnabled(enabled);
+        source.sendSuccess(() -> Component.literal(
+                "Set resistance-field off-thread sampling to " + (resolved ? "enabled" : "disabled")
+        ), true);
+        return 1;
+    }
+
     private static int profExplode(CommandSourceStack source, Vec3 pos, double power,
                                    int runs, int warmup, long seed, boolean apply) {
         if (!(KrakkApi.explosions() instanceof KrakkExplosionRuntime runtime)) {
@@ -513,6 +546,19 @@ public final class KrakkDebugCommands {
         return runs;
     }
 
+    private static int quickProfileEikonal(CommandSourceStack source, boolean apply) {
+        return profEikonalExplode(
+                source,
+                source.getPosition(),
+                QPROF_EIKONAL_RADIUS,
+                QPROF_EIKONAL_ENERGY,
+                QPROF_RUNS,
+                QPROF_WARMUP,
+                QPROF_SEED,
+                apply
+        );
+    }
+
     private static ProfileAggregate profileMode(KrakkExplosionRuntime runtime,
                                                 ServerLevel level,
                                                 Entity sourceEntity,
@@ -565,6 +611,7 @@ public final class KrakkDebugCommands {
         long totalVolumetricResistanceFieldNanos = 0L;
         long totalVolumetricDirectionSetupNanos = 0L;
         long totalVolumetricPressureSolveNanos = 0L;
+        long totalEikonalSolveNanos = 0L;
         long totalVolumetricTargetScanNanos = 0L;
         long totalVolumetricTargetScanPrecheckNanos = 0L;
         long totalVolumetricTargetScanBlendNanos = 0L;
@@ -574,6 +621,8 @@ public final class KrakkDebugCommands {
         long totalVolumetricTargetBlocks = 0L;
         long totalVolumetricDirectionSamples = 0L;
         long totalVolumetricRadialSteps = 0L;
+        long totalEikonalSourceCells = 0L;
+        long totalEikonalSweepCycles = 0L;
         long totalPackets = 0L;
         long totalBytes = 0L;
 
@@ -618,6 +667,7 @@ public final class KrakkDebugCommands {
             totalVolumetricResistanceFieldNanos += report.volumetricResistanceFieldNanos();
             totalVolumetricDirectionSetupNanos += report.volumetricDirectionSetupNanos();
             totalVolumetricPressureSolveNanos += report.volumetricPressureSolveNanos();
+            totalEikonalSolveNanos += report.eikonalSolveNanos();
             totalVolumetricTargetScanNanos += report.volumetricTargetScanNanos();
             totalVolumetricTargetScanPrecheckNanos += report.volumetricTargetScanPrecheckNanos();
             totalVolumetricTargetScanBlendNanos += report.volumetricTargetScanBlendNanos();
@@ -627,6 +677,8 @@ public final class KrakkDebugCommands {
             totalVolumetricTargetBlocks += report.volumetricTargetBlocks();
             totalVolumetricDirectionSamples += report.volumetricDirectionSamples();
             totalVolumetricRadialSteps += report.volumetricRadialSteps();
+            totalEikonalSourceCells += report.eikonalSourceCells();
+            totalEikonalSweepCycles += report.eikonalSweepCycles();
             totalPackets += report.estimatedSyncPackets();
             totalBytes += report.estimatedSyncBytes();
         }
@@ -675,6 +727,7 @@ public final class KrakkDebugCommands {
                 nanosToMs(totalVolumetricResistanceFieldNanos / (double) runs),
                 nanosToMs(totalVolumetricDirectionSetupNanos / (double) runs),
                 nanosToMs(totalVolumetricPressureSolveNanos / (double) runs),
+                nanosToMs(totalEikonalSolveNanos / (double) runs),
                 nanosToMs(totalVolumetricTargetScanNanos / (double) runs),
                 nanosToMs(totalVolumetricTargetScanPrecheckNanos / (double) runs),
                 nanosToMs(totalVolumetricTargetScanBlendNanos / (double) runs),
@@ -684,6 +737,8 @@ public final class KrakkDebugCommands {
                 totalVolumetricTargetBlocks / (double) runs,
                 totalVolumetricDirectionSamples / (double) runs,
                 totalVolumetricRadialSteps / (double) runs,
+                totalEikonalSourceCells / (double) runs,
+                totalEikonalSweepCycles / (double) runs,
                 totalPackets / (double) runs,
                 totalBytes / (double) runs
         );
@@ -760,6 +815,14 @@ public final class KrakkDebugCommands {
                 aggregate.avgVolumetricDirectionSamples,
                 aggregate.avgVolumetricRadialSteps
         )), false);
+        if (aggregate.avgEikonalSolveMs > 0.0D || aggregate.avgEikonalSourceCells > 0.0D || aggregate.avgEikonalSweepCycles > 0.0D) {
+            source.sendSuccess(() -> Component.literal(String.format(
+                    "avgEikonal: solve=%.3fms sourceCells=%.1f sweepCycles=%.1f",
+                    aggregate.avgEikonalSolveMs,
+                    aggregate.avgEikonalSourceCells,
+                    aggregate.avgEikonalSweepCycles
+            )), false);
+        }
     }
 
     private record ProfileAggregate(
@@ -799,6 +862,7 @@ public final class KrakkDebugCommands {
             double avgVolumetricResistanceFieldMs,
             double avgVolumetricDirectionSetupMs,
             double avgVolumetricPressureSolveMs,
+            double avgEikonalSolveMs,
             double avgVolumetricTargetScanMs,
             double avgVolumetricTargetScanPrecheckMs,
             double avgVolumetricTargetScanBlendMs,
@@ -808,6 +872,8 @@ public final class KrakkDebugCommands {
             double avgVolumetricTargetBlocks,
             double avgVolumetricDirectionSamples,
             double avgVolumetricRadialSteps,
+            double avgEikonalSourceCells,
+            double avgEikonalSweepCycles,
             double avgPackets,
             double avgBytes
     ) {

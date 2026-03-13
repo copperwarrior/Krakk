@@ -147,12 +147,14 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final int VOLUMETRIC_DIRECTION_NEIGHBOR_COUNT = 10;
     private static final int VOLUMETRIC_DIRECTION_BLEND_COUNT = 8;
     private static final double VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT = 1.7D;
+    private static final int VOLUMETRIC_DIRECTION_LOOKUP_RESOLUTION = 64;
     private static final double VOLUMETRIC_RADIUS_SCALE_BASE = 6.0D;
     private static final double VOLUMETRIC_MAX_POWER_RADIUS_SCALE = 8.0D;
     private static final double VOLUMETRIC_MAX_POINT_RADIUS_SCALE = 8.0D;
     private static final double VOLUMETRIC_DIRECTION_SAMPLES_PER_RADIUS2 = 6.0D;
     private static final int VOLUMETRIC_MIN_DIRECTION_SAMPLES = 128;
     private static final int VOLUMETRIC_MAX_DIRECTION_SAMPLES = 3072;
+    private static final int VOLUMETRIC_MAX_RADIAL_STEPS = 128;
     private static final double VOLUMETRIC_EDGE_POINT_BIAS_BLEND = 0.70D;
     private static final double VOLUMETRIC_EDGE_POINT_BIAS_EXPONENT = 2.25D;
     private static final double VOLUMETRIC_OUTER_SMOOTHING_RATIO = 0.06D;
@@ -187,6 +189,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final double EIKONAL_SHADOW_NORMALIZED_ATTENUATION = 7.0D;
     private static final double EIKONAL_HARD_BLOCK_SHADOW_NORMALIZED_OVERRUN = 2.5D;
     private static final double EIKONAL_SHADOW_OVERRUN_DEADZONE = 0.02D;
+    private static final boolean EIKONAL_USE_MULTIRES_COARSE_SOLVE = true;
+    private static final int EIKONAL_MULTIRES_DOWNSAMPLE_FACTOR = 2;
+    private static final int EIKONAL_MULTIRES_FINE_REFINE_SWEEP_CYCLES = 2;
+    private static final int EIKONAL_MULTIRES_MIN_AXIS_FOR_COARSE = 24;
     private static final double EIKONAL_MIN_TRANSMITTANCE = 1.0E-3D;
     private static final double EIKONAL_ENVELOPE_TRANSMITTANCE_BLEND = 0.25D;
     private static final double EIKONAL_BASELINE_SMOOTH_BLEND = 0.70D;
@@ -200,13 +206,30 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final int VOLUMETRIC_TARGET_SCAN_MIN_SOLIDS_FOR_PARALLEL = 262_144;
     private static final int VOLUMETRIC_TARGET_SCAN_SOLIDS_PER_TASK = 262_144;
     private static final int VOLUMETRIC_TARGET_SCAN_MAX_TASKS = 32;
+    private static final int EIKONAL_TARGET_SCAN_MIN_SOLIDS_FOR_PARALLEL = 131_072;
+    private static final int EIKONAL_TARGET_SCAN_SOLIDS_PER_TASK = 262_144;
+    private static final int EIKONAL_TARGET_SCAN_MAX_TASKS = 32;
+    private static final int RESISTANCE_FIELD_MIN_VOXELS_FOR_PARALLEL = 262_144;
+    private static final int RESISTANCE_FIELD_COLUMNS_PER_TASK = 8;
+    private static final int RESISTANCE_FIELD_MAX_TASKS = 32;
+    private static final int EIKONAL_SWEEP_MIN_ROWS_FOR_PARALLEL = 144;
+    private static final int EIKONAL_SWEEP_ROWS_PER_TASK = 24;
+    private static final int EIKONAL_SWEEP_MAX_TASKS = 8;
+    private static final int EIKONAL_SOLVE_PARALLELISM = Math.max(
+            1,
+            Math.min(2, Runtime.getRuntime().availableProcessors() - 1)
+    );
     private static final ConcurrentHashMap<Integer, VolumetricDirectionCache> VOLUMETRIC_DIRECTION_CACHE = new ConcurrentHashMap<>();
     private static final ForkJoinPool VOLUMETRIC_TARGET_SCAN_POOL = VOLUMETRIC_TARGET_SCAN_PARALLELISM > 1
             ? new ForkJoinPool(VOLUMETRIC_TARGET_SCAN_PARALLELISM)
             : null;
+    private static final ForkJoinPool EIKONAL_SOLVE_POOL = EIKONAL_SOLVE_PARALLELISM > 1
+            ? new ForkJoinPool(EIKONAL_SOLVE_PARALLELISM)
+            : null;
     private static final int[] CHILD_TRAVERSAL_OFFSETS = new int[]{0, 1, 2, 4, 3, 5, 6, 7};
     private static final int[][] CHILD_ORDER_BY_RAY_OCTANT = buildChildOrderByRayOctant();
     private static volatile SpecialBlockHandler specialBlockHandler = SpecialBlockHandler.NOOP;
+    private static volatile boolean parallelResistanceFieldSamplingEnabled = false;
     private static volatile double raySplitDistanceThreshold = DEFAULT_RAY_SPLIT_DISTANCE_THRESHOLD;
 
     public KrakkExplosionRuntime() {
@@ -238,6 +261,15 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         );
         raySplitDistanceThreshold = clamped;
         return clamped;
+    }
+
+    public static boolean isParallelResistanceFieldSamplingEnabled() {
+        return parallelResistanceFieldSamplingEnabled;
+    }
+
+    public static boolean setParallelResistanceFieldSamplingEnabled(boolean enabled) {
+        parallelResistanceFieldSamplingEnabled = enabled;
+        return parallelResistanceFieldSamplingEnabled;
     }
 
     public record ExplosionProfileReport(
@@ -277,6 +309,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             long volumetricResistanceFieldNanos,
             long volumetricDirectionSetupNanos,
             long volumetricPressureSolveNanos,
+            long eikonalSolveNanos,
             long volumetricTargetScanNanos,
             long volumetricTargetScanPrecheckNanos,
             long volumetricTargetScanBlendNanos,
@@ -286,6 +319,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             int volumetricTargetBlocks,
             int volumetricDirectionSamples,
             int volumetricRadialSteps,
+            int eikonalSourceCells,
+            int eikonalSweepCycles,
             int estimatedSyncPackets,
             int estimatedSyncBytes,
             int smokeParticles
@@ -497,155 +532,112 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             return;
         }
 
+        boolean profileSubstages = trace != null;
+        Future<EikonalVolumetricBaselineResult> baselineFuture = null;
+        if (EIKONAL_SOLVE_POOL != null) {
+            baselineFuture = EIKONAL_SOLVE_POOL.submit(
+                    () -> buildEikonalVolumetricBaselineByPos(
+                            centerX,
+                            centerY,
+                            centerZ,
+                            resolvedRadius,
+                            eikonalField,
+                            profileSubstages
+                    )
+            );
+        }
+
         long solveStart = trace != null ? System.nanoTime() : 0L;
-        EikonalSolveResult solveResult = solveEikonalArrivalTimes(eikonalField, centerX, centerY, centerZ, Float.NaN, 1.0F);
-        EikonalSolveResult airSolveResult = solveEikonalArrivalTimes(eikonalField, centerX, centerY, centerZ, (float) EIKONAL_AIR_SLOWNESS, 1.0F);
-        EikonalSolveResult shadowSolveResult = solveEikonalArrivalTimes(
+        PairedEikonalSolveResult pairedSolveResult = solvePairedEikonalArrivalTimes(
                 eikonalField,
                 centerX,
                 centerY,
                 centerZ,
                 Float.NaN,
+                1.0F,
                 (float) EIKONAL_SHADOW_SOLID_SLOWNESS_SCALE
         );
+        EikonalSolveResult solveResult = pairedSolveResult.normal();
+        EikonalSolveResult shadowSolveResult = pairedSolveResult.shadow();
         if (trace != null) {
-            trace.volumetricPressureSolveNanos += (System.nanoTime() - solveStart);
-            trace.volumetricRadialSteps += solveResult.sweepCycles() + airSolveResult.sweepCycles() + shadowSolveResult.sweepCycles();
+            long solveNanos = System.nanoTime() - solveStart;
+            trace.volumetricPressureSolveNanos += solveNanos;
+            trace.eikonalSolveNanos += solveNanos;
+            trace.eikonalSourceCells += solveResult.sourceCells() + shadowSolveResult.sourceCells();
+            trace.eikonalSweepCycles += solveResult.sweepCycles() + shadowSolveResult.sweepCycles();
+        }
+
+        EikonalVolumetricBaselineResult baselineResult;
+        if (baselineFuture != null) {
+            try {
+                baselineResult = baselineFuture.get();
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                baselineFuture.cancel(true);
+                baselineResult = buildEikonalVolumetricBaselineByPos(
+                        centerX,
+                        centerY,
+                        centerZ,
+                        resolvedRadius,
+                        eikonalField,
+                        profileSubstages
+                );
+            } catch (ExecutionException exception) {
+                baselineFuture.cancel(true);
+                baselineResult = buildEikonalVolumetricBaselineByPos(
+                        centerX,
+                        centerY,
+                        centerZ,
+                        resolvedRadius,
+                        eikonalField,
+                        profileSubstages
+                );
+            }
+        } else {
+            baselineResult = buildEikonalVolumetricBaselineByPos(
+                    centerX,
+                    centerY,
+                    centerZ,
+                    resolvedRadius,
+                    eikonalField,
+                    profileSubstages
+            );
+        }
+        if (trace != null) {
+            trace.volumetricDirectionSetupNanos += baselineResult.directionSetupNanos();
+            trace.volumetricPressureSolveNanos += baselineResult.pressureSolveNanos();
+            trace.volumetricTargetScanNanos += baselineResult.targetScanNanos();
+            trace.volumetricTargetScanPrecheckNanos += baselineResult.targetScanPrecheckNanos();
+            trace.volumetricTargetScanBlendNanos += baselineResult.targetScanBlendNanos();
+            trace.volumetricDirectionSamples += baselineResult.directionSamples();
+            trace.volumetricRadialSteps += baselineResult.radialSteps();
         }
 
         float[] arrivalTimes = solveResult.arrivalTimes();
-        float[] airArrivalTimes = airSolveResult.arrivalTimes();
         float[] shadowArrivalTimes = shadowSolveResult.arrivalTimes();
         LongArrayList solidPositions = eikonalField.solidPositions();
-        Long2FloatOpenHashMap volumetricBaselineByPos = buildEikonalVolumetricBaselineByPos(
+        Long2FloatOpenHashMap volumetricBaselineByPos = baselineResult.baselineByPos();
+        double maxArrival = Math.max(1.0E-6D, resolvedRadius * EIKONAL_MAX_ARRIVAL_MULTIPLIER);
+        long targetScanStart = trace != null ? System.nanoTime() : 0L;
+        EikonalTargetScanResult targetScanResult = scanEikonalTargets(
+                solidPositions,
+                volumetricBaselineByPos,
+                arrivalTimes,
+                shadowArrivalTimes,
+                eikonalField,
                 centerX,
                 centerY,
                 centerZ,
-                resolvedRadius,
-                eikonalField,
-                trace
+                maxArrival,
+                true,
+                profileSubstages
         );
-        LongArrayList targetPositions = new LongArrayList(Math.max(64, solidPositions.size() / 8));
-        FloatArrayList targetWeights = new FloatArrayList(Math.max(64, solidPositions.size() / 8));
-        double maxArrival = Math.max(1.0E-6D, resolvedRadius * EIKONAL_MAX_ARRIVAL_MULTIPLIER);
-        double solidWeight = 0.0D;
-        long targetScanStart = trace != null ? System.nanoTime() : 0L;
-        long targetPrecheckNanos = 0L;
-        for (int i = 0; i < solidPositions.size(); i++) {
-            long posLong = solidPositions.getLong(i);
-            long precheckStart = trace != null ? System.nanoTime() : 0L;
-            float baselineWeight = volumetricBaselineByPos.get(posLong);
-            if (!Float.isFinite(baselineWeight) || baselineWeight <= VOLUMETRIC_MIN_ENERGY) {
-                if (trace != null) {
-                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
-                }
-                continue;
-            }
-            int x = BlockPos.getX(posLong);
-            int y = BlockPos.getY(posLong);
-            int z = BlockPos.getZ(posLong);
-            int index = eikonalGridIndex(
-                    x - eikonalField.minX(),
-                    y - eikonalField.minY(),
-                    z - eikonalField.minZ(),
-                    eikonalField.sizeY(),
-                    eikonalField.sizeZ()
-            );
-            double arrival = arrivalTimes[index];
-            if (!Double.isFinite(arrival) || arrival > maxArrival) {
-                if (trace != null) {
-                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
-                }
-                continue;
-            }
-            double normalized = 1.0D - (arrival / maxArrival);
-            if (normalized <= 0.0D) {
-                if (trace != null) {
-                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
-                }
-                continue;
-            }
-            double airArrival = airArrivalTimes[index];
-            if (!Double.isFinite(airArrival)) {
-                if (trace != null) {
-                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
-                }
-                continue;
-            }
-            double resistanceOverrun = Math.max(0.0D, arrival - airArrival);
-            double effectiveOverrun = Math.max(0.0D, resistanceOverrun - EIKONAL_OVERRUN_DEADZONE);
-            double normalizedOverrun = effectiveOverrun / Math.max(1.0D, airArrival);
-            if (normalizedOverrun >= EIKONAL_HARD_BLOCK_NORMALIZED_OVERRUN) {
-                if (trace != null) {
-                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
-                }
-                continue;
-            }
-            double transmittance = Math.exp(
-                    -(effectiveOverrun * EIKONAL_RESISTANCE_ATTENUATION_PER_OVERRUN)
-                            - (normalizedOverrun * EIKONAL_RESISTANCE_NORMALIZED_ATTENUATION)
-            );
-            if (transmittance <= EIKONAL_MIN_TRANSMITTANCE) {
-                if (trace != null) {
-                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
-                }
-                continue;
-            }
-            double shadowArrival = shadowArrivalTimes[index];
-            if (!Double.isFinite(shadowArrival)) {
-                if (trace != null) {
-                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
-                }
-                continue;
-            }
-            double shadowOverrun = Math.max(0.0D, shadowArrival - arrival);
-            double effectiveShadowOverrun = Math.max(0.0D, shadowOverrun - EIKONAL_SHADOW_OVERRUN_DEADZONE);
-            double normalizedShadowOverrun = effectiveShadowOverrun / Math.max(0.25D, airArrival);
-            if (normalizedShadowOverrun >= EIKONAL_HARD_BLOCK_SHADOW_NORMALIZED_OVERRUN) {
-                if (trace != null) {
-                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
-                }
-                continue;
-            }
-            double shadowTransmittance = Math.exp(
-                    -(effectiveShadowOverrun * EIKONAL_SHADOW_ATTENUATION_PER_OVERRUN)
-                            - (normalizedShadowOverrun * EIKONAL_SHADOW_NORMALIZED_ATTENUATION)
-            );
-            if (shadowTransmittance <= EIKONAL_MIN_TRANSMITTANCE) {
-                if (trace != null) {
-                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
-                }
-                continue;
-            }
-            double eikEnvelope = Math.pow(normalized, EIKONAL_WEIGHT_EXPONENT);
-            double eikonalTransFactor = Mth.lerp(
-                    EIKONAL_ENVELOPE_TRANSMITTANCE_BLEND,
-                    1.0D,
-                    transmittance * shadowTransmittance
-            );
-            double smoothingFactor = Mth.lerp(
-                    EIKONAL_BASELINE_SMOOTH_BLEND,
-                    1.0D,
-                    eikEnvelope * eikonalTransFactor
-            );
-            double cutoffRetention = computeEikonalCutoffEdgeRetention(normalized);
-            double weight = baselineWeight * smoothingFactor * cutoffRetention;
-            if (weight <= VOLUMETRIC_MIN_ENERGY) {
-                if (trace != null) {
-                    targetPrecheckNanos += (System.nanoTime() - precheckStart);
-                }
-                continue;
-            }
-            if (trace != null) {
-                targetPrecheckNanos += (System.nanoTime() - precheckStart);
-            }
-            targetPositions.add(posLong);
-            targetWeights.add((float) weight);
-            solidWeight += weight;
-        }
+        LongArrayList targetPositions = targetScanResult.targetPositions();
+        FloatArrayList targetWeights = targetScanResult.targetWeights();
+        double solidWeight = targetScanResult.solidWeight();
         if (trace != null) {
             trace.volumetricTargetScanNanos += (System.nanoTime() - targetScanStart);
-            trace.volumetricTargetScanPrecheckNanos += targetPrecheckNanos;
+            trace.volumetricTargetScanPrecheckNanos += targetScanResult.precheckNanos();
         }
         if (targetPositions.isEmpty() || solidWeight <= VOLUMETRIC_MIN_ENERGY) {
             return;
@@ -723,54 +715,262 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int sizeZ = maxZ - minZ + 1;
         long volumeLong = (long) sizeX * (long) sizeY * (long) sizeZ;
         if (volumeLong <= 0L || volumeLong > Integer.MAX_VALUE - 8L) {
-            return new EikonalField(minX, minY, minZ, sizeX, sizeY, sizeZ, 0, new float[1], new LongArrayList());
+            return new EikonalField(
+                    minX,
+                    minY,
+                    minZ,
+                    sizeX,
+                    sizeY,
+                    sizeZ,
+                    0,
+                    new BitSet(1),
+                    new float[1],
+                    new LongArrayList(),
+                    new int[0],
+                    new int[0],
+                    new int[0],
+                    new int[0],
+                    new int[0],
+                    new int[0],
+                    new int[0],
+                    new int[0],
+                    new int[0]
+            );
         }
         int volume = (int) volumeLong;
+        BitSet activeMask = new BitSet(volume);
         float[] slowness = new float[Math.max(1, volume)];
         LongArrayList solidPositions = new LongArrayList(Math.max(64, volume / 8));
-        BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
-        int sampledVoxelCount = 0;
-        for (int x = minX; x <= maxX; x++) {
-            for (int y = minY; y <= maxY; y++) {
-                for (int z = minZ; z <= maxZ; z++) {
-                    double dx = (x + 0.5D) - centerX;
-                    double dy = (y + 0.5D) - centerY;
-                    double dz = (z + 0.5D) - centerZ;
-                    double distSq = (dx * dx) + (dy * dy) + (dz * dz);
-                    if (distSq > radiusSq) {
+        int rowCount = sizeX * sizeY;
+        int[] activeCountByRow = new int[Math.max(1, rowCount)];
+        int sampledVoxelCount;
+        int resistanceTaskCount = resolveResistanceFieldTaskCount(sizeX, sizeY, sizeZ);
+        if (resistanceTaskCount <= 1 || VOLUMETRIC_TARGET_SCAN_POOL == null) {
+            EikonalResistanceFieldChunkResult chunkResult = sampleEikonalFieldChunk(
+                    level,
+                    centerX,
+                    centerY,
+                    centerZ,
+                    minX,
+                    minY,
+                    minZ,
+                    sizeY,
+                    sizeZ,
+                    radiusSq,
+                    0,
+                    sizeX,
+                    slowness,
+                    activeCountByRow,
+                    resistanceCostCache
+            );
+            sampledVoxelCount = chunkResult.sampledVoxelCount();
+            LongArrayList chunkPositions = chunkResult.solidPositions();
+            for (int i = 0; i < chunkPositions.size(); i++) {
+                solidPositions.add(chunkPositions.getLong(i));
+            }
+        } else {
+            ResistanceFieldSnapshot resistanceFieldSnapshot = sampleResistanceFieldSnapshot(
+                    level,
+                    centerX,
+                    centerY,
+                    centerZ,
+                    minX,
+                    minY,
+                    minZ,
+                    sizeX,
+                    sizeY,
+                    sizeZ,
+                    radiusSq
+            );
+            int chunkSize = (sizeX + resistanceTaskCount - 1) / resistanceTaskCount;
+            ArrayList<Future<EikonalResistanceFieldChunkResult>> futures = new ArrayList<>(resistanceTaskCount);
+            for (int taskIndex = 0; taskIndex < resistanceTaskCount; taskIndex++) {
+                int startXOffset = taskIndex * chunkSize;
+                int endXOffset = Math.min(sizeX, startXOffset + chunkSize);
+                if (startXOffset >= endXOffset) {
+                    break;
+                }
+                final int chunkStartX = startXOffset;
+                final int chunkEndX = endXOffset;
+                futures.add(VOLUMETRIC_TARGET_SCAN_POOL.submit(
+                        () -> sampleEikonalFieldChunk(
+                                resistanceFieldSnapshot,
+                                minX,
+                                minY,
+                                minZ,
+                                sizeY,
+                                sizeZ,
+                                chunkStartX,
+                                chunkEndX,
+                                slowness,
+                                activeCountByRow,
+                                null
+                        )
+                ));
+            }
+
+            int sampledCountAccumulator = 0;
+            boolean mergeFailed = false;
+            try {
+                for (Future<EikonalResistanceFieldChunkResult> future : futures) {
+                    EikonalResistanceFieldChunkResult chunkResult = future.get();
+                    sampledCountAccumulator += chunkResult.sampledVoxelCount();
+                    LongArrayList chunkPositions = chunkResult.solidPositions();
+                    for (int i = 0; i < chunkPositions.size(); i++) {
+                        solidPositions.add(chunkPositions.getLong(i));
+                    }
+                }
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                cancelEikonalResistanceFieldFutures(futures);
+                mergeFailed = true;
+            } catch (ExecutionException exception) {
+                cancelEikonalResistanceFieldFutures(futures);
+                mergeFailed = true;
+            }
+
+            if (mergeFailed) {
+                Arrays.fill(slowness, 0.0F);
+                Arrays.fill(activeCountByRow, 0);
+                solidPositions.clear();
+                EikonalResistanceFieldChunkResult fallback = sampleEikonalFieldChunk(
+                        resistanceFieldSnapshot,
+                        minX,
+                        minY,
+                        minZ,
+                        sizeY,
+                        sizeZ,
+                        0,
+                        sizeX,
+                        slowness,
+                        activeCountByRow,
+                        resistanceCostCache
+                );
+                sampledVoxelCount = fallback.sampledVoxelCount();
+                LongArrayList chunkPositions = fallback.solidPositions();
+                for (int i = 0; i < chunkPositions.size(); i++) {
+                    solidPositions.add(chunkPositions.getLong(i));
+                }
+            } else {
+                sampledVoxelCount = sampledCountAccumulator;
+            }
+        }
+
+        int[] activeRowOffsets = new int[Math.max(1, rowCount)];
+        int totalActiveIndices = 0;
+        for (int rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+            activeRowOffsets[rowIndex] = totalActiveIndices;
+            totalActiveIndices += activeCountByRow[rowIndex];
+        }
+        int[] activeRowIndices = new int[Math.max(1, totalActiveIndices)];
+        int[] writeCursorByRow = Arrays.copyOf(activeRowOffsets, activeRowOffsets.length);
+        int strideX = sizeY * sizeZ;
+        int strideY = sizeZ;
+        for (int xOffset = 0; xOffset < sizeX; xOffset++) {
+            int baseX = xOffset * strideX;
+            for (int yOffset = 0; yOffset < sizeY; yOffset++) {
+                int rowIndex = eikonalRowIndex(xOffset, yOffset, sizeY);
+                int base = baseX + (yOffset * strideY);
+                for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
+                    int index = base + zOffset;
+                    if (slowness[index] <= 0.0F) {
                         continue;
                     }
-                    mutablePos.set(x, y, z);
-                    if (!level.isInWorldBounds(mutablePos)) {
-                        continue;
-                    }
-                    sampledVoxelCount++;
-                    int index = eikonalGridIndex(x - minX, y - minY, z - minZ, sizeY, sizeZ);
-                    BlockState blockState = level.getBlockState(mutablePos);
-                    if (blockState.isAir()) {
-                        slowness[index] = (float) EIKONAL_AIR_SLOWNESS;
-                        continue;
-                    }
-                    double resistance = getCachedResistanceCost(resistanceCostCache, blockState);
-                    slowness[index] = (float) (EIKONAL_AIR_SLOWNESS + (resistance * EIKONAL_SOLID_SLOWNESS_SCALE));
-                    solidPositions.add(mutablePos.asLong());
+                    activeMask.set(index);
+                    activeRowIndices[writeCursorByRow[rowIndex]++] = index;
                 }
             }
         }
-        return new EikonalField(minX, minY, minZ, sizeX, sizeY, sizeZ, sampledVoxelCount, slowness, solidPositions);
+
+        int[] neighborNegX = new int[Math.max(1, volume)];
+        int[] neighborPosX = new int[Math.max(1, volume)];
+        int[] neighborNegY = new int[Math.max(1, volume)];
+        int[] neighborPosY = new int[Math.max(1, volume)];
+        int[] neighborNegZ = new int[Math.max(1, volume)];
+        int[] neighborPosZ = new int[Math.max(1, volume)];
+        Arrays.fill(neighborNegX, -1);
+        Arrays.fill(neighborPosX, -1);
+        Arrays.fill(neighborNegY, -1);
+        Arrays.fill(neighborPosY, -1);
+        Arrays.fill(neighborNegZ, -1);
+        Arrays.fill(neighborPosZ, -1);
+        for (int index = activeMask.nextSetBit(0); index >= 0; index = activeMask.nextSetBit(index + 1)) {
+            int xOffset = index / strideX;
+            int yz = index - (xOffset * strideX);
+            int yOffset = yz / strideY;
+            int zOffset = yz - (yOffset * strideY);
+            if (xOffset > 0) {
+                int neighbor = index - strideX;
+                if (activeMask.get(neighbor)) {
+                    neighborNegX[index] = neighbor;
+                }
+            }
+            if (xOffset + 1 < sizeX) {
+                int neighbor = index + strideX;
+                if (activeMask.get(neighbor)) {
+                    neighborPosX[index] = neighbor;
+                }
+            }
+            if (yOffset > 0) {
+                int neighbor = index - strideY;
+                if (activeMask.get(neighbor)) {
+                    neighborNegY[index] = neighbor;
+                }
+            }
+            if (yOffset + 1 < sizeY) {
+                int neighbor = index + strideY;
+                if (activeMask.get(neighbor)) {
+                    neighborPosY[index] = neighbor;
+                }
+            }
+            if (zOffset > 0) {
+                int neighbor = index - 1;
+                if (activeMask.get(neighbor)) {
+                    neighborNegZ[index] = neighbor;
+                }
+            }
+            if (zOffset + 1 < sizeZ) {
+                int neighbor = index + 1;
+                if (activeMask.get(neighbor)) {
+                    neighborPosZ[index] = neighbor;
+                }
+            }
+        }
+
+        return new EikonalField(
+                minX,
+                minY,
+                minZ,
+                sizeX,
+                sizeY,
+                sizeZ,
+                sampledVoxelCount,
+                activeMask,
+                slowness,
+                solidPositions,
+                activeRowOffsets,
+                activeCountByRow,
+                activeRowIndices,
+                neighborNegX,
+                neighborPosX,
+                neighborNegY,
+                neighborPosY,
+                neighborNegZ,
+                neighborPosZ
+        );
     }
 
-    private static Long2FloatOpenHashMap buildEikonalVolumetricBaselineByPos(double centerX,
-                                                                              double centerY,
-                                                                              double centerZ,
-                                                                              double resolvedRadius,
-                                                                              EikonalField eikonalField,
-                                                                              ExplosionProfileTrace trace) {
+    private static EikonalVolumetricBaselineResult buildEikonalVolumetricBaselineByPos(double centerX,
+                                                                                        double centerY,
+                                                                                        double centerZ,
+                                                                                        double resolvedRadius,
+                                                                                        EikonalField eikonalField,
+                                                                                        boolean collectMetrics) {
         LongArrayList solidPositions = eikonalField.solidPositions();
         Long2FloatOpenHashMap empty = new Long2FloatOpenHashMap(16);
         empty.defaultReturnValue(Float.NaN);
         if (solidPositions.isEmpty()) {
-            return empty;
+            return new EikonalVolumetricBaselineResult(empty, 0L, 0L, 0L, 0L, 0L, 0, 0);
         }
 
         float[] fieldSlowness = eikonalField.slowness();
@@ -783,7 +983,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         float airSlowness = (float) EIKONAL_AIR_SLOWNESS;
         float resistanceScaleInv = (float) (1.0D / Math.max(1.0E-6D, EIKONAL_SOLID_SLOWNESS_SCALE));
 
-        long directionSetupStart = trace != null ? System.nanoTime() : 0L;
+        long directionSetupStart = collectMetrics ? System.nanoTime() : 0L;
         double pointScale = computeVolumetricRadiusScale(resolvedRadius, VOLUMETRIC_MAX_POINT_RADIUS_SCALE);
         int directionCount = computeVolumetricDirectionSampleCount(resolvedRadius, pointScale);
         VolumetricDirectionCache directionCache = getVolumetricDirectionCache(directionCount);
@@ -791,7 +991,13 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         double[] dirY = directionCache.dirY();
         double[] dirZ = directionCache.dirZ();
         int[][] directionNeighbors = directionCache.neighbors();
-        int radialSteps = Math.max(1, Mth.ceil(resolvedRadius / VOLUMETRIC_DEFORM_SAMPLE_STEP));
+        int[] directionLookup = directionCache.directionLookup();
+        int directionLookupResolution = directionCache.directionLookupResolution();
+        int radialSteps = Mth.clamp(
+                Mth.ceil(resolvedRadius / VOLUMETRIC_DEFORM_SAMPLE_STEP),
+                1,
+                VOLUMETRIC_MAX_RADIAL_STEPS
+        );
         double radialStepSize = resolvedRadius / radialSteps;
         float[] pressureByShell = new float[(radialSteps + 1) * directionCount];
         Arrays.fill(pressureByShell, 0, directionCount, 1.0F);
@@ -803,13 +1009,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         float[] currentPressure = new float[directionCount];
         double perStepAirDecay = Mth.clamp(VOLUMETRIC_PRESSURE_AIR_DECAY_PER_BLOCK * radialStepSize, 0.0D, 0.95D);
         double perStepRecovery = Math.max(0.0D, VOLUMETRIC_PRESSURE_RECOVERY_PER_BLOCK * radialStepSize);
-        if (trace != null) {
-            trace.volumetricDirectionSetupNanos += (System.nanoTime() - directionSetupStart);
-            trace.volumetricDirectionSamples += directionCount;
-            trace.volumetricRadialSteps += radialSteps;
-        }
+        long directionSetupNanos = collectMetrics ? (System.nanoTime() - directionSetupStart) : 0L;
 
-        long pressureSolveStart = trace != null ? System.nanoTime() : 0L;
+        long pressureSolveStart = collectMetrics ? System.nanoTime() : 0L;
         for (int shell = 1; shell <= radialSteps; shell++) {
             double t = shell * radialStepSize;
             for (int i = 0; i < directionCount; i++) {
@@ -860,14 +1062,15 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 }
             }
             maxPressureByShell[shell] = shellMaxPressure;
+            if (shellMaxPressure <= 0.0F) {
+                break;
+            }
 
             float[] swap = previousPressure;
             previousPressure = currentPressure;
             currentPressure = swap;
         }
-        if (trace != null) {
-            trace.volumetricPressureSolveNanos += (System.nanoTime() - pressureSolveStart);
-        }
+        long pressureSolveNanos = collectMetrics ? (System.nanoTime() - pressureSolveStart) : 0L;
 
         VolumetricTargetScanContext targetScanContext = new VolumetricTargetScanContext(
                 centerX,
@@ -881,20 +1084,19 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 directionCount,
                 dirX,
                 dirY,
-                dirZ
+                dirZ,
+                directionNeighbors,
+                directionLookup,
+                directionLookupResolution
         );
-        long targetScanStart = trace != null ? System.nanoTime() : 0L;
+        long targetScanStart = collectMetrics ? System.nanoTime() : 0L;
         VolumetricTargetScanResult targetScanResult = scanVolumetricTargets(
                 solidPositions,
                 targetScanContext,
-                false,
-                trace != null
+                true,
+                collectMetrics
         );
-        if (trace != null) {
-            trace.volumetricTargetScanNanos += (System.nanoTime() - targetScanStart);
-            trace.volumetricTargetScanPrecheckNanos += targetScanResult.precheckNanos();
-            trace.volumetricTargetScanBlendNanos += targetScanResult.blendNanos();
-        }
+        long targetScanNanos = collectMetrics ? (System.nanoTime() - targetScanStart) : 0L;
 
         LongArrayList targetPositions = targetScanResult.targetPositions();
         FloatArrayList targetWeights = targetScanResult.targetWeights();
@@ -903,7 +1105,17 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         for (int i = 0; i < targetPositions.size(); i++) {
             baselineByPos.put(targetPositions.getLong(i), targetWeights.getFloat(i));
         }
-        return smoothEikonalVolumetricMechanics(baselineByPos, solidPositions);
+        Long2FloatOpenHashMap smoothed = smoothEikonalVolumetricMechanics(baselineByPos, solidPositions);
+        return new EikonalVolumetricBaselineResult(
+                smoothed,
+                directionSetupNanos,
+                pressureSolveNanos,
+                targetScanNanos,
+                collectMetrics ? targetScanResult.precheckNanos() : 0L,
+                collectMetrics ? targetScanResult.blendNanos() : 0L,
+                collectMetrics ? directionCount : 0,
+                collectMetrics ? radialSteps : 0
+        );
     }
 
     private static Long2FloatOpenHashMap smoothEikonalVolumetricMechanics(Long2FloatOpenHashMap pressureByPos,
@@ -969,6 +1181,18 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return Math.pow(Math.max(0.0D, edgeProgress), EIKONAL_CUTOFF_EDGE_CURVE_EXPONENT);
     }
 
+    private static double computeAnalyticEikonalAirArrival(double centerX,
+                                                           double centerY,
+                                                           double centerZ,
+                                                           int x,
+                                                           int y,
+                                                           int z) {
+        double dx = (x + 0.5D) - centerX;
+        double dy = (y + 0.5D) - centerY;
+        double dz = (z + 0.5D) - centerZ;
+        return Math.sqrt((dx * dx) + (dy * dy) + (dz * dz)) * EIKONAL_AIR_SLOWNESS;
+    }
+
     private static EikonalSolveResult solveEikonalArrivalTimes(EikonalField field,
                                                                double centerX,
                                                                double centerY,
@@ -977,49 +1201,676 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                                float solidSlownessScale) {
         float[] arrivalTimes = new float[field.slowness().length];
         Arrays.fill(arrivalTimes, Float.POSITIVE_INFINITY);
+        BitSet traversableMask = field.activeMask();
+        float[] resolvedSlowness = resolveEikonalSlownessField(field, uniformSlownessOverride, solidSlownessScale);
         BitSet sourceMask = new BitSet(arrivalTimes.length);
         int sourceCount = initializeEikonalSources(
                 arrivalTimes,
                 sourceMask,
                 field,
+                traversableMask,
+                resolvedSlowness,
                 centerX,
                 centerY,
-                centerZ,
-                uniformSlownessOverride,
-                solidSlownessScale
+                centerZ
         );
+        return solveEikonalArrivalTimesPreparedMultires(
+                arrivalTimes,
+                resolvedSlowness,
+                field,
+                sourceMask,
+                sourceCount,
+                true
+        );
+    }
+
+    private static PairedEikonalSolveResult solvePairedEikonalArrivalTimes(EikonalField field,
+                                                                           double centerX,
+                                                                           double centerY,
+                                                                           double centerZ,
+                                                                           float uniformSlownessOverride,
+                                                                           float normalSolidSlownessScale,
+                                                                           float shadowSolidSlownessScale) {
+        float[] normalArrivalTimes = new float[field.slowness().length];
+        float[] shadowArrivalTimes = new float[field.slowness().length];
+        Arrays.fill(normalArrivalTimes, Float.POSITIVE_INFINITY);
+        Arrays.fill(shadowArrivalTimes, Float.POSITIVE_INFINITY);
+        BitSet traversableMask = field.activeMask();
+        PairedEikonalSlownessResult slownessResult = resolvePairedEikonalSlownessField(
+                field,
+                uniformSlownessOverride,
+                normalSolidSlownessScale,
+                shadowSolidSlownessScale
+        );
+        BitSet normalSourceMask = new BitSet(normalArrivalTimes.length);
+        BitSet shadowSourceMask = new BitSet(shadowArrivalTimes.length);
+        PairedEikonalSourceResult sourceResult = initializePairedEikonalSources(
+                normalArrivalTimes,
+                normalSourceMask,
+                slownessResult.normalSlowness(),
+                shadowArrivalTimes,
+                shadowSourceMask,
+                slownessResult.shadowSlowness(),
+                field,
+                traversableMask,
+                centerX,
+                centerY,
+                centerZ
+        );
+
+        EikonalSolveResult normalSolveResult;
+        EikonalSolveResult shadowSolveResult;
+        if (EIKONAL_SOLVE_POOL != null) {
+            Future<EikonalSolveResult> shadowFuture = EIKONAL_SOLVE_POOL.submit(
+                    () -> solveEikonalArrivalTimesPreparedMultires(
+                            shadowArrivalTimes,
+                            slownessResult.shadowSlowness(),
+                            field,
+                            shadowSourceMask,
+                            sourceResult.shadowSourceCount(),
+                            true
+                    )
+            );
+            normalSolveResult = solveEikonalArrivalTimesPreparedMultires(
+                    normalArrivalTimes,
+                    slownessResult.normalSlowness(),
+                    field,
+                    normalSourceMask,
+                    sourceResult.normalSourceCount(),
+                    true
+            );
+            try {
+                shadowSolveResult = shadowFuture.get();
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                shadowFuture.cancel(true);
+                shadowSolveResult = solveEikonalArrivalTimesPreparedMultires(
+                        shadowArrivalTimes,
+                        slownessResult.shadowSlowness(),
+                        field,
+                        shadowSourceMask,
+                        sourceResult.shadowSourceCount(),
+                        true
+                );
+            } catch (ExecutionException exception) {
+                shadowFuture.cancel(true);
+                shadowSolveResult = solveEikonalArrivalTimesPreparedMultires(
+                        shadowArrivalTimes,
+                        slownessResult.shadowSlowness(),
+                        field,
+                        shadowSourceMask,
+                        sourceResult.shadowSourceCount(),
+                        true
+                );
+            }
+        } else {
+            normalSolveResult = solveEikonalArrivalTimesPreparedMultires(
+                    normalArrivalTimes,
+                    slownessResult.normalSlowness(),
+                    field,
+                    normalSourceMask,
+                    sourceResult.normalSourceCount(),
+                    true
+            );
+            shadowSolveResult = solveEikonalArrivalTimesPreparedMultires(
+                    shadowArrivalTimes,
+                    slownessResult.shadowSlowness(),
+                    field,
+                    shadowSourceMask,
+                    sourceResult.shadowSourceCount(),
+                    true
+            );
+        }
+        return new PairedEikonalSolveResult(normalSolveResult, shadowSolveResult);
+    }
+
+    private static EikonalSolveResult solveEikonalArrivalTimesPrepared(float[] arrivalTimes,
+                                                                       float[] resolvedSlowness,
+                                                                       EikonalField field,
+                                                                       BitSet sourceMask,
+                                                                       int sourceCount) {
+        return solveEikonalArrivalTimesPrepared(
+                arrivalTimes,
+                resolvedSlowness,
+                field,
+                sourceMask,
+                sourceCount,
+                true
+        );
+    }
+
+    private static EikonalSolveResult solveEikonalArrivalTimesPrepared(float[] arrivalTimes,
+                                                                       float[] resolvedSlowness,
+                                                                       EikonalField field,
+                                                                       BitSet sourceMask,
+                                                                       int sourceCount,
+                                                                       boolean allowParallelSweep) {
         if (sourceCount <= 0) {
-            return new EikonalSolveResult(arrivalTimes, 0);
+            return new EikonalSolveResult(arrivalTimes, 0, 0);
+        }
+        int maxSweepCycles = computeEikonalMaxSweepCycles(field);
+        int sweepCycles = refineEikonalArrivalTimes(
+                arrivalTimes,
+                resolvedSlowness,
+                field,
+                sourceMask,
+                allowParallelSweep,
+                maxSweepCycles
+        );
+        return new EikonalSolveResult(arrivalTimes, sourceCount, sweepCycles);
+    }
+
+    private static EikonalSolveResult solveEikonalArrivalTimesPreparedMultires(float[] arrivalTimes,
+                                                                                float[] resolvedSlowness,
+                                                                                EikonalField field,
+                                                                                BitSet sourceMask,
+                                                                                int sourceCount,
+                                                                                boolean allowParallelSweep) {
+        if (!EIKONAL_USE_MULTIRES_COARSE_SOLVE || sourceCount <= 0) {
+            return solveEikonalArrivalTimesPrepared(
+                    arrivalTimes,
+                    resolvedSlowness,
+                    field,
+                    sourceMask,
+                    sourceCount,
+                    allowParallelSweep
+            );
         }
 
+        EikonalCoarseSolveContext coarseContext = buildCoarseEikonalSolveContext(
+                field,
+                resolvedSlowness,
+                sourceMask,
+                arrivalTimes,
+                EIKONAL_MULTIRES_DOWNSAMPLE_FACTOR
+        );
+        if (coarseContext == null || coarseContext.coarseSourceCount() <= 0) {
+            return solveEikonalArrivalTimesPrepared(
+                    arrivalTimes,
+                    resolvedSlowness,
+                    field,
+                    sourceMask,
+                    sourceCount,
+                    allowParallelSweep
+            );
+        }
+
+        solveEikonalArrivalTimesPrepared(
+                coarseContext.coarseArrivalTimes(),
+                coarseContext.coarseSlowness(),
+                coarseContext.coarseField(),
+                coarseContext.coarseSourceMask(),
+                coarseContext.coarseSourceCount(),
+                allowParallelSweep
+        );
+
+        seedFineArrivalTimesFromCoarse(
+                arrivalTimes,
+                resolvedSlowness,
+                field,
+                sourceMask,
+                coarseContext
+        );
+        int fineSweepCycles = refineEikonalArrivalTimes(
+                arrivalTimes,
+                resolvedSlowness,
+                field,
+                sourceMask,
+                allowParallelSweep,
+                EIKONAL_MULTIRES_FINE_REFINE_SWEEP_CYCLES
+        );
+        return new EikonalSolveResult(arrivalTimes, sourceCount, fineSweepCycles);
+    }
+
+    private static int refineEikonalArrivalTimes(float[] arrivalTimes,
+                                                 float[] resolvedSlowness,
+                                                 EikonalField field,
+                                                 BitSet sourceMask,
+                                                 boolean allowParallelSweep,
+                                                 int maxSweepCycles) {
+        int boundedCycles = Math.max(0, Math.min(maxSweepCycles, computeEikonalMaxSweepCycles(field)));
         int sweepCycles = 0;
-        int maxSweepCycles = computeEikonalMaxSweepCycles(field);
-        for (int cycle = 0; cycle < maxSweepCycles; cycle++) {
+        for (int cycle = 0; cycle < boundedCycles; cycle++) {
             double maxDelta = 0.0D;
-            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, field, sourceMask, true, true, true, uniformSlownessOverride, solidSlownessScale));
-            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, field, sourceMask, true, true, false, uniformSlownessOverride, solidSlownessScale));
-            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, field, sourceMask, true, false, true, uniformSlownessOverride, solidSlownessScale));
-            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, field, sourceMask, true, false, false, uniformSlownessOverride, solidSlownessScale));
-            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, field, sourceMask, false, true, true, uniformSlownessOverride, solidSlownessScale));
-            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, field, sourceMask, false, true, false, uniformSlownessOverride, solidSlownessScale));
-            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, field, sourceMask, false, false, true, uniformSlownessOverride, solidSlownessScale));
-            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, field, sourceMask, false, false, false, uniformSlownessOverride, solidSlownessScale));
+            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, true, true, true));
+            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, true, true, false));
+            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, true, false, true));
+            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, true, false, false));
+            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, false, true, true));
+            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, false, true, false));
+            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, false, false, true));
+            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, false, false, false));
             sweepCycles++;
             if (maxDelta <= EIKONAL_CONVERGENCE_EPSILON) {
                 break;
             }
         }
-        return new EikonalSolveResult(arrivalTimes, sweepCycles);
+        return sweepCycles;
+    }
+
+    private static EikonalCoarseSolveContext buildCoarseEikonalSolveContext(EikonalField fineField,
+                                                                             float[] fineSlowness,
+                                                                             BitSet fineSourceMask,
+                                                                             float[] fineArrivalTimes,
+                                                                             int downsampleFactor) {
+        if (downsampleFactor <= 1) {
+            return null;
+        }
+        int fineSizeX = fineField.sizeX();
+        int fineSizeY = fineField.sizeY();
+        int fineSizeZ = fineField.sizeZ();
+        int longestAxis = Math.max(fineSizeX, Math.max(fineSizeY, fineSizeZ));
+        if (longestAxis < EIKONAL_MULTIRES_MIN_AXIS_FOR_COARSE) {
+            return null;
+        }
+
+        int coarseSizeX = (fineSizeX + downsampleFactor - 1) / downsampleFactor;
+        int coarseSizeY = (fineSizeY + downsampleFactor - 1) / downsampleFactor;
+        int coarseSizeZ = (fineSizeZ + downsampleFactor - 1) / downsampleFactor;
+        if (coarseSizeX >= fineSizeX && coarseSizeY >= fineSizeY && coarseSizeZ >= fineSizeZ) {
+            return null;
+        }
+        long coarseVolumeLong = (long) coarseSizeX * (long) coarseSizeY * (long) coarseSizeZ;
+        if (coarseVolumeLong <= 0L || coarseVolumeLong > Integer.MAX_VALUE - 8L) {
+            return null;
+        }
+        int coarseVolume = (int) coarseVolumeLong;
+        float[] coarseSlowness = new float[Math.max(1, coarseVolume)];
+        float[] coarseArrivalTimes = new float[Math.max(1, coarseVolume)];
+        Arrays.fill(coarseArrivalTimes, Float.POSITIVE_INFINITY);
+        BitSet coarseSourceMask = new BitSet(coarseArrivalTimes.length);
+        int coarseSourceCount = 0;
+        LongArrayList coarseSolidPositions = new LongArrayList(Math.max(16, fineField.solidPositions().size() / Math.max(1, downsampleFactor * downsampleFactor)));
+
+        float airSlowness = (float) EIKONAL_AIR_SLOWNESS;
+        int fineStrideX = fineSizeY * fineSizeZ;
+        int fineStrideY = fineSizeZ;
+        for (int coarseX = 0; coarseX < coarseSizeX; coarseX++) {
+            int fineStartX = coarseX * downsampleFactor;
+            int fineEndX = Math.min(fineSizeX, fineStartX + downsampleFactor);
+            for (int coarseY = 0; coarseY < coarseSizeY; coarseY++) {
+                int fineStartY = coarseY * downsampleFactor;
+                int fineEndY = Math.min(fineSizeY, fineStartY + downsampleFactor);
+                for (int coarseZ = 0; coarseZ < coarseSizeZ; coarseZ++) {
+                    int fineStartZ = coarseZ * downsampleFactor;
+                    int fineEndZ = Math.min(fineSizeZ, fineStartZ + downsampleFactor);
+                    float minSlowness = Float.POSITIVE_INFINITY;
+                    float minSourceArrival = Float.POSITIVE_INFINITY;
+                    boolean active = false;
+                    boolean hasSolid = false;
+                    boolean hasSource = false;
+                    for (int fineX = fineStartX; fineX < fineEndX; fineX++) {
+                        int baseX = fineX * fineStrideX;
+                        for (int fineY = fineStartY; fineY < fineEndY; fineY++) {
+                            int base = baseX + (fineY * fineStrideY);
+                            for (int fineZ = fineStartZ; fineZ < fineEndZ; fineZ++) {
+                                int fineIndex = base + fineZ;
+                                float slowness = fineSlowness[fineIndex];
+                                if (slowness <= 0.0F) {
+                                    continue;
+                                }
+                                active = true;
+                                minSlowness = Math.min(minSlowness, slowness);
+                                hasSolid |= slowness > airSlowness + 1.0E-6F;
+                                if (fineSourceMask.get(fineIndex)) {
+                                    hasSource = true;
+                                    minSourceArrival = Math.min(minSourceArrival, fineArrivalTimes[fineIndex]);
+                                }
+                            }
+                        }
+                    }
+
+                    if (!active || !Float.isFinite(minSlowness)) {
+                        continue;
+                    }
+
+                    int coarseIndex = eikonalGridIndex(coarseX, coarseY, coarseZ, coarseSizeY, coarseSizeZ);
+                    coarseSlowness[coarseIndex] = minSlowness;
+                    if (hasSolid) {
+                        coarseSolidPositions.add(BlockPos.asLong(
+                                fineField.minX() + fineStartX,
+                                fineField.minY() + fineStartY,
+                                fineField.minZ() + fineStartZ
+                        ));
+                    }
+                    if (hasSource && Float.isFinite(minSourceArrival)) {
+                        if (!coarseSourceMask.get(coarseIndex)) {
+                            coarseSourceMask.set(coarseIndex);
+                            coarseSourceCount++;
+                        }
+                        coarseArrivalTimes[coarseIndex] = minSourceArrival;
+                    }
+                }
+            }
+        }
+
+        if (coarseSourceCount <= 0) {
+            return null;
+        }
+        int coarseSampledVoxels = Math.max(1, fineField.sampledVoxelCount() / Math.max(1, downsampleFactor * downsampleFactor * downsampleFactor));
+        EikonalField coarseField = buildPreparedEikonalFieldFromSlowness(
+                fineField.minX(),
+                fineField.minY(),
+                fineField.minZ(),
+                coarseSizeX,
+                coarseSizeY,
+                coarseSizeZ,
+                coarseSampledVoxels,
+                coarseSlowness,
+                coarseSolidPositions
+        );
+        if (coarseField.activeMask().isEmpty()) {
+            return null;
+        }
+        return new EikonalCoarseSolveContext(
+                coarseField,
+                coarseArrivalTimes,
+                coarseSlowness,
+                coarseSourceMask,
+                coarseSourceCount,
+                downsampleFactor
+        );
+    }
+
+    private static EikonalField buildPreparedEikonalFieldFromSlowness(int minX,
+                                                                       int minY,
+                                                                       int minZ,
+                                                                       int sizeX,
+                                                                       int sizeY,
+                                                                       int sizeZ,
+                                                                       int sampledVoxelCount,
+                                                                       float[] slowness,
+                                                                       LongArrayList solidPositions) {
+        int volume = Math.max(1, sizeX * sizeY * sizeZ);
+        BitSet activeMask = new BitSet(volume);
+        int rowCount = Math.max(1, sizeX * sizeY);
+        int[] activeCountByRow = new int[rowCount];
+
+        int strideX = sizeY * sizeZ;
+        int strideY = sizeZ;
+        for (int xOffset = 0; xOffset < sizeX; xOffset++) {
+            int baseX = xOffset * strideX;
+            for (int yOffset = 0; yOffset < sizeY; yOffset++) {
+                int rowIndex = eikonalRowIndex(xOffset, yOffset, sizeY);
+                int base = baseX + (yOffset * strideY);
+                int activeCount = 0;
+                for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
+                    int index = base + zOffset;
+                    if (slowness[index] <= 0.0F) {
+                        continue;
+                    }
+                    activeMask.set(index);
+                    activeCount++;
+                }
+                activeCountByRow[rowIndex] = activeCount;
+            }
+        }
+
+        int[] activeRowOffsets = new int[rowCount];
+        int totalActive = 0;
+        for (int rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+            activeRowOffsets[rowIndex] = totalActive;
+            totalActive += activeCountByRow[rowIndex];
+        }
+        int[] activeRowIndices = new int[Math.max(1, totalActive)];
+        int[] writeCursorByRow = Arrays.copyOf(activeRowOffsets, activeRowOffsets.length);
+        for (int xOffset = 0; xOffset < sizeX; xOffset++) {
+            int baseX = xOffset * strideX;
+            for (int yOffset = 0; yOffset < sizeY; yOffset++) {
+                int rowIndex = eikonalRowIndex(xOffset, yOffset, sizeY);
+                int base = baseX + (yOffset * strideY);
+                for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
+                    int index = base + zOffset;
+                    if (slowness[index] <= 0.0F) {
+                        continue;
+                    }
+                    activeRowIndices[writeCursorByRow[rowIndex]++] = index;
+                }
+            }
+        }
+
+        int[] neighborNegX = new int[Math.max(1, volume)];
+        int[] neighborPosX = new int[Math.max(1, volume)];
+        int[] neighborNegY = new int[Math.max(1, volume)];
+        int[] neighborPosY = new int[Math.max(1, volume)];
+        int[] neighborNegZ = new int[Math.max(1, volume)];
+        int[] neighborPosZ = new int[Math.max(1, volume)];
+        Arrays.fill(neighborNegX, -1);
+        Arrays.fill(neighborPosX, -1);
+        Arrays.fill(neighborNegY, -1);
+        Arrays.fill(neighborPosY, -1);
+        Arrays.fill(neighborNegZ, -1);
+        Arrays.fill(neighborPosZ, -1);
+        for (int index = activeMask.nextSetBit(0); index >= 0; index = activeMask.nextSetBit(index + 1)) {
+            int xOffset = index / strideX;
+            int yz = index - (xOffset * strideX);
+            int yOffset = yz / strideY;
+            int zOffset = yz - (yOffset * strideY);
+            if (xOffset > 0) {
+                int neighbor = index - strideX;
+                if (activeMask.get(neighbor)) {
+                    neighborNegX[index] = neighbor;
+                }
+            }
+            if (xOffset + 1 < sizeX) {
+                int neighbor = index + strideX;
+                if (activeMask.get(neighbor)) {
+                    neighborPosX[index] = neighbor;
+                }
+            }
+            if (yOffset > 0) {
+                int neighbor = index - strideY;
+                if (activeMask.get(neighbor)) {
+                    neighborNegY[index] = neighbor;
+                }
+            }
+            if (yOffset + 1 < sizeY) {
+                int neighbor = index + strideY;
+                if (activeMask.get(neighbor)) {
+                    neighborPosY[index] = neighbor;
+                }
+            }
+            if (zOffset > 0) {
+                int neighbor = index - 1;
+                if (activeMask.get(neighbor)) {
+                    neighborNegZ[index] = neighbor;
+                }
+            }
+            if (zOffset + 1 < sizeZ) {
+                int neighbor = index + 1;
+                if (activeMask.get(neighbor)) {
+                    neighborPosZ[index] = neighbor;
+                }
+            }
+        }
+
+        return new EikonalField(
+                minX,
+                minY,
+                minZ,
+                sizeX,
+                sizeY,
+                sizeZ,
+                sampledVoxelCount,
+                activeMask,
+                slowness,
+                solidPositions,
+                activeRowOffsets,
+                activeCountByRow,
+                activeRowIndices,
+                neighborNegX,
+                neighborPosX,
+                neighborNegY,
+                neighborPosY,
+                neighborNegZ,
+                neighborPosZ
+        );
+    }
+
+    private static void seedFineArrivalTimesFromCoarse(float[] fineArrivalTimes,
+                                                       float[] fineSlowness,
+                                                       EikonalField fineField,
+                                                       BitSet fineSourceMask,
+                                                       EikonalCoarseSolveContext coarseContext) {
+        EikonalField coarseField = coarseContext.coarseField();
+        float[] coarseArrivalTimes = coarseContext.coarseArrivalTimes();
+        int downsampleFactor = coarseContext.downsampleFactor();
+        int fineSizeY = fineField.sizeY();
+        int fineSizeZ = fineField.sizeZ();
+        int coarseSizeY = coarseField.sizeY();
+        int coarseSizeZ = coarseField.sizeZ();
+        int fineStrideX = fineSizeY * fineSizeZ;
+        int fineStrideY = fineSizeZ;
+        int maxCoarseX = coarseField.sizeX() - 1;
+        int maxCoarseY = coarseField.sizeY() - 1;
+        int maxCoarseZ = coarseField.sizeZ() - 1;
+        int[] activeIndices = fineField.activeRowIndices();
+        for (int fineIndex : activeIndices) {
+            if (fineSourceMask.get(fineIndex) || fineSlowness[fineIndex] <= 0.0F) {
+                continue;
+            }
+            int fineX = fineIndex / fineStrideX;
+            int fineYZ = fineIndex - (fineX * fineStrideX);
+            int fineY = fineYZ / fineStrideY;
+            int fineZ = fineYZ - (fineY * fineStrideY);
+
+            int coarseX = Math.min(maxCoarseX, fineX / downsampleFactor);
+            int coarseY = Math.min(maxCoarseY, fineY / downsampleFactor);
+            int coarseZ = Math.min(maxCoarseZ, fineZ / downsampleFactor);
+            int coarseIndex = ((coarseX * coarseSizeY) + coarseY) * coarseSizeZ + coarseZ;
+            float coarseArrival = coarseArrivalTimes[coarseIndex];
+            if (!Float.isFinite(coarseArrival)) {
+                continue;
+            }
+
+            double coarseCenterX = (coarseX * downsampleFactor) + (downsampleFactor * 0.5D);
+            double coarseCenterY = (coarseY * downsampleFactor) + (downsampleFactor * 0.5D);
+            double coarseCenterZ = (coarseZ * downsampleFactor) + (downsampleFactor * 0.5D);
+            double dx = (fineX + 0.5D) - coarseCenterX;
+            double dy = (fineY + 0.5D) - coarseCenterY;
+            double dz = (fineZ + 0.5D) - coarseCenterZ;
+            double localDistance = Math.sqrt((dx * dx) + (dy * dy) + (dz * dz));
+            float seededArrival = (float) (coarseArrival + (localDistance * Math.max(1.0E-6F, fineSlowness[fineIndex])));
+            if (seededArrival < fineArrivalTimes[fineIndex]) {
+                fineArrivalTimes[fineIndex] = seededArrival;
+            }
+        }
+    }
+
+    private static float[] resolveEikonalSlownessField(EikonalField field,
+                                                       float uniformSlownessOverride,
+                                                       float solidSlownessScale) {
+        return resolvePairedEikonalSlownessField(
+                field,
+                uniformSlownessOverride,
+                solidSlownessScale,
+                solidSlownessScale
+        ).normalSlowness();
+    }
+
+    private static PairedEikonalSlownessResult resolvePairedEikonalSlownessField(EikonalField field,
+                                                                                  float uniformSlownessOverride,
+                                                                                  float normalSolidSlownessScale,
+                                                                                  float shadowSolidSlownessScale) {
+        float[] baseSlowness = field.slowness();
+        boolean uniformOverrideActive = Float.isFinite(uniformSlownessOverride) && uniformSlownessOverride > 0.0F;
+        float resolvedNormalScale = Float.isFinite(normalSolidSlownessScale) && normalSolidSlownessScale > 0.0F
+                ? normalSolidSlownessScale
+                : 1.0F;
+        float resolvedShadowScale = Float.isFinite(shadowSolidSlownessScale) && shadowSolidSlownessScale > 0.0F
+                ? shadowSolidSlownessScale
+                : 1.0F;
+        if (!uniformOverrideActive
+                && Math.abs(resolvedNormalScale - 1.0F) <= 1.0E-6F
+                && Math.abs(resolvedShadowScale - 1.0F) <= 1.0E-6F) {
+            return new PairedEikonalSlownessResult(baseSlowness, baseSlowness);
+        }
+
+        int[] activeIndices = field.activeRowIndices();
+        if (uniformOverrideActive) {
+            float[] resolvedSlowness = new float[baseSlowness.length];
+            for (int index : activeIndices) {
+                if (baseSlowness[index] > 0.0F) {
+                    resolvedSlowness[index] = uniformSlownessOverride;
+                }
+            }
+            return new PairedEikonalSlownessResult(resolvedSlowness, resolvedSlowness);
+        }
+
+        boolean normalIsBase = Math.abs(resolvedNormalScale - 1.0F) <= 1.0E-6F;
+        boolean shadowIsBase = Math.abs(resolvedShadowScale - 1.0F) <= 1.0E-6F;
+        if (!normalIsBase && !shadowIsBase && Math.abs(resolvedNormalScale - resolvedShadowScale) <= 1.0E-6F) {
+            float[] resolvedSlowness = new float[baseSlowness.length];
+            applyEikonalSlownessScale(resolvedSlowness, baseSlowness, activeIndices, resolvedNormalScale);
+            return new PairedEikonalSlownessResult(resolvedSlowness, resolvedSlowness);
+        }
+
+        float[] normalSlowness = normalIsBase ? baseSlowness : new float[baseSlowness.length];
+        float[] shadowSlowness = shadowIsBase ? baseSlowness : new float[baseSlowness.length];
+        if (!normalIsBase) {
+            applyEikonalSlownessScale(normalSlowness, baseSlowness, activeIndices, resolvedNormalScale);
+        }
+        if (!shadowIsBase) {
+            applyEikonalSlownessScale(shadowSlowness, baseSlowness, activeIndices, resolvedShadowScale);
+        }
+        return new PairedEikonalSlownessResult(normalSlowness, shadowSlowness);
+    }
+
+    private static void applyEikonalSlownessScale(float[] outputSlowness,
+                                                  float[] baseSlowness,
+                                                  int[] activeIndices,
+                                                  float scale) {
+        float airSlowness = (float) EIKONAL_AIR_SLOWNESS;
+        for (int index : activeIndices) {
+            float base = baseSlowness[index];
+            if (base <= 0.0F) {
+                continue;
+            }
+            float solidOverrun = Math.max(0.0F, base - airSlowness);
+            if (solidOverrun <= 1.0E-6F) {
+                outputSlowness[index] = base;
+                continue;
+            }
+            outputSlowness[index] = airSlowness + (solidOverrun * scale);
+        }
     }
 
     private static int initializeEikonalSources(float[] arrivalTimes,
                                                 BitSet sourceMask,
                                                 EikonalField field,
+                                                BitSet traversableMask,
+                                                float[] resolvedSlowness,
                                                 double centerX,
                                                 double centerY,
-                                                double centerZ,
-                                                float uniformSlownessOverride,
-                                                float solidSlownessScale) {
+                                                double centerZ) {
+        PairedEikonalSourceResult sourceResult = initializePairedEikonalSources(
+                arrivalTimes,
+                sourceMask,
+                resolvedSlowness,
+                null,
+                null,
+                null,
+                field,
+                traversableMask,
+                centerX,
+                centerY,
+                centerZ
+        );
+        return sourceResult.normalSourceCount();
+    }
+
+    private static PairedEikonalSourceResult initializePairedEikonalSources(float[] normalArrivalTimes,
+                                                                             BitSet normalSourceMask,
+                                                                             float[] normalSlowness,
+                                                                             float[] shadowArrivalTimes,
+                                                                             BitSet shadowSourceMask,
+                                                                             float[] shadowSlowness,
+                                                                             EikonalField field,
+                                                                             BitSet traversableMask,
+                                                                             double centerX,
+                                                                             double centerY,
+                                                                             double centerZ) {
+        boolean computeShadow = shadowArrivalTimes != null && shadowSourceMask != null && shadowSlowness != null;
         int baseX = Mth.floor(centerX) - field.minX();
         int baseY = Mth.floor(centerY) - field.minY();
         int baseZ = Mth.floor(centerZ) - field.minZ();
@@ -1029,13 +1880,13 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int maxY = Math.min(field.sizeY() - 1, baseY + 1);
         int minZ = Math.max(0, baseZ - 1);
         int maxZ = Math.min(field.sizeZ() - 1, baseZ + 1);
-        int sourceCount = 0;
+        int normalSourceCount = 0;
+        int shadowSourceCount = 0;
         for (int x = minX; x <= maxX; x++) {
             for (int y = minY; y <= maxY; y++) {
                 for (int z = minZ; z <= maxZ; z++) {
                     int index = eikonalGridIndex(x, y, z, field.sizeY(), field.sizeZ());
-                    float cellSlowness = resolvedEikonalSlowness(field.slowness(), index, uniformSlownessOverride, solidSlownessScale);
-                    if (cellSlowness <= 0.0F) {
+                    if (!traversableMask.get(index)) {
                         continue;
                     }
                     double worldX = field.minX() + x + 0.5D;
@@ -1044,27 +1895,53 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     double dx = worldX - centerX;
                     double dy = worldY - centerY;
                     double dz = worldZ - centerZ;
-                    double arrival = Math.sqrt((dx * dx) + (dy * dy) + (dz * dz)) * cellSlowness;
-                    if (arrival + 1.0E-6D < arrivalTimes[index]) {
-                        if (!sourceMask.get(index)) {
-                            sourceMask.set(index);
-                            sourceCount++;
+                    double distance = Math.sqrt((dx * dx) + (dy * dy) + (dz * dz));
+
+                    float normalCellSlowness = normalSlowness[index];
+                    if (normalCellSlowness > 0.0F) {
+                        double normalArrival = distance * normalCellSlowness;
+                        if (normalArrival + 1.0E-6D < normalArrivalTimes[index]) {
+                            if (!normalSourceMask.get(index)) {
+                                normalSourceMask.set(index);
+                                normalSourceCount++;
+                            }
+                            normalArrivalTimes[index] = (float) normalArrival;
                         }
-                        arrivalTimes[index] = (float) arrival;
+                    }
+
+                    if (computeShadow) {
+                        float shadowCellSlowness = shadowSlowness[index];
+                        if (shadowCellSlowness <= 0.0F) {
+                            continue;
+                        }
+                        double shadowArrival = distance * shadowCellSlowness;
+                        if (shadowArrival + 1.0E-6D < shadowArrivalTimes[index]) {
+                            if (!shadowSourceMask.get(index)) {
+                                shadowSourceMask.set(index);
+                                shadowSourceCount++;
+                            }
+                            shadowArrivalTimes[index] = (float) shadowArrival;
+                        }
                     }
                 }
             }
         }
-        if (sourceCount > 0) {
-            return sourceCount;
+
+        int seedIndex = -1;
+        if (normalSourceCount <= 0 || (computeShadow && shadowSourceCount <= 0)) {
+            seedIndex = resolveEikonalSeedIndex(field, traversableMask, centerX, centerY, centerZ);
         }
-        int seedIndex = resolveEikonalSeedIndex(field, centerX, centerY, centerZ);
-        if (seedIndex >= 0) {
-            arrivalTimes[seedIndex] = 0.0F;
-            sourceMask.set(seedIndex);
-            return 1;
+        if (normalSourceCount <= 0 && seedIndex >= 0 && normalSlowness[seedIndex] > 0.0F) {
+            normalArrivalTimes[seedIndex] = 0.0F;
+            normalSourceMask.set(seedIndex);
+            normalSourceCount = 1;
         }
-        return 0;
+        if (computeShadow && shadowSourceCount <= 0 && seedIndex >= 0 && shadowSlowness[seedIndex] > 0.0F) {
+            shadowArrivalTimes[seedIndex] = 0.0F;
+            shadowSourceMask.set(seedIndex);
+            shadowSourceCount = 1;
+        }
+        return new PairedEikonalSourceResult(normalSourceCount, shadowSourceCount);
     }
 
     private static int computeEikonalMaxSweepCycles(EikonalField field) {
@@ -1073,12 +1950,16 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return Mth.clamp(EIKONAL_BASE_SWEEP_CYCLES + growthCycles, EIKONAL_BASE_SWEEP_CYCLES, EIKONAL_MAX_SWEEP_CYCLES);
     }
 
-    private static int resolveEikonalSeedIndex(EikonalField field, double centerX, double centerY, double centerZ) {
+    private static int resolveEikonalSeedIndex(EikonalField field,
+                                               BitSet traversableMask,
+                                               double centerX,
+                                               double centerY,
+                                               double centerZ) {
         int seedX = Mth.clamp(Mth.floor(centerX), field.minX(), field.minX() + field.sizeX() - 1);
         int seedY = Mth.clamp(Mth.floor(centerY), field.minY(), field.minY() + field.sizeY() - 1);
         int seedZ = Mth.clamp(Mth.floor(centerZ), field.minZ(), field.minZ() + field.sizeZ() - 1);
         int seedIndex = eikonalGridIndex(seedX - field.minX(), seedY - field.minY(), seedZ - field.minZ(), field.sizeY(), field.sizeZ());
-        if (field.slowness()[seedIndex] > 0.0F) {
+        if (traversableMask.get(seedIndex)) {
             return seedIndex;
         }
 
@@ -1088,7 +1969,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             for (int y = 0; y < field.sizeY(); y++) {
                 for (int z = 0; z < field.sizeZ(); z++) {
                     int index = eikonalGridIndex(x, y, z, field.sizeY(), field.sizeZ());
-                    if (field.slowness()[index] <= 0.0F) {
+                    if (!traversableMask.get(index)) {
                         continue;
                     }
                     double worldX = field.minX() + x + 0.5D;
@@ -1109,53 +1990,161 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     }
 
     private static double sweepEikonalPass(float[] arrivalTimes,
+                                           float[] resolvedSlowness,
                                            EikonalField field,
                                            BitSet sourceMask,
+                                           boolean allowParallelSweep,
                                            boolean xForward,
                                            boolean yForward,
-                                           boolean zForward,
-                                           float uniformSlownessOverride,
-                                           float solidSlownessScale) {
+                                           boolean zForward) {
         int sizeX = field.sizeX();
         int sizeY = field.sizeY();
-        int sizeZ = field.sizeZ();
-        int strideX = sizeY * sizeZ;
-        int strideY = sizeZ;
-        float[] slowness = field.slowness();
-        int xStart = xForward ? 0 : sizeX - 1;
-        int xEnd = xForward ? sizeX : -1;
-        int xStep = xForward ? 1 : -1;
-        int yStart = yForward ? 0 : sizeY - 1;
-        int yEnd = yForward ? sizeY : -1;
-        int yStep = yForward ? 1 : -1;
-        int zStart = zForward ? 0 : sizeZ - 1;
-        int zEnd = zForward ? sizeZ : -1;
-        int zStep = zForward ? 1 : -1;
+        int diagonalCount = sizeX + sizeY - 1;
+        int[] activeRowOffsets = field.activeRowOffsets();
+        int[] activeRowLengths = field.activeRowLengths();
+        int[] activeRowIndices = field.activeRowIndices();
+        int[] neighborNegX = field.neighborNegX();
+        int[] neighborPosX = field.neighborPosX();
+        int[] neighborNegY = field.neighborNegY();
+        int[] neighborPosY = field.neighborPosY();
+        int[] neighborNegZ = field.neighborNegZ();
+        int[] neighborPosZ = field.neighborPosZ();
         double maxDelta = 0.0D;
-        for (int x = xStart; x != xEnd; x += xStep) {
-            int baseX = x * strideX;
-            for (int y = yStart; y != yEnd; y += yStep) {
-                int base = baseX + (y * strideY);
-                for (int z = zStart; z != zEnd; z += zStep) {
-                    int index = base + z;
-                    float cellSlowness = resolvedEikonalSlowness(slowness, index, uniformSlownessOverride, solidSlownessScale);
-                    if (sourceMask.get(index) || cellSlowness <= 0.0F) {
+        for (int diagonal = 0; diagonal < diagonalCount; diagonal++) {
+            int minXOrder = Math.max(0, diagonal - (sizeY - 1));
+            int maxXOrder = Math.min(sizeX - 1, diagonal);
+            int rowSpan = maxXOrder - minXOrder + 1;
+            int taskCount = resolveEikonalSweepTaskCount(rowSpan);
+            if (!allowParallelSweep || taskCount <= 1 || VOLUMETRIC_TARGET_SCAN_POOL == null) {
+                maxDelta = Math.max(
+                        maxDelta,
+                        sweepEikonalDiagonalChunk(
+                                arrivalTimes,
+                                resolvedSlowness,
+                                field,
+                                sourceMask,
+                                xForward,
+                                yForward,
+                                zForward,
+                                diagonal,
+                                minXOrder,
+                                maxXOrder + 1,
+                                activeRowOffsets,
+                                activeRowLengths,
+                                activeRowIndices,
+                                neighborNegX,
+                                neighborPosX,
+                                neighborNegY,
+                                neighborPosY,
+                                neighborNegZ,
+                                neighborPosZ
+                        )
+                );
+                continue;
+            }
+
+            int chunkSize = (rowSpan + taskCount - 1) / taskCount;
+            ArrayList<Future<Double>> futures = new ArrayList<>(taskCount);
+            final int diagonalIndex = diagonal;
+            for (int taskIndex = 0; taskIndex < taskCount; taskIndex++) {
+                int startXOrder = minXOrder + (taskIndex * chunkSize);
+                int endXOrder = Math.min(maxXOrder + 1, startXOrder + chunkSize);
+                if (startXOrder >= endXOrder) {
+                    break;
+                }
+                final int chunkStartXOrder = startXOrder;
+                final int chunkEndXOrder = endXOrder;
+                futures.add(VOLUMETRIC_TARGET_SCAN_POOL.submit(
+                        () -> sweepEikonalDiagonalChunk(
+                                arrivalTimes,
+                                resolvedSlowness,
+                                field,
+                                sourceMask,
+                                xForward,
+                                yForward,
+                                zForward,
+                                diagonalIndex,
+                                chunkStartXOrder,
+                                chunkEndXOrder,
+                                activeRowOffsets,
+                                activeRowLengths,
+                                activeRowIndices,
+                                neighborNegX,
+                                neighborPosX,
+                                neighborNegY,
+                                neighborPosY,
+                                neighborNegZ,
+                                neighborPosZ
+                        )
+                ));
+            }
+
+            try {
+                for (Future<Double> future : futures) {
+                    maxDelta = Math.max(maxDelta, future.get());
+                }
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                cancelEikonalSweepFutures(futures);
+            } catch (ExecutionException exception) {
+                cancelEikonalSweepFutures(futures);
+            }
+        }
+        return maxDelta;
+    }
+
+    private static double sweepEikonalDiagonalChunk(float[] arrivalTimes,
+                                                    float[] resolvedSlowness,
+                                                    EikonalField field,
+                                                    BitSet sourceMask,
+                                                    boolean xForward,
+                                                    boolean yForward,
+                                                    boolean zForward,
+                                                    int diagonal,
+                                                    int startXOrderInclusive,
+                                                    int endXOrderExclusive,
+                                                    int[] activeRowOffsets,
+                                                    int[] activeRowLengths,
+                                                    int[] activeRowIndices,
+                                                    int[] neighborNegX,
+                                                    int[] neighborPosX,
+                                                    int[] neighborNegY,
+                                                    int[] neighborPosY,
+                                                    int[] neighborNegZ,
+                                                    int[] neighborPosZ) {
+        int sizeX = field.sizeX();
+        int sizeY = field.sizeY();
+        double maxDelta = 0.0D;
+        for (int xOrder = startXOrderInclusive; xOrder < endXOrderExclusive; xOrder++) {
+            int yOrder = diagonal - xOrder;
+            if (yOrder < 0 || yOrder >= sizeY) {
+                continue;
+            }
+            int x = xForward ? xOrder : (sizeX - 1 - xOrder);
+            int y = yForward ? yOrder : (sizeY - 1 - yOrder);
+            int rowIndex = eikonalRowIndex(x, y, sizeY);
+            int rowOffset = activeRowOffsets[rowIndex];
+            int rowLength = activeRowLengths[rowIndex];
+            if (rowLength <= 0) {
+                continue;
+            }
+            if (zForward) {
+                int rowEnd = rowOffset + rowLength;
+                for (int i = rowOffset; i < rowEnd; i++) {
+                    int index = activeRowIndices[i];
+                    if (sourceMask.get(index)) {
                         continue;
                     }
                     double candidate = solveEikonalCell(
                             arrivalTimes,
-                            slowness,
-                            uniformSlownessOverride,
-                            solidSlownessScale,
+                            resolvedSlowness,
                             index,
-                            x,
-                            y,
-                            z,
-                            sizeX,
-                            sizeY,
-                            sizeZ,
-                            strideX,
-                            strideY
+                            neighborNegX,
+                            neighborPosX,
+                            neighborNegY,
+                            neighborPosY,
+                            neighborNegZ,
+                            neighborPosZ
                     );
                     if (!Double.isFinite(candidate)) {
                         continue;
@@ -1170,88 +2159,171 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                         }
                     }
                 }
+                continue;
+            }
+            for (int i = rowOffset + rowLength - 1; i >= rowOffset; i--) {
+                int index = activeRowIndices[i];
+                if (sourceMask.get(index)) {
+                    continue;
+                }
+                double candidate = solveEikonalCell(
+                        arrivalTimes,
+                        resolvedSlowness,
+                        index,
+                        neighborNegX,
+                        neighborPosX,
+                        neighborNegY,
+                        neighborPosY,
+                        neighborNegZ,
+                        neighborPosZ
+                );
+                if (!Double.isFinite(candidate)) {
+                    continue;
+                }
+                double previous = arrivalTimes[index];
+                if (candidate + 1.0E-9D < previous) {
+                    arrivalTimes[index] = (float) candidate;
+                    if (Double.isFinite(previous)) {
+                        maxDelta = Math.max(maxDelta, previous - candidate);
+                    } else {
+                        maxDelta = Math.max(maxDelta, candidate);
+                    }
+                }
             }
         }
         return maxDelta;
     }
 
     private static double solveEikonalCell(float[] arrivalTimes,
-                                           float[] slowness,
-                                           float uniformSlownessOverride,
-                                           float solidSlownessScale,
+                                           float[] resolvedSlowness,
                                            int index,
-                                           int x,
-                                           int y,
-                                           int z,
-                                           int sizeX,
-                                           int sizeY,
-                                           int sizeZ,
-                                           int strideX,
-                                           int strideY) {
-        double a = minEikonalAxisNeighbor(
+                                           int[] neighborNegX,
+                                           int[] neighborPosX,
+                                           int[] neighborNegY,
+                                           int[] neighborPosY,
+                                           int[] neighborNegZ,
+                                           int[] neighborPosZ) {
+        double a = Double.POSITIVE_INFINITY;
+        int negX = neighborNegX[index];
+        int posX = neighborPosX[index];
+        if (negX >= 0) {
+            a = Math.min(a, arrivalTimes[negX]);
+        }
+        if (posX >= 0) {
+            a = Math.min(a, arrivalTimes[posX]);
+        }
+
+        double b = Double.POSITIVE_INFINITY;
+        int negY = neighborNegY[index];
+        int posY = neighborPosY[index];
+        if (negY >= 0) {
+            b = Math.min(b, arrivalTimes[negY]);
+        }
+        if (posY >= 0) {
+            b = Math.min(b, arrivalTimes[posY]);
+        }
+
+        double c = Double.POSITIVE_INFINITY;
+        int negZ = neighborNegZ[index];
+        int posZ = neighborPosZ[index];
+        if (negZ >= 0) {
+            c = Math.min(c, arrivalTimes[negZ]);
+        }
+        if (posZ >= 0) {
+            c = Math.min(c, arrivalTimes[posZ]);
+        }
+
+        if (!Double.isFinite(a) && !Double.isFinite(b) && !Double.isFinite(c)) {
+            return Double.POSITIVE_INFINITY;
+        }
+        return solveEikonalDistance(a, b, c, resolvedSlowness[index]);
+    }
+
+    private static double solveEikonalCellFromAccepted(float[] arrivalTimes,
+                                                       float[] resolvedSlowness,
+                                                       BitSet accepted,
+                                                       int index,
+                                                       int[] neighborNegX,
+                                                       int[] neighborPosX,
+                                                       int[] neighborNegY,
+                                                       int[] neighborPosY,
+                                                       int[] neighborNegZ,
+                                                       int[] neighborPosZ) {
+        double a = minAcceptedEikonalAxisNeighbor(
                 arrivalTimes,
-                slowness,
-                uniformSlownessOverride,
-                solidSlownessScale,
-                x > 0 ? index - strideX : -1,
-                x + 1 < sizeX ? index + strideX : -1
+                resolvedSlowness,
+                accepted,
+                neighborNegX[index],
+                neighborPosX[index]
         );
-        double b = minEikonalAxisNeighbor(
+        double b = minAcceptedEikonalAxisNeighbor(
                 arrivalTimes,
-                slowness,
-                uniformSlownessOverride,
-                solidSlownessScale,
-                y > 0 ? index - strideY : -1,
-                y + 1 < sizeY ? index + strideY : -1
+                resolvedSlowness,
+                accepted,
+                neighborNegY[index],
+                neighborPosY[index]
         );
-        double c = minEikonalAxisNeighbor(
+        double c = minAcceptedEikonalAxisNeighbor(
                 arrivalTimes,
-                slowness,
-                uniformSlownessOverride,
-                solidSlownessScale,
-                z > 0 ? index - 1 : -1,
-                z + 1 < sizeZ ? index + 1 : -1
+                resolvedSlowness,
+                accepted,
+                neighborNegZ[index],
+                neighborPosZ[index]
         );
         if (!Double.isFinite(a) && !Double.isFinite(b) && !Double.isFinite(c)) {
             return Double.POSITIVE_INFINITY;
         }
-        return solveEikonalDistance(a, b, c, resolvedEikonalSlowness(slowness, index, uniformSlownessOverride, solidSlownessScale));
+        return solveEikonalDistance(a, b, c, resolvedSlowness[index]);
     }
 
-    private static double minEikonalAxisNeighbor(float[] arrivalTimes,
-                                                 float[] slowness,
-                                                 float uniformSlownessOverride,
-                                                 float solidSlownessScale,
-                                                 int negativeIndex,
-                                                 int positiveIndex) {
+    private static void updateEikonalNeighborFromAccepted(float[] arrivalTimes,
+                                                          float[] resolvedSlowness,
+                                                          BitSet accepted,
+                                                          EikonalMinHeap heap,
+                                                          int neighborIndex,
+                                                          int[] neighborNegX,
+                                                          int[] neighborPosX,
+                                                          int[] neighborNegY,
+                                                          int[] neighborPosY,
+                                                          int[] neighborNegZ,
+                                                          int[] neighborPosZ) {
+        if (neighborIndex < 0 || accepted.get(neighborIndex) || resolvedSlowness[neighborIndex] <= 0.0F) {
+            return;
+        }
+        double candidate = solveEikonalCellFromAccepted(
+                arrivalTimes,
+                resolvedSlowness,
+                accepted,
+                neighborIndex,
+                neighborNegX,
+                neighborPosX,
+                neighborNegY,
+                neighborPosY,
+                neighborNegZ,
+                neighborPosZ
+        );
+        if (!Double.isFinite(candidate)) {
+            return;
+        }
+        if (candidate + 1.0E-9D < arrivalTimes[neighborIndex]) {
+            arrivalTimes[neighborIndex] = (float) candidate;
+            heap.add(neighborIndex, candidate);
+        }
+    }
+
+    private static double minAcceptedEikonalAxisNeighbor(float[] arrivalTimes,
+                                                         float[] resolvedSlowness,
+                                                         BitSet accepted,
+                                                         int negativeIndex,
+                                                         int positiveIndex) {
         double min = Double.POSITIVE_INFINITY;
-        if (negativeIndex >= 0 && resolvedEikonalSlowness(slowness, negativeIndex, uniformSlownessOverride, solidSlownessScale) > 0.0F) {
+        if (negativeIndex >= 0 && accepted.get(negativeIndex) && resolvedSlowness[negativeIndex] > 0.0F) {
             min = Math.min(min, arrivalTimes[negativeIndex]);
         }
-        if (positiveIndex >= 0 && resolvedEikonalSlowness(slowness, positiveIndex, uniformSlownessOverride, solidSlownessScale) > 0.0F) {
+        if (positiveIndex >= 0 && accepted.get(positiveIndex) && resolvedSlowness[positiveIndex] > 0.0F) {
             min = Math.min(min, arrivalTimes[positiveIndex]);
         }
         return min;
-    }
-
-    private static float resolvedEikonalSlowness(float[] slowness, int index, float uniformSlownessOverride, float solidSlownessScale) {
-        float baseSlowness = slowness[index];
-        if (baseSlowness <= 0.0F) {
-            return 0.0F;
-        }
-        if (Float.isFinite(uniformSlownessOverride) && uniformSlownessOverride > 0.0F) {
-            return uniformSlownessOverride;
-        }
-        float resolvedScale = Float.isFinite(solidSlownessScale) && solidSlownessScale > 0.0F ? solidSlownessScale : 1.0F;
-        if (Math.abs(resolvedScale - 1.0F) <= 1.0E-6F) {
-            return baseSlowness;
-        }
-        float airSlowness = (float) EIKONAL_AIR_SLOWNESS;
-        float solidOverrun = Math.max(0.0F, baseSlowness - airSlowness);
-        if (solidOverrun <= 1.0E-6F) {
-            return baseSlowness;
-        }
-        return airSlowness + (solidOverrun * resolvedScale);
     }
 
     private static double solveEikonalDistance(double a, double b, double c, double slowness) {
@@ -1310,6 +2382,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
     private static int eikonalGridIndex(int xOffset, int yOffset, int zOffset, int sizeY, int sizeZ) {
         return ((xOffset * sizeY) + yOffset) * sizeZ + zOffset;
+    }
+
+    private static int eikonalRowIndex(int xOffset, int yOffset, int sizeY) {
+        return (xOffset * sizeY) + yOffset;
     }
 
     private static void applyStructuralCollapsePass(ServerLevel level,
@@ -1534,7 +2610,13 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         double[] dirY = directionCache.dirY();
         double[] dirZ = directionCache.dirZ();
         int[][] directionNeighbors = directionCache.neighbors();
-        int radialSteps = Math.max(1, Mth.ceil(resolvedRadius / VOLUMETRIC_DEFORM_SAMPLE_STEP));
+        int[] directionLookup = directionCache.directionLookup();
+        int directionLookupResolution = directionCache.directionLookupResolution();
+        int radialSteps = Mth.clamp(
+                Mth.ceil(resolvedRadius / VOLUMETRIC_DEFORM_SAMPLE_STEP),
+                1,
+                VOLUMETRIC_MAX_RADIAL_STEPS
+        );
         double radialStepSize = resolvedRadius / radialSteps;
         float[] pressureByShell = new float[(radialSteps + 1) * directionCount];
         Arrays.fill(pressureByShell, 0, directionCount, 1.0F);
@@ -1619,7 +2701,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 directionCount,
                 dirX,
                 dirY,
-                dirZ
+                dirZ,
+                directionNeighbors,
+                directionLookup,
+                directionLookupResolution
         );
         VolumetricTargetScanResult targetScanResult = scanVolumetricTargets(
                 solidPositions,
@@ -1710,15 +2795,200 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                                             int maxZ,
                                                                             double radiusSq,
                                                                             Int2DoubleOpenHashMap resistanceCostCache) {
-        BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
         int estimatedEntries = estimateVolumetricResistanceFieldEntries(radiusSq);
         Long2FloatOpenHashMap resistanceField = new Long2FloatOpenHashMap(estimatedEntries);
         resistanceField.defaultReturnValue(0.0F);
         LongArrayList solidPositions = new LongArrayList(Math.max(64, (int) Math.ceil(estimatedEntries * 0.75D)));
+        int sizeX = maxX - minX + 1;
+        int sizeY = maxY - minY + 1;
+        int sizeZ = maxZ - minZ + 1;
+        int taskCount = resolveResistanceFieldTaskCount(sizeX, sizeY, sizeZ);
+        if (taskCount <= 1 || VOLUMETRIC_TARGET_SCAN_POOL == null) {
+            VolumetricResistanceFieldChunkResult chunkResult = sampleVolumetricResistanceFieldChunk(
+                    level,
+                    centerX,
+                    centerY,
+                    centerZ,
+                    minX,
+                    minY,
+                    minZ,
+                    sizeY,
+                    sizeZ,
+                    radiusSq,
+                    0,
+                    sizeX,
+                    resistanceCostCache
+            );
+            LongArrayList chunkPositions = chunkResult.solidPositions();
+            FloatArrayList chunkResistance = chunkResult.solidResistance();
+            for (int i = 0; i < chunkPositions.size(); i++) {
+                long posLong = chunkPositions.getLong(i);
+                resistanceField.put(posLong, chunkResistance.getFloat(i));
+                solidPositions.add(posLong);
+            }
+            return solidPositions.isEmpty()
+                    ? createEmptyVolumetricResistanceField(chunkResult.sampledVoxelCount())
+                    : new VolumetricResistanceField(resistanceField, solidPositions, chunkResult.sampledVoxelCount());
+        }
+
+        ResistanceFieldSnapshot resistanceFieldSnapshot = sampleResistanceFieldSnapshot(
+                level,
+                centerX,
+                centerY,
+                centerZ,
+                minX,
+                minY,
+                minZ,
+                sizeX,
+                sizeY,
+                sizeZ,
+                radiusSq
+        );
+        int chunkSize = (sizeX + taskCount - 1) / taskCount;
+        ArrayList<Future<VolumetricResistanceFieldChunkResult>> futures = new ArrayList<>(taskCount);
+        for (int taskIndex = 0; taskIndex < taskCount; taskIndex++) {
+            int startXOffset = taskIndex * chunkSize;
+            int endXOffset = Math.min(sizeX, startXOffset + chunkSize);
+            if (startXOffset >= endXOffset) {
+                break;
+            }
+            final int chunkStartX = startXOffset;
+            final int chunkEndX = endXOffset;
+            futures.add(VOLUMETRIC_TARGET_SCAN_POOL.submit(
+                    () -> sampleVolumetricResistanceFieldChunk(
+                            resistanceFieldSnapshot,
+                            minX,
+                            minY,
+                            minZ,
+                            sizeY,
+                            sizeZ,
+                            chunkStartX,
+                            chunkEndX,
+                            null
+                    )
+            ));
+        }
+
         int sampledVoxelCount = 0;
-        for (int x = minX; x <= maxX; x++) {
-            for (int y = minY; y <= maxY; y++) {
-                for (int z = minZ; z <= maxZ; z++) {
+        try {
+            for (Future<VolumetricResistanceFieldChunkResult> future : futures) {
+                VolumetricResistanceFieldChunkResult chunkResult = future.get();
+                sampledVoxelCount += chunkResult.sampledVoxelCount();
+                LongArrayList chunkPositions = chunkResult.solidPositions();
+                FloatArrayList chunkResistance = chunkResult.solidResistance();
+                for (int i = 0; i < chunkPositions.size(); i++) {
+                    long posLong = chunkPositions.getLong(i);
+                    resistanceField.put(posLong, chunkResistance.getFloat(i));
+                    solidPositions.add(posLong);
+                }
+            }
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            cancelVolumetricResistanceFieldFutures(futures);
+            VolumetricResistanceFieldChunkResult fallback = sampleVolumetricResistanceFieldChunk(
+                    resistanceFieldSnapshot,
+                    minX,
+                    minY,
+                    minZ,
+                    sizeY,
+                    sizeZ,
+                    0,
+                    sizeX,
+                    resistanceCostCache
+            );
+            LongArrayList fallbackPositions = fallback.solidPositions();
+            FloatArrayList fallbackResistance = fallback.solidResistance();
+            resistanceField.clear();
+            solidPositions.clear();
+            for (int i = 0; i < fallbackPositions.size(); i++) {
+                long posLong = fallbackPositions.getLong(i);
+                resistanceField.put(posLong, fallbackResistance.getFloat(i));
+                solidPositions.add(posLong);
+            }
+            return solidPositions.isEmpty()
+                    ? createEmptyVolumetricResistanceField(fallback.sampledVoxelCount())
+                    : new VolumetricResistanceField(resistanceField, solidPositions, fallback.sampledVoxelCount());
+        } catch (ExecutionException exception) {
+            cancelVolumetricResistanceFieldFutures(futures);
+            VolumetricResistanceFieldChunkResult fallback = sampleVolumetricResistanceFieldChunk(
+                    resistanceFieldSnapshot,
+                    minX,
+                    minY,
+                    minZ,
+                    sizeY,
+                    sizeZ,
+                    0,
+                    sizeX,
+                    resistanceCostCache
+            );
+            LongArrayList fallbackPositions = fallback.solidPositions();
+            FloatArrayList fallbackResistance = fallback.solidResistance();
+            resistanceField.clear();
+            solidPositions.clear();
+            for (int i = 0; i < fallbackPositions.size(); i++) {
+                long posLong = fallbackPositions.getLong(i);
+                resistanceField.put(posLong, fallbackResistance.getFloat(i));
+                solidPositions.add(posLong);
+            }
+            return solidPositions.isEmpty()
+                    ? createEmptyVolumetricResistanceField(fallback.sampledVoxelCount())
+                    : new VolumetricResistanceField(resistanceField, solidPositions, fallback.sampledVoxelCount());
+        }
+
+        if (solidPositions.isEmpty()) {
+            return createEmptyVolumetricResistanceField(sampledVoxelCount);
+        }
+        return new VolumetricResistanceField(resistanceField, solidPositions, sampledVoxelCount);
+    }
+
+    private static int estimateVolumetricResistanceFieldEntries(double radiusSq) {
+        double clampedRadiusSq = Math.max(0.0D, radiusSq);
+        double radius = Math.sqrt(clampedRadiusSq);
+        double sphereVolume = (4.0D / 3.0D) * Math.PI * radius * radius * radius;
+        double estimatedSolidCount = Math.max(1.0D, sphereVolume * VOLUMETRIC_RESISTANCE_FIELD_PREALLOC_SOLID_FRACTION);
+        return Math.max(64, (int) Math.min(Integer.MAX_VALUE - 8L, Math.ceil(estimatedSolidCount / 0.75D)));
+    }
+
+    private static VolumetricResistanceField createEmptyVolumetricResistanceField(int sampledVoxelCount) {
+        Long2FloatOpenHashMap empty = new Long2FloatOpenHashMap(16);
+        empty.defaultReturnValue(0.0F);
+        return new VolumetricResistanceField(empty, new LongArrayList(), sampledVoxelCount);
+    }
+
+    private static VolumetricResistanceFieldChunkResult sampleVolumetricResistanceFieldChunk(ServerLevel level,
+                                                                                              double centerX,
+                                                                                              double centerY,
+                                                                                              double centerZ,
+                                                                                              int minX,
+                                                                                              int minY,
+                                                                                              int minZ,
+                                                                                              int sizeY,
+                                                                                              int sizeZ,
+                                                                                              double radiusSq,
+                                                                                              int startXOffsetInclusive,
+                                                                                              int endXOffsetExclusive,
+                                                                                              Int2DoubleOpenHashMap sharedResistanceCostCache) {
+        int chunkWidth = Math.max(1, endXOffsetExclusive - startXOffsetInclusive);
+        int expectedChunkEntries = Math.max(
+                16,
+                (int) Math.ceil((double) (chunkWidth * sizeY * sizeZ) * VOLUMETRIC_RESISTANCE_FIELD_PREALLOC_SOLID_FRACTION)
+        );
+        LongArrayList localPositions = new LongArrayList(expectedChunkEntries);
+        FloatArrayList localResistance = new FloatArrayList(expectedChunkEntries);
+        Int2DoubleOpenHashMap localResistanceCache = sharedResistanceCostCache != null
+                ? sharedResistanceCostCache
+                : new Int2DoubleOpenHashMap(128);
+        if (sharedResistanceCostCache == null) {
+            localResistanceCache.defaultReturnValue(Double.NaN);
+        }
+        BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        int sampledVoxelCount = 0;
+        for (int xOffset = startXOffsetInclusive; xOffset < endXOffsetExclusive; xOffset++) {
+            int x = minX + xOffset;
+            for (int yOffset = 0; yOffset < sizeY; yOffset++) {
+                int y = minY + yOffset;
+                for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
+                    int z = minZ + zOffset;
                     double dx = (x + 0.5D) - centerX;
                     double dy = (y + 0.5D) - centerY;
                     double dz = (z + 0.5D) - centerZ;
@@ -1735,27 +3005,270 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     if (blockState.isAir()) {
                         continue;
                     }
-                    long posLong = mutablePos.asLong();
-                    resistanceField.put(posLong, (float) getCachedResistanceCost(resistanceCostCache, blockState));
-                    solidPositions.add(posLong);
+                    localPositions.add(mutablePos.asLong());
+                    localResistance.add((float) getCachedResistanceCost(localResistanceCache, blockState));
                 }
             }
         }
-
-        if (solidPositions.isEmpty()) {
-            Long2FloatOpenHashMap empty = new Long2FloatOpenHashMap(16);
-            empty.defaultReturnValue(0.0F);
-            return new VolumetricResistanceField(empty, new LongArrayList(), sampledVoxelCount);
-        }
-        return new VolumetricResistanceField(resistanceField, solidPositions, sampledVoxelCount);
+        return new VolumetricResistanceFieldChunkResult(localPositions, localResistance, sampledVoxelCount);
     }
 
-    private static int estimateVolumetricResistanceFieldEntries(double radiusSq) {
-        double clampedRadiusSq = Math.max(0.0D, radiusSq);
-        double radius = Math.sqrt(clampedRadiusSq);
-        double sphereVolume = (4.0D / 3.0D) * Math.PI * radius * radius * radius;
-        double estimatedSolidCount = Math.max(1.0D, sphereVolume * VOLUMETRIC_RESISTANCE_FIELD_PREALLOC_SOLID_FRACTION);
-        return Math.max(64, (int) Math.min(Integer.MAX_VALUE - 8L, Math.ceil(estimatedSolidCount / 0.75D)));
+    private static EikonalResistanceFieldChunkResult sampleEikonalFieldChunk(ServerLevel level,
+                                                                             double centerX,
+                                                                             double centerY,
+                                                                             double centerZ,
+                                                                             int minX,
+                                                                             int minY,
+                                                                             int minZ,
+                                                                             int sizeY,
+                                                                             int sizeZ,
+                                                                             double radiusSq,
+                                                                             int startXOffsetInclusive,
+                                                                             int endXOffsetExclusive,
+                                                                             float[] slowness,
+                                                                             int[] activeCountByRow,
+                                                                             Int2DoubleOpenHashMap sharedResistanceCostCache) {
+        Int2DoubleOpenHashMap localResistanceCache = sharedResistanceCostCache != null
+                ? sharedResistanceCostCache
+                : new Int2DoubleOpenHashMap(128);
+        if (sharedResistanceCostCache == null) {
+            localResistanceCache.defaultReturnValue(Double.NaN);
+        }
+        LongArrayList localSolidPositions = new LongArrayList(Math.max(16, (endXOffsetExclusive - startXOffsetInclusive) * sizeY));
+        BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        int sampledVoxelCount = 0;
+        float airSlowness = (float) EIKONAL_AIR_SLOWNESS;
+        float solidScale = (float) EIKONAL_SOLID_SLOWNESS_SCALE;
+        for (int xOffset = startXOffsetInclusive; xOffset < endXOffsetExclusive; xOffset++) {
+            int x = minX + xOffset;
+            int baseX = xOffset * sizeY * sizeZ;
+            for (int yOffset = 0; yOffset < sizeY; yOffset++) {
+                int y = minY + yOffset;
+                int rowIndex = eikonalRowIndex(xOffset, yOffset, sizeY);
+                int baseIndex = baseX + (yOffset * sizeZ);
+                int rowActiveCount = 0;
+                for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
+                    int z = minZ + zOffset;
+                    double dx = (x + 0.5D) - centerX;
+                    double dy = (y + 0.5D) - centerY;
+                    double dz = (z + 0.5D) - centerZ;
+                    double distSq = (dx * dx) + (dy * dy) + (dz * dz);
+                    if (distSq > radiusSq) {
+                        continue;
+                    }
+                    mutablePos.set(x, y, z);
+                    if (!level.isInWorldBounds(mutablePos)) {
+                        continue;
+                    }
+                    sampledVoxelCount++;
+                    int index = baseIndex + zOffset;
+                    BlockState blockState = level.getBlockState(mutablePos);
+                    if (blockState.isAir()) {
+                        slowness[index] = airSlowness;
+                        rowActiveCount++;
+                        continue;
+                    }
+                    double resistance = getCachedResistanceCost(localResistanceCache, blockState);
+                    slowness[index] = airSlowness + ((float) resistance * solidScale);
+                    rowActiveCount++;
+                    localSolidPositions.add(mutablePos.asLong());
+                }
+                activeCountByRow[rowIndex] = rowActiveCount;
+            }
+        }
+        return new EikonalResistanceFieldChunkResult(localSolidPositions, sampledVoxelCount);
+    }
+
+    private static ResistanceFieldSnapshot sampleResistanceFieldSnapshot(ServerLevel level,
+                                                                         double centerX,
+                                                                         double centerY,
+                                                                         double centerZ,
+                                                                         int minX,
+                                                                         int minY,
+                                                                         int minZ,
+                                                                         int sizeX,
+                                                                         int sizeY,
+                                                                         int sizeZ,
+                                                                         double radiusSq) {
+        long volumeLong = (long) sizeX * (long) sizeY * (long) sizeZ;
+        if (volumeLong <= 0L || volumeLong > Integer.MAX_VALUE - 8L) {
+            return new ResistanceFieldSnapshot(new BlockState[1], 0);
+        }
+        int volume = (int) volumeLong;
+        BlockState[] sampledStates = new BlockState[Math.max(1, volume)];
+        BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        int sampledVoxelCount = 0;
+        int strideX = sizeY * sizeZ;
+        int strideY = sizeZ;
+        for (int xOffset = 0; xOffset < sizeX; xOffset++) {
+            int x = minX + xOffset;
+            int baseX = xOffset * strideX;
+            for (int yOffset = 0; yOffset < sizeY; yOffset++) {
+                int y = minY + yOffset;
+                int baseIndex = baseX + (yOffset * strideY);
+                for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
+                    int z = minZ + zOffset;
+                    double dx = (x + 0.5D) - centerX;
+                    double dy = (y + 0.5D) - centerY;
+                    double dz = (z + 0.5D) - centerZ;
+                    double distSq = (dx * dx) + (dy * dy) + (dz * dz);
+                    if (distSq > radiusSq) {
+                        continue;
+                    }
+                    mutablePos.set(x, y, z);
+                    if (!level.isInWorldBounds(mutablePos)) {
+                        continue;
+                    }
+                    sampledVoxelCount++;
+                    sampledStates[baseIndex + zOffset] = level.getBlockState(mutablePos);
+                }
+            }
+        }
+        return new ResistanceFieldSnapshot(sampledStates, sampledVoxelCount);
+    }
+
+    private static VolumetricResistanceFieldChunkResult sampleVolumetricResistanceFieldChunk(ResistanceFieldSnapshot resistanceFieldSnapshot,
+                                                                                              int minX,
+                                                                                              int minY,
+                                                                                              int minZ,
+                                                                                              int sizeY,
+                                                                                              int sizeZ,
+                                                                                              int startXOffsetInclusive,
+                                                                                              int endXOffsetExclusive,
+                                                                                              Int2DoubleOpenHashMap sharedResistanceCostCache) {
+        int chunkWidth = Math.max(1, endXOffsetExclusive - startXOffsetInclusive);
+        int expectedChunkEntries = Math.max(
+                16,
+                (int) Math.ceil((double) (chunkWidth * sizeY * sizeZ) * VOLUMETRIC_RESISTANCE_FIELD_PREALLOC_SOLID_FRACTION)
+        );
+        LongArrayList localPositions = new LongArrayList(expectedChunkEntries);
+        FloatArrayList localResistance = new FloatArrayList(expectedChunkEntries);
+        Int2DoubleOpenHashMap localResistanceCache = sharedResistanceCostCache != null
+                ? sharedResistanceCostCache
+                : new Int2DoubleOpenHashMap(128);
+        if (sharedResistanceCostCache == null) {
+            localResistanceCache.defaultReturnValue(Double.NaN);
+        }
+        BlockState[] sampledStates = resistanceFieldSnapshot.sampledStates();
+        int sampledVoxelCount = 0;
+        for (int xOffset = startXOffsetInclusive; xOffset < endXOffsetExclusive; xOffset++) {
+            int x = minX + xOffset;
+            int baseX = xOffset * sizeY * sizeZ;
+            for (int yOffset = 0; yOffset < sizeY; yOffset++) {
+                int y = minY + yOffset;
+                int baseIndex = baseX + (yOffset * sizeZ);
+                for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
+                    int z = minZ + zOffset;
+                    BlockState blockState = sampledStates[baseIndex + zOffset];
+                    if (blockState == null) {
+                        continue;
+                    }
+                    sampledVoxelCount++;
+                    if (blockState.isAir()) {
+                        continue;
+                    }
+                    localPositions.add(BlockPos.asLong(x, y, z));
+                    localResistance.add((float) getCachedResistanceCost(localResistanceCache, blockState));
+                }
+            }
+        }
+        return new VolumetricResistanceFieldChunkResult(localPositions, localResistance, sampledVoxelCount);
+    }
+
+    private static EikonalResistanceFieldChunkResult sampleEikonalFieldChunk(ResistanceFieldSnapshot resistanceFieldSnapshot,
+                                                                             int minX,
+                                                                             int minY,
+                                                                             int minZ,
+                                                                             int sizeY,
+                                                                             int sizeZ,
+                                                                             int startXOffsetInclusive,
+                                                                             int endXOffsetExclusive,
+                                                                             float[] slowness,
+                                                                             int[] activeCountByRow,
+                                                                             Int2DoubleOpenHashMap sharedResistanceCostCache) {
+        Int2DoubleOpenHashMap localResistanceCache = sharedResistanceCostCache != null
+                ? sharedResistanceCostCache
+                : new Int2DoubleOpenHashMap(128);
+        if (sharedResistanceCostCache == null) {
+            localResistanceCache.defaultReturnValue(Double.NaN);
+        }
+        LongArrayList localSolidPositions = new LongArrayList(Math.max(16, (endXOffsetExclusive - startXOffsetInclusive) * sizeY));
+        BlockState[] sampledStates = resistanceFieldSnapshot.sampledStates();
+        int sampledVoxelCount = 0;
+        float airSlowness = (float) EIKONAL_AIR_SLOWNESS;
+        float solidScale = (float) EIKONAL_SOLID_SLOWNESS_SCALE;
+        for (int xOffset = startXOffsetInclusive; xOffset < endXOffsetExclusive; xOffset++) {
+            int x = minX + xOffset;
+            int baseX = xOffset * sizeY * sizeZ;
+            for (int yOffset = 0; yOffset < sizeY; yOffset++) {
+                int y = minY + yOffset;
+                int rowIndex = eikonalRowIndex(xOffset, yOffset, sizeY);
+                int baseIndex = baseX + (yOffset * sizeZ);
+                int rowActiveCount = 0;
+                for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
+                    int z = minZ + zOffset;
+                    BlockState blockState = sampledStates[baseIndex + zOffset];
+                    if (blockState == null) {
+                        continue;
+                    }
+                    sampledVoxelCount++;
+                    int index = baseIndex + zOffset;
+                    if (blockState.isAir()) {
+                        slowness[index] = airSlowness;
+                        rowActiveCount++;
+                        continue;
+                    }
+                    double resistance = getCachedResistanceCost(localResistanceCache, blockState);
+                    slowness[index] = airSlowness + ((float) resistance * solidScale);
+                    rowActiveCount++;
+                    localSolidPositions.add(BlockPos.asLong(x, y, z));
+                }
+                activeCountByRow[rowIndex] = rowActiveCount;
+            }
+        }
+        return new EikonalResistanceFieldChunkResult(localSolidPositions, sampledVoxelCount);
+    }
+
+    private static int resolveResistanceFieldTaskCount(int sizeX, int sizeY, int sizeZ) {
+        if (!parallelResistanceFieldSamplingEnabled || VOLUMETRIC_TARGET_SCAN_POOL == null) {
+            return 1;
+        }
+        long voxelCount = (long) sizeX * (long) sizeY * (long) sizeZ;
+        if (voxelCount < RESISTANCE_FIELD_MIN_VOXELS_FOR_PARALLEL) {
+            return 1;
+        }
+        int tasksByColumns = Math.max(1, (sizeX + RESISTANCE_FIELD_COLUMNS_PER_TASK - 1) / RESISTANCE_FIELD_COLUMNS_PER_TASK);
+        int tasksByWorkers = Math.max(1, VOLUMETRIC_TARGET_SCAN_PARALLELISM * 2);
+        int taskCount = Math.min(tasksByColumns, tasksByWorkers);
+        return Math.max(1, Math.min(RESISTANCE_FIELD_MAX_TASKS, taskCount));
+    }
+
+    private static void cancelVolumetricResistanceFieldFutures(List<Future<VolumetricResistanceFieldChunkResult>> futures) {
+        for (Future<VolumetricResistanceFieldChunkResult> future : futures) {
+            future.cancel(true);
+        }
+    }
+
+    private static void cancelEikonalResistanceFieldFutures(List<Future<EikonalResistanceFieldChunkResult>> futures) {
+        for (Future<EikonalResistanceFieldChunkResult> future : futures) {
+            future.cancel(true);
+        }
+    }
+
+    private static int resolveEikonalSweepTaskCount(int rowSpan) {
+        if (VOLUMETRIC_TARGET_SCAN_POOL == null || rowSpan < EIKONAL_SWEEP_MIN_ROWS_FOR_PARALLEL) {
+            return 1;
+        }
+        int tasksBySize = Math.max(1, (rowSpan + EIKONAL_SWEEP_ROWS_PER_TASK - 1) / EIKONAL_SWEEP_ROWS_PER_TASK);
+        int tasksByWorkers = Math.max(1, VOLUMETRIC_TARGET_SCAN_PARALLELISM);
+        int taskCount = Math.min(tasksBySize, tasksByWorkers);
+        return Math.max(1, Math.min(EIKONAL_SWEEP_MAX_TASKS, taskCount));
+    }
+
+    private static void cancelEikonalSweepFutures(List<Future<Double>> futures) {
+        for (Future<Double> future : futures) {
+            future.cancel(true);
+        }
     }
 
     private static VolumetricTargetScanResult scanVolumetricTargets(LongArrayList solidPositions,
@@ -1917,7 +3430,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     nz,
                     context.dirX(),
                     context.dirY(),
-                    context.dirZ()
+                    context.dirZ(),
+                    context.directionNeighbors(),
+                    context.directionLookup(),
+                    context.directionLookupResolution()
             );
             double pressureFactor = Mth.clamp(localPressure, 0.0D, 1.0D);
             double weight = maxWeight * pressureFactor;
@@ -1946,6 +3462,256 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
     private static void cancelVolumetricTargetScanFutures(List<Future<VolumetricTargetScanResult>> futures) {
         for (Future<VolumetricTargetScanResult> future : futures) {
+            future.cancel(true);
+        }
+    }
+
+    private static EikonalTargetScanResult scanEikonalTargets(LongArrayList solidPositions,
+                                                              Long2FloatOpenHashMap volumetricBaselineByPos,
+                                                              float[] arrivalTimes,
+                                                              float[] shadowArrivalTimes,
+                                                              EikonalField eikonalField,
+                                                              double centerX,
+                                                              double centerY,
+                                                              double centerZ,
+                                                              double maxArrival,
+                                                              boolean allowParallel,
+                                                              boolean profileSubstages) {
+        int solidCount = solidPositions.size();
+        int taskCount = resolveEikonalTargetScanTaskCount(solidCount);
+        if (!allowParallel || taskCount <= 1 || VOLUMETRIC_TARGET_SCAN_POOL == null) {
+            return scanEikonalTargetScanChunk(
+                    solidPositions,
+                    0,
+                    solidCount,
+                    volumetricBaselineByPos,
+                    arrivalTimes,
+                    shadowArrivalTimes,
+                    eikonalField,
+                    centerX,
+                    centerY,
+                    centerZ,
+                    maxArrival,
+                    profileSubstages
+            );
+        }
+
+        int chunkSize = (solidCount + taskCount - 1) / taskCount;
+        ArrayList<Future<EikonalTargetScanResult>> futures = new ArrayList<>(taskCount);
+        for (int taskIndex = 0; taskIndex < taskCount; taskIndex++) {
+            int startIndex = taskIndex * chunkSize;
+            int endIndex = Math.min(solidCount, startIndex + chunkSize);
+            if (startIndex >= endIndex) {
+                break;
+            }
+            final int chunkStart = startIndex;
+            final int chunkEnd = endIndex;
+            futures.add(VOLUMETRIC_TARGET_SCAN_POOL.submit(
+                    () -> scanEikonalTargetScanChunk(
+                            solidPositions,
+                            chunkStart,
+                            chunkEnd,
+                            volumetricBaselineByPos,
+                            arrivalTimes,
+                            shadowArrivalTimes,
+                            eikonalField,
+                            centerX,
+                            centerY,
+                            centerZ,
+                            maxArrival,
+                            profileSubstages
+                    )
+            ));
+        }
+
+        LongArrayList mergedPositions = new LongArrayList(Math.max(64, solidCount / 8));
+        FloatArrayList mergedWeights = new FloatArrayList(Math.max(64, solidCount / 8));
+        double solidWeight = 0.0D;
+        long precheckNanos = 0L;
+        try {
+            for (Future<EikonalTargetScanResult> future : futures) {
+                EikonalTargetScanResult chunkResult = future.get();
+                precheckNanos += chunkResult.precheckNanos();
+                solidWeight += chunkResult.solidWeight();
+                LongArrayList chunkPositions = chunkResult.targetPositions();
+                FloatArrayList chunkWeights = chunkResult.targetWeights();
+                for (int i = 0; i < chunkPositions.size(); i++) {
+                    mergedPositions.add(chunkPositions.getLong(i));
+                    mergedWeights.add(chunkWeights.getFloat(i));
+                }
+            }
+            return new EikonalTargetScanResult(mergedPositions, mergedWeights, solidWeight, precheckNanos);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            cancelEikonalTargetScanFutures(futures);
+        } catch (ExecutionException exception) {
+            cancelEikonalTargetScanFutures(futures);
+        }
+        return scanEikonalTargetScanChunk(
+                solidPositions,
+                0,
+                solidCount,
+                volumetricBaselineByPos,
+                arrivalTimes,
+                shadowArrivalTimes,
+                eikonalField,
+                centerX,
+                centerY,
+                centerZ,
+                maxArrival,
+                profileSubstages
+        );
+    }
+
+    private static EikonalTargetScanResult scanEikonalTargetScanChunk(LongArrayList solidPositions,
+                                                                       int startInclusive,
+                                                                       int endExclusive,
+                                                                       Long2FloatOpenHashMap volumetricBaselineByPos,
+                                                                       float[] arrivalTimes,
+                                                                       float[] shadowArrivalTimes,
+                                                                       EikonalField eikonalField,
+                                                                       double centerX,
+                                                                       double centerY,
+                                                                       double centerZ,
+                                                                       double maxArrival,
+                                                                       boolean profileSubstages) {
+        int expectedTargets = Math.max(16, (endExclusive - startInclusive) / 8);
+        LongArrayList targetPositions = new LongArrayList(expectedTargets);
+        FloatArrayList targetWeights = new FloatArrayList(expectedTargets);
+        long precheckNanos = 0L;
+        double solidWeight = 0.0D;
+        int fieldMinX = eikonalField.minX();
+        int fieldMinY = eikonalField.minY();
+        int fieldMinZ = eikonalField.minZ();
+        int fieldSizeY = eikonalField.sizeY();
+        int fieldSizeZ = eikonalField.sizeZ();
+        for (int i = startInclusive; i < endExclusive; i++) {
+            long posLong = solidPositions.getLong(i);
+            long precheckStart = profileSubstages ? System.nanoTime() : 0L;
+            float baselineWeight = volumetricBaselineByPos.get(posLong);
+            if (!Float.isFinite(baselineWeight) || baselineWeight <= VOLUMETRIC_MIN_ENERGY) {
+                if (profileSubstages) {
+                    precheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            int x = BlockPos.getX(posLong);
+            int y = BlockPos.getY(posLong);
+            int z = BlockPos.getZ(posLong);
+            int index = eikonalGridIndex(
+                    x - fieldMinX,
+                    y - fieldMinY,
+                    z - fieldMinZ,
+                    fieldSizeY,
+                    fieldSizeZ
+            );
+            double arrival = arrivalTimes[index];
+            if (!Double.isFinite(arrival) || arrival > maxArrival) {
+                if (profileSubstages) {
+                    precheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            double normalized = 1.0D - (arrival / maxArrival);
+            if (normalized <= 0.0D) {
+                if (profileSubstages) {
+                    precheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            double airArrival = computeAnalyticEikonalAirArrival(centerX, centerY, centerZ, x, y, z);
+            if (!Double.isFinite(airArrival)) {
+                if (profileSubstages) {
+                    precheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            double resistanceOverrun = Math.max(0.0D, arrival - airArrival);
+            double effectiveOverrun = Math.max(0.0D, resistanceOverrun - EIKONAL_OVERRUN_DEADZONE);
+            double normalizedOverrun = effectiveOverrun / Math.max(1.0D, airArrival);
+            if (normalizedOverrun >= EIKONAL_HARD_BLOCK_NORMALIZED_OVERRUN) {
+                if (profileSubstages) {
+                    precheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            double transmittance = Math.exp(
+                    -(effectiveOverrun * EIKONAL_RESISTANCE_ATTENUATION_PER_OVERRUN)
+                            - (normalizedOverrun * EIKONAL_RESISTANCE_NORMALIZED_ATTENUATION)
+            );
+            if (transmittance <= EIKONAL_MIN_TRANSMITTANCE) {
+                if (profileSubstages) {
+                    precheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            double shadowArrival = shadowArrivalTimes[index];
+            if (!Double.isFinite(shadowArrival)) {
+                if (profileSubstages) {
+                    precheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            double shadowOverrun = Math.max(0.0D, shadowArrival - arrival);
+            double effectiveShadowOverrun = Math.max(0.0D, shadowOverrun - EIKONAL_SHADOW_OVERRUN_DEADZONE);
+            double normalizedShadowOverrun = effectiveShadowOverrun / Math.max(0.25D, airArrival);
+            if (normalizedShadowOverrun >= EIKONAL_HARD_BLOCK_SHADOW_NORMALIZED_OVERRUN) {
+                if (profileSubstages) {
+                    precheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            double shadowTransmittance = Math.exp(
+                    -(effectiveShadowOverrun * EIKONAL_SHADOW_ATTENUATION_PER_OVERRUN)
+                            - (normalizedShadowOverrun * EIKONAL_SHADOW_NORMALIZED_ATTENUATION)
+            );
+            if (shadowTransmittance <= EIKONAL_MIN_TRANSMITTANCE) {
+                if (profileSubstages) {
+                    precheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            double eikEnvelope = Math.pow(normalized, EIKONAL_WEIGHT_EXPONENT);
+            double eikonalTransFactor = Mth.lerp(
+                    EIKONAL_ENVELOPE_TRANSMITTANCE_BLEND,
+                    1.0D,
+                    transmittance * shadowTransmittance
+            );
+            double smoothingFactor = Mth.lerp(
+                    EIKONAL_BASELINE_SMOOTH_BLEND,
+                    1.0D,
+                    eikEnvelope * eikonalTransFactor
+            );
+            double cutoffRetention = computeEikonalCutoffEdgeRetention(normalized);
+            double weight = baselineWeight * smoothingFactor * cutoffRetention;
+            if (weight <= VOLUMETRIC_MIN_ENERGY) {
+                if (profileSubstages) {
+                    precheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
+            if (profileSubstages) {
+                precheckNanos += (System.nanoTime() - precheckStart);
+            }
+            targetPositions.add(posLong);
+            targetWeights.add((float) weight);
+            solidWeight += weight;
+        }
+        return new EikonalTargetScanResult(targetPositions, targetWeights, solidWeight, precheckNanos);
+    }
+
+    private static int resolveEikonalTargetScanTaskCount(int solidCount) {
+        if (VOLUMETRIC_TARGET_SCAN_POOL == null || solidCount < EIKONAL_TARGET_SCAN_MIN_SOLIDS_FOR_PARALLEL) {
+            return 1;
+        }
+        int tasksBySize = Math.max(1, (solidCount + EIKONAL_TARGET_SCAN_SOLIDS_PER_TASK - 1) / EIKONAL_TARGET_SCAN_SOLIDS_PER_TASK);
+        int tasksByWorkers = Math.max(1, VOLUMETRIC_TARGET_SCAN_PARALLELISM * 2);
+        int taskCount = Math.min(tasksBySize, tasksByWorkers);
+        return Math.max(1, Math.min(EIKONAL_TARGET_SCAN_MAX_TASKS, taskCount));
+    }
+
+    private static void cancelEikonalTargetScanFutures(List<Future<EikonalTargetScanResult>> futures) {
+        for (Future<EikonalTargetScanResult> future : futures) {
             future.cancel(true);
         }
     }
@@ -1982,8 +3748,57 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     dirZ,
                     VOLUMETRIC_DIRECTION_NEIGHBOR_COUNT
             );
-            return new VolumetricDirectionCache(dirX, dirY, dirZ, neighbors);
+            int lookupResolution = Math.max(8, VOLUMETRIC_DIRECTION_LOOKUP_RESOLUTION);
+            int[] directionLookup = buildVolumetricDirectionLookup(dirX, dirY, dirZ, lookupResolution);
+            return new VolumetricDirectionCache(dirX, dirY, dirZ, neighbors, directionLookup, lookupResolution);
         });
+    }
+
+    private static int[] buildVolumetricDirectionLookup(double[] dirX,
+                                                        double[] dirY,
+                                                        double[] dirZ,
+                                                        int resolution) {
+        int entryCount = resolution * resolution;
+        int[] lookup = new int[Math.max(1, entryCount)];
+        int directionCount = dirX.length;
+        for (int v = 0; v < resolution; v++) {
+            for (int u = 0; u < resolution; u++) {
+                Direction direction = decodeOctahedralDirection(u, v, resolution);
+                double nx = direction.x();
+                double ny = direction.y();
+                double nz = direction.z();
+                int bestIndex = 0;
+                double bestDot = -Double.MAX_VALUE;
+                for (int i = 0; i < directionCount; i++) {
+                    double dot = (nx * dirX[i]) + (ny * dirY[i]) + (nz * dirZ[i]);
+                    if (dot > bestDot) {
+                        bestDot = dot;
+                        bestIndex = i;
+                    }
+                }
+                lookup[(v * resolution) + u] = bestIndex;
+            }
+        }
+        return lookup;
+    }
+
+    private static Direction decodeOctahedralDirection(int u, int v, int resolution) {
+        double ox = (((u + 0.5D) / resolution) * 2.0D) - 1.0D;
+        double oy = (((v + 0.5D) / resolution) * 2.0D) - 1.0D;
+        double oz = 1.0D - Math.abs(ox) - Math.abs(oy);
+        if (oz < 0.0D) {
+            double oldX = ox;
+            double oldY = oy;
+            ox = (1.0D - Math.abs(oldY)) * Math.signum(oldX);
+            oy = (1.0D - Math.abs(oldX)) * Math.signum(oldY);
+            oz = -oz;
+        }
+        double length = Math.sqrt((ox * ox) + (oy * oy) + (oz * oz));
+        if (length <= 1.0E-9D) {
+            return new Direction(0.0D, 1.0D, 0.0D);
+        }
+        double invLength = 1.0D / length;
+        return new Direction(ox * invLength, oy * invLength, oz * invLength);
     }
 
     private static double computeVolumetricRadiusScale(double radius, double maxScale) {
@@ -2072,7 +3887,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                           double nz,
                                                           double[] dirX,
                                                           double[] dirY,
-                                                          double[] dirZ) {
+                                                          double[] dirZ,
+                                                          int[][] directionNeighbors,
+                                                          int[] directionLookup,
+                                                          int directionLookupResolution) {
         int blendCount = Math.min(VOLUMETRIC_DIRECTION_BLEND_COUNT, directionCount);
         int best0 = -1;
         int best1 = -1;
@@ -2248,6 +4066,25 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             return Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best0], pressureByShell[upperRowOffset + best0]);
         }
         return 0.0D;
+    }
+
+    private static int octahedralLookupIndex(double nx, double ny, double nz, int resolution) {
+        double ax = Math.abs(nx);
+        double ay = Math.abs(ny);
+        double az = Math.abs(nz);
+        double invL1 = 1.0D / Math.max(1.0E-9D, ax + ay + az);
+        double ox = nx * invL1;
+        double oy = ny * invL1;
+        double oz = nz * invL1;
+        if (oz < 0.0D) {
+            double oldX = ox;
+            double oldY = oy;
+            ox = (1.0D - Math.abs(oldY)) * Math.signum(oldX);
+            oy = (1.0D - Math.abs(oldX)) * Math.signum(oldY);
+        }
+        int u = Mth.clamp(Mth.floor(((ox * 0.5D) + 0.5D) * resolution), 0, resolution - 1);
+        int v = Mth.clamp(Mth.floor(((oy * 0.5D) + 0.5D) * resolution), 0, resolution - 1);
+        return (v * resolution) + u;
     }
 
     private static int[][] computeVolumetricDirectionNeighbors(double[] dirX,
@@ -4756,7 +6593,88 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private record VolumetricResistanceField(Long2FloatOpenHashMap resistanceByPos, LongArrayList solidPositions, int sampledVoxelCount) {
     }
 
-    private record VolumetricDirectionCache(double[] dirX, double[] dirY, double[] dirZ, int[][] neighbors) {
+    private static final class EikonalMinHeap {
+        private int[] indices;
+        private double[] priorities;
+        private int size;
+        private double polledPriority;
+
+        private EikonalMinHeap(int initialCapacity) {
+            int capacity = Math.max(16, initialCapacity);
+            this.indices = new int[capacity];
+            this.priorities = new double[capacity];
+            this.size = 0;
+            this.polledPriority = Double.POSITIVE_INFINITY;
+        }
+
+        private boolean isEmpty() {
+            return size <= 0;
+        }
+
+        private void add(int index, double priority) {
+            ensureCapacity(size + 1);
+            int cursor = size++;
+            while (cursor > 0) {
+                int parent = (cursor - 1) >>> 1;
+                if (priority >= priorities[parent]) {
+                    break;
+                }
+                indices[cursor] = indices[parent];
+                priorities[cursor] = priorities[parent];
+                cursor = parent;
+            }
+            indices[cursor] = index;
+            priorities[cursor] = priority;
+        }
+
+        private int pollIndex() {
+            int rootIndex = indices[0];
+            polledPriority = priorities[0];
+            size--;
+            if (size > 0) {
+                int tailIndex = indices[size];
+                double tailPriority = priorities[size];
+                int cursor = 0;
+                while (true) {
+                    int left = (cursor << 1) + 1;
+                    if (left >= size) {
+                        break;
+                    }
+                    int right = left + 1;
+                    int child = right < size && priorities[right] < priorities[left] ? right : left;
+                    if (tailPriority <= priorities[child]) {
+                        break;
+                    }
+                    indices[cursor] = indices[child];
+                    priorities[cursor] = priorities[child];
+                    cursor = child;
+                }
+                indices[cursor] = tailIndex;
+                priorities[cursor] = tailPriority;
+            }
+            return rootIndex;
+        }
+
+        private double pollPriority() {
+            return polledPriority;
+        }
+
+        private void ensureCapacity(int minCapacity) {
+            if (minCapacity <= indices.length) {
+                return;
+            }
+            int newCapacity = Math.max(minCapacity, indices.length << 1);
+            indices = Arrays.copyOf(indices, newCapacity);
+            priorities = Arrays.copyOf(priorities, newCapacity);
+        }
+    }
+
+    private record VolumetricDirectionCache(double[] dirX,
+                                            double[] dirY,
+                                            double[] dirZ,
+                                            int[][] neighbors,
+                                            int[] directionLookup,
+                                            int directionLookupResolution) {
     }
 
     private record VolumetricTargetScanContext(
@@ -4771,7 +6689,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             int directionCount,
             double[] dirX,
             double[] dirY,
-            double[] dirZ
+            double[] dirZ,
+            int[][] directionNeighbors,
+            int[] directionLookup,
+            int directionLookupResolution
     ) {
     }
 
@@ -4783,6 +6704,42 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     ) {
     }
 
+    private record VolumetricResistanceFieldChunkResult(
+            LongArrayList solidPositions,
+            FloatArrayList solidResistance,
+            int sampledVoxelCount
+    ) {
+    }
+
+    private record ResistanceFieldSnapshot(BlockState[] sampledStates, int sampledVoxelCount) {
+    }
+
+    private record EikonalResistanceFieldChunkResult(
+            LongArrayList solidPositions,
+            int sampledVoxelCount
+    ) {
+    }
+
+    private record EikonalTargetScanResult(
+            LongArrayList targetPositions,
+            FloatArrayList targetWeights,
+            double solidWeight,
+            long precheckNanos
+    ) {
+    }
+
+    private record EikonalVolumetricBaselineResult(
+            Long2FloatOpenHashMap baselineByPos,
+            long directionSetupNanos,
+            long pressureSolveNanos,
+            long targetScanNanos,
+            long targetScanPrecheckNanos,
+            long targetScanBlendNanos,
+            int directionSamples,
+            int radialSteps
+    ) {
+    }
+
     private record EikonalField(
             int minX,
             int minY,
@@ -4791,12 +6748,41 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             int sizeY,
             int sizeZ,
             int sampledVoxelCount,
+            BitSet activeMask,
             float[] slowness,
-            LongArrayList solidPositions
+            LongArrayList solidPositions,
+            int[] activeRowOffsets,
+            int[] activeRowLengths,
+            int[] activeRowIndices,
+            int[] neighborNegX,
+            int[] neighborPosX,
+            int[] neighborNegY,
+            int[] neighborPosY,
+            int[] neighborNegZ,
+            int[] neighborPosZ
     ) {
     }
 
-    private record EikonalSolveResult(float[] arrivalTimes, int sweepCycles) {
+    private record EikonalCoarseSolveContext(
+            EikonalField coarseField,
+            float[] coarseArrivalTimes,
+            float[] coarseSlowness,
+            BitSet coarseSourceMask,
+            int coarseSourceCount,
+            int downsampleFactor
+    ) {
+    }
+
+    private record EikonalSolveResult(float[] arrivalTimes, int sourceCells, int sweepCycles) {
+    }
+
+    private record PairedEikonalSolveResult(EikonalSolveResult normal, EikonalSolveResult shadow) {
+    }
+
+    private record PairedEikonalSlownessResult(float[] normalSlowness, float[] shadowSlowness) {
+    }
+
+    private record PairedEikonalSourceResult(int normalSourceCount, int shadowSourceCount) {
     }
 
     @Override
@@ -4939,6 +6925,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 trace.volumetricResistanceFieldNanos,
                 trace.volumetricDirectionSetupNanos,
                 trace.volumetricPressureSolveNanos,
+                trace.eikonalSolveNanos,
                 trace.volumetricTargetScanNanos,
                 trace.volumetricTargetScanPrecheckNanos,
                 trace.volumetricTargetScanBlendNanos,
@@ -4948,6 +6935,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 trace.volumetricTargetBlocks,
                 trace.volumetricDirectionSamples,
                 trace.volumetricRadialSteps,
+                trace.eikonalSourceCells,
+                trace.eikonalSweepCycles,
                 trace.syncPacketsEstimated,
                 trace.syncBytesEstimated,
                 trace.smokeParticles
@@ -5069,6 +7058,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         private long volumetricResistanceFieldNanos;
         private long volumetricDirectionSetupNanos;
         private long volumetricPressureSolveNanos;
+        private long eikonalSolveNanos;
         private long volumetricTargetScanNanos;
         private long volumetricTargetScanPrecheckNanos;
         private long volumetricTargetScanBlendNanos;
@@ -5078,6 +7068,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         private int volumetricTargetBlocks;
         private int volumetricDirectionSamples;
         private int volumetricRadialSteps;
+        private int eikonalSourceCells;
+        private int eikonalSweepCycles;
         private int syncPacketsEstimated;
         private int syncBytesEstimated;
         private int smokeParticles;
