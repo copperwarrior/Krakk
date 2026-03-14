@@ -193,12 +193,17 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final int EIKONAL_MULTIRES_DOWNSAMPLE_FACTOR = 2;
     private static final int EIKONAL_MULTIRES_FINE_REFINE_SWEEP_CYCLES = 2;
     private static final int EIKONAL_MULTIRES_MIN_AXIS_FOR_COARSE = 24;
+    private static final double EIKONAL_TARGET_MIN_WEIGHT = 2.5E-5D;
+    private static final boolean EIKONAL_ENABLE_LOW_WEIGHT_STOCHASTIC_SAMPLING = true;
+    private static final double EIKONAL_LOW_WEIGHT_STOCHASTIC_THRESHOLD = 2.0E-4D;
+    private static final double EIKONAL_LOW_WEIGHT_STOCHASTIC_MIN_KEEP_PROBABILITY = 0.25D;
+    private static final boolean EIKONAL_ENABLE_VOLUMETRIC_BASELINE_SMOOTHING = true;
     private static final double EIKONAL_MIN_TRANSMITTANCE = 1.0E-3D;
     private static final double EIKONAL_ENVELOPE_TRANSMITTANCE_BLEND = 0.25D;
-    private static final double EIKONAL_BASELINE_SMOOTH_BLEND = 0.70D;
-    private static final double EIKONAL_VOLUMETRIC_MECHANICS_SELF_SMOOTH = 0.45D;
-    private static final double EIKONAL_CUTOFF_EDGE_START_NORMALIZED = 0.24D;
-    private static final double EIKONAL_CUTOFF_EDGE_CURVE_EXPONENT = 2.4D;
+    private static final double EIKONAL_BASELINE_SMOOTH_BLEND = 0.78D;
+    private static final double EIKONAL_VOLUMETRIC_MECHANICS_SELF_SMOOTH = 0.32D;
+    private static final double EIKONAL_CUTOFF_EDGE_START_NORMALIZED = 0.32D;
+    private static final double EIKONAL_CUTOFF_EDGE_CURVE_EXPONENT = 1.85D;
     private static final int VOLUMETRIC_TARGET_SCAN_PARALLELISM = Math.max(
             1,
             Math.min(8, Runtime.getRuntime().availableProcessors() - 1)
@@ -244,6 +249,17 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
     public static void setSpecialBlockHandler(SpecialBlockHandler handler) {
         specialBlockHandler = handler == null ? SpecialBlockHandler.NOOP : handler;
+    }
+
+    public static String getProfilerTestName() {
+        return String.format(
+                "mr%d-ref%d-rad%d-lwSample=%s-baseSmooth=%s-baseIdxLookup=v1-solidIdxScan=off-airArrivalIdx=off-resFieldDense=off",
+                EIKONAL_MULTIRES_DOWNSAMPLE_FACTOR,
+                EIKONAL_MULTIRES_FINE_REFINE_SWEEP_CYCLES,
+                VOLUMETRIC_MAX_RADIAL_STEPS,
+                EIKONAL_ENABLE_LOW_WEIGHT_STOCHASTIC_SAMPLING,
+                EIKONAL_ENABLE_VOLUMETRIC_BASELINE_SMOOTHING
+        );
     }
 
     public static double getRaySplitDistanceThreshold() {
@@ -617,11 +633,15 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         float[] shadowArrivalTimes = shadowSolveResult.arrivalTimes();
         LongArrayList solidPositions = eikonalField.solidPositions();
         Long2FloatOpenHashMap volumetricBaselineByPos = baselineResult.baselineByPos();
+        float[] volumetricBaselineByIndex = buildEikonalBaselineByIndex(
+                solidPositions,
+                volumetricBaselineByPos
+        );
         double maxArrival = Math.max(1.0E-6D, resolvedRadius * EIKONAL_MAX_ARRIVAL_MULTIPLIER);
         long targetScanStart = trace != null ? System.nanoTime() : 0L;
         EikonalTargetScanResult targetScanResult = scanEikonalTargets(
                 solidPositions,
-                volumetricBaselineByPos,
+                volumetricBaselineByIndex,
                 arrivalTimes,
                 shadowArrivalTimes,
                 eikonalField,
@@ -660,7 +680,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         long impactApplyStart = trace != null ? System.nanoTime() : 0L;
         for (int i = 0; i < targetPositions.size(); i++) {
             double weight = targetWeights.getFloat(i);
-            if (weight <= VOLUMETRIC_MIN_ENERGY) {
+            if (weight <= EIKONAL_TARGET_MIN_WEIGHT) {
                 continue;
             }
             double impactPower = impactBudget * (weight / normalizationWeight);
@@ -936,7 +956,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 }
             }
         }
-
         return new EikonalField(
                 minX,
                 minY,
@@ -1105,7 +1124,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         for (int i = 0; i < targetPositions.size(); i++) {
             baselineByPos.put(targetPositions.getLong(i), targetWeights.getFloat(i));
         }
-        Long2FloatOpenHashMap smoothed = smoothEikonalVolumetricMechanics(baselineByPos, solidPositions);
+        Long2FloatOpenHashMap smoothed = EIKONAL_ENABLE_VOLUMETRIC_BASELINE_SMOOTHING
+                ? smoothEikonalVolumetricMechanics(baselineByPos, solidPositions)
+                : baselineByPos;
         return new EikonalVolumetricBaselineResult(
                 smoothed,
                 directionSetupNanos,
@@ -1191,6 +1212,16 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         double dy = (y + 0.5D) - centerY;
         double dz = (z + 0.5D) - centerZ;
         return Math.sqrt((dx * dx) + (dy * dy) + (dz * dz)) * EIKONAL_AIR_SLOWNESS;
+    }
+
+    private static float[] buildEikonalBaselineByIndex(LongArrayList solidPositions,
+                                                       Long2FloatOpenHashMap volumetricBaselineByPos) {
+        int solidCount = solidPositions.size();
+        float[] volumetricBaselineByIndex = new float[solidCount];
+        for (int i = 0; i < solidCount; i++) {
+            volumetricBaselineByIndex[i] = volumetricBaselineByPos.get(solidPositions.getLong(i));
+        }
+        return volumetricBaselineByIndex;
     }
 
     private static EikonalSolveResult solveEikonalArrivalTimes(EikonalField field,
@@ -1683,7 +1714,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 }
             }
         }
-
         return new EikonalField(
                 minX,
                 minY,
@@ -3467,7 +3497,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     }
 
     private static EikonalTargetScanResult scanEikonalTargets(LongArrayList solidPositions,
-                                                              Long2FloatOpenHashMap volumetricBaselineByPos,
+                                                              float[] volumetricBaselineByIndex,
                                                               float[] arrivalTimes,
                                                               float[] shadowArrivalTimes,
                                                               EikonalField eikonalField,
@@ -3484,7 +3514,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     solidPositions,
                     0,
                     solidCount,
-                    volumetricBaselineByPos,
+                    volumetricBaselineByIndex,
                     arrivalTimes,
                     shadowArrivalTimes,
                     eikonalField,
@@ -3511,7 +3541,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                             solidPositions,
                             chunkStart,
                             chunkEnd,
-                            volumetricBaselineByPos,
+                            volumetricBaselineByIndex,
                             arrivalTimes,
                             shadowArrivalTimes,
                             eikonalField,
@@ -3551,7 +3581,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 solidPositions,
                 0,
                 solidCount,
-                volumetricBaselineByPos,
+                volumetricBaselineByIndex,
                 arrivalTimes,
                 shadowArrivalTimes,
                 eikonalField,
@@ -3566,7 +3596,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static EikonalTargetScanResult scanEikonalTargetScanChunk(LongArrayList solidPositions,
                                                                        int startInclusive,
                                                                        int endExclusive,
-                                                                       Long2FloatOpenHashMap volumetricBaselineByPos,
+                                                                       float[] volumetricBaselineByIndex,
                                                                        float[] arrivalTimes,
                                                                        float[] shadowArrivalTimes,
                                                                        EikonalField eikonalField,
@@ -3588,8 +3618,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         for (int i = startInclusive; i < endExclusive; i++) {
             long posLong = solidPositions.getLong(i);
             long precheckStart = profileSubstages ? System.nanoTime() : 0L;
-            float baselineWeight = volumetricBaselineByPos.get(posLong);
-            if (!Float.isFinite(baselineWeight) || baselineWeight <= VOLUMETRIC_MIN_ENERGY) {
+            float baselineWeight = i >= 0 && i < volumetricBaselineByIndex.length
+                    ? volumetricBaselineByIndex[i]
+                    : Float.NaN;
+            if (!Float.isFinite(baselineWeight) || baselineWeight <= EIKONAL_TARGET_MIN_WEIGHT) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
                 }
@@ -3684,20 +3716,56 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             );
             double cutoffRetention = computeEikonalCutoffEdgeRetention(normalized);
             double weight = baselineWeight * smoothingFactor * cutoffRetention;
-            if (weight <= VOLUMETRIC_MIN_ENERGY) {
+            if (weight <= EIKONAL_TARGET_MIN_WEIGHT) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
                 }
                 continue;
             }
+            double sampledWeight = weight;
+            if (EIKONAL_ENABLE_LOW_WEIGHT_STOCHASTIC_SAMPLING
+                    && weight < EIKONAL_LOW_WEIGHT_STOCHASTIC_THRESHOLD) {
+                double keepProbability = Mth.clamp(
+                        weight / EIKONAL_LOW_WEIGHT_STOCHASTIC_THRESHOLD,
+                        EIKONAL_LOW_WEIGHT_STOCHASTIC_MIN_KEEP_PROBABILITY,
+                        1.0D
+                );
+                double keepRoll = sampleEikonalLowWeightKeepNoise(x, y, z, centerX, centerY, centerZ);
+                if (keepRoll > keepProbability) {
+                    if (profileSubstages) {
+                        precheckNanos += (System.nanoTime() - precheckStart);
+                    }
+                    continue;
+                }
+                sampledWeight = weight / keepProbability;
+            }
             if (profileSubstages) {
                 precheckNanos += (System.nanoTime() - precheckStart);
             }
             targetPositions.add(posLong);
-            targetWeights.add((float) weight);
-            solidWeight += weight;
+            targetWeights.add((float) sampledWeight);
+            solidWeight += sampledWeight;
         }
         return new EikonalTargetScanResult(targetPositions, targetWeights, solidWeight, precheckNanos);
+    }
+
+    private static double sampleEikonalLowWeightKeepNoise(int x, int y, int z, double centerX, double centerY, double centerZ) {
+        int cx = Mth.floor(centerX * 2.0D);
+        int cy = Mth.floor(centerY * 2.0D);
+        int cz = Mth.floor(centerZ * 2.0D);
+        long hash = 0xA24BAED4963EE407L;
+        hash ^= ((long) x) * 0x9E3779B97F4A7C15L;
+        hash ^= ((long) y) * 0xC2B2AE3D27D4EB4FL;
+        hash ^= ((long) z) * 0x165667B19E3779F9L;
+        hash ^= ((long) cx) * 0x94D049BB133111EBL;
+        hash ^= ((long) cy) * 0xFF51AFD7ED558CCDL;
+        hash ^= ((long) cz) * 0xC4CEB9FE1A85EC53L;
+        hash ^= (hash >>> 33);
+        hash *= 0xFF51AFD7ED558CCDL;
+        hash ^= (hash >>> 33);
+        hash *= 0xC4CEB9FE1A85EC53L;
+        hash ^= (hash >>> 33);
+        return ((hash >>> 11) & 0x1FFFFFL) / 2097151.0D;
     }
 
     private static int resolveEikonalTargetScanTaskCount(int solidCount) {

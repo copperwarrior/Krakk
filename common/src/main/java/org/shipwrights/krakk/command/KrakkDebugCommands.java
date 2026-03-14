@@ -37,8 +37,8 @@ public final class KrakkDebugCommands {
     private static final int DEFAULT_PROFILE_WARMUP = 3;
     private static final double QPROF_EIKONAL_RADIUS = 96.0D;
     private static final double QPROF_EIKONAL_ENERGY = 1_000_000.0D;
-    private static final int QPROF_RUNS = 1;
-    private static final int QPROF_WARMUP = 0;
+    private static final int QPROF_RUNS = 7;
+    private static final int QPROF_WARMUP = 2;
     private static final long QPROF_SEED = 12_345L;
 
     private KrakkDebugCommands() {
@@ -498,12 +498,15 @@ public final class KrakkDebugCommands {
         LivingEntity owner = sourceEntity instanceof LivingEntity living ? living : null;
         KrakkExplosionProfile profile = new KrakkExplosionProfile(power);
         long effectiveSeed = seed != Long.MIN_VALUE ? seed : (level.getGameTime() ^ BlockPos.containing(pos).asLong());
+        int effectiveRuns = resolveProfileRuns(apply, runs);
+        int effectiveWarmup = resolveProfileWarmup(apply, warmup);
+        emitApplyProfileIterationNotice(source, apply, runs, warmup, effectiveRuns, effectiveWarmup);
 
         ProfileAggregate aggregate = profileMode(
-                runtime, level, sourceEntity, owner, pos, profile, apply, runs, warmup, effectiveSeed
+                runtime, level, sourceEntity, owner, pos, profile, apply, effectiveRuns, effectiveWarmup, effectiveSeed
         );
-        emitProfileAggregate(source, "profexplode", apply, runs, warmup, effectiveSeed, aggregate);
-        return runs;
+        emitProfileAggregate(source, "profexplode", apply, effectiveRuns, effectiveWarmup, effectiveSeed, aggregate);
+        return effectiveRuns;
     }
 
     private static int profVolumetricExplode(CommandSourceStack source, Vec3 pos, double radius, double energy,
@@ -518,12 +521,15 @@ public final class KrakkDebugCommands {
         LivingEntity owner = sourceEntity instanceof LivingEntity living ? living : null;
         KrakkExplosionProfile profile = KrakkExplosionProfile.volumetric(radius, energy);
         long effectiveSeed = seed != Long.MIN_VALUE ? seed : (level.getGameTime() ^ BlockPos.containing(pos).asLong());
+        int effectiveRuns = resolveProfileRuns(apply, runs);
+        int effectiveWarmup = resolveProfileWarmup(apply, warmup);
+        emitApplyProfileIterationNotice(source, apply, runs, warmup, effectiveRuns, effectiveWarmup);
 
         ProfileAggregate aggregate = profileMode(
-                runtime, level, sourceEntity, owner, pos, profile, apply, runs, warmup, effectiveSeed
+                runtime, level, sourceEntity, owner, pos, profile, apply, effectiveRuns, effectiveWarmup, effectiveSeed
         );
-        emitProfileAggregate(source, "profvolexplode", apply, runs, warmup, effectiveSeed, aggregate);
-        return runs;
+        emitProfileAggregate(source, "profvolexplode", apply, effectiveRuns, effectiveWarmup, effectiveSeed, aggregate);
+        return effectiveRuns;
     }
 
     private static int profEikonalExplode(CommandSourceStack source, Vec3 pos, double radius, double energy,
@@ -538,12 +544,15 @@ public final class KrakkDebugCommands {
         LivingEntity owner = sourceEntity instanceof LivingEntity living ? living : null;
         KrakkExplosionProfile profile = KrakkExplosionProfile.eikonal(radius, energy);
         long effectiveSeed = seed != Long.MIN_VALUE ? seed : (level.getGameTime() ^ BlockPos.containing(pos).asLong());
+        int effectiveRuns = resolveProfileRuns(apply, runs);
+        int effectiveWarmup = resolveProfileWarmup(apply, warmup);
+        emitApplyProfileIterationNotice(source, apply, runs, warmup, effectiveRuns, effectiveWarmup);
 
         ProfileAggregate aggregate = profileMode(
-                runtime, level, sourceEntity, owner, pos, profile, apply, runs, warmup, effectiveSeed
+                runtime, level, sourceEntity, owner, pos, profile, apply, effectiveRuns, effectiveWarmup, effectiveSeed
         );
-        emitProfileAggregate(source, "profeikexplode", apply, runs, warmup, effectiveSeed, aggregate);
-        return runs;
+        emitProfileAggregate(source, "profeikexplode", apply, effectiveRuns, effectiveWarmup, effectiveSeed, aggregate);
+        return effectiveRuns;
     }
 
     private static int quickProfileEikonal(CommandSourceStack source, boolean apply) {
@@ -557,6 +566,35 @@ public final class KrakkDebugCommands {
                 QPROF_SEED,
                 apply
         );
+    }
+
+    private static int resolveProfileRuns(boolean apply, int runs) {
+        return apply ? 1 : runs;
+    }
+
+    private static int resolveProfileWarmup(boolean apply, int warmup) {
+        return apply ? 0 : warmup;
+    }
+
+    private static void emitApplyProfileIterationNotice(CommandSourceStack source,
+                                                        boolean apply,
+                                                        int requestedRuns,
+                                                        int requestedWarmup,
+                                                        int effectiveRuns,
+                                                        int effectiveWarmup) {
+        if (!apply) {
+            return;
+        }
+        if (requestedRuns == effectiveRuns && requestedWarmup == effectiveWarmup) {
+            return;
+        }
+        source.sendSuccess(() -> Component.literal(String.format(
+                "apply=true mutates world state; forcing runs=%d warmup=%d (requested runs=%d warmup=%d)",
+                effectiveRuns,
+                effectiveWarmup,
+                requestedRuns,
+                requestedWarmup
+        )), false);
     }
 
     private static ProfileAggregate profileMode(KrakkExplosionRuntime runtime,
@@ -685,15 +723,26 @@ public final class KrakkDebugCommands {
 
         long[] sorted = Arrays.copyOf(nanos, nanos.length);
         Arrays.sort(sorted);
+        double avgNanos = sumNanos / (double) runs;
+        double varianceNanos = 0.0D;
+        for (long sampleNanos : nanos) {
+            double delta = sampleNanos - avgNanos;
+            varianceNanos += delta * delta;
+        }
+        varianceNanos /= runs;
+        double stddevNanos = Math.sqrt(Math.max(0.0D, varianceNanos));
+        double covPercent = avgNanos > 0.0D ? ((stddevNanos / avgNanos) * 100.0D) : 0.0D;
         long p95 = sorted[percentileIndex(sorted.length, 0.95D)];
         long p99 = sorted[percentileIndex(sorted.length, 0.99D)];
         long brokenOut = apply ? totalBroken : totalPredictedBroken;
         long damagedOut = apply ? totalDamaged : totalPredictedDamaged;
 
         return new ProfileAggregate(
-                nanosToMs(sumNanos / (double) runs),
+                nanosToMs(avgNanos),
                 nanosToMs(minNanos),
                 nanosToMs(maxNanos),
+                nanosToMs(stddevNanos),
+                covPercent,
                 nanosToMs(p95),
                 nanosToMs(p99),
                 totalInitialRays / (double) runs,
@@ -751,19 +800,28 @@ public final class KrakkDebugCommands {
                                              int warmup,
                                              long seed,
                                              ProfileAggregate aggregate) {
+        String testName = KrakkExplosionRuntime.getProfilerTestName();
         source.sendSuccess(() -> Component.literal(String.format(
-                "Krakk %s: apply=%s runs=%d warmup=%d seed=%d avg=%.3fms p95=%.3fms p99=%.3fms min=%.3fms max=%.3fms",
+                "Krakk %s: test=%s apply=%s runs=%d warmup=%d seed=%d avg=%.3fms stddev=%.3fms cov=%.2f%% p95=%.3fms p99=%.3fms min=%.3fms max=%.3fms",
                 commandLabel,
+                testName,
                 apply,
                 runs,
                 warmup,
                 seed,
                 aggregate.avgMs,
+                aggregate.stddevMs,
+                aggregate.covPercent,
                 aggregate.p95Ms,
                 aggregate.p99Ms,
                 aggregate.minMs,
                 aggregate.maxMs
         )), false);
+        if (runs < 5 || warmup < 1) {
+            source.sendSuccess(() -> Component.literal(
+                    "profileQuality: low confidence; recommended runs>=7 warmup>=2 for parity/perf comparisons."
+            ), false);
+        }
         source.sendSuccess(() -> Component.literal(String.format(
                 "avgMetrics: rays(initial=%.1f processed=%.1f splits=%.1f checks=%.1f steps=%.1f) impacts(raw=%.1f postAA=%.1f lowSkip=%.1f) blocks(eval=%.1f broken=%.1f damaged=%.1f tnt=%.1f special=%.1f) entities(candidates=%.1f tests=%.1f hits=%.1f octree(nodes=%.1f leaves=%.1f) affected=%.1f damaged=%.1f killed=%.1f) syncEst(packets=%.1f bytes=%.1f)",
                 aggregate.avgInitialRays,
@@ -829,6 +887,8 @@ public final class KrakkDebugCommands {
             double avgMs,
             double minMs,
             double maxMs,
+            double stddevMs,
+            double covPercent,
             double p95Ms,
             double p99Ms,
             double avgInitialRays,
