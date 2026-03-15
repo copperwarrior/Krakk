@@ -18,12 +18,13 @@ public abstract class KrakkServerChunkCacheMixin implements KrakkServerChunkCach
     protected abstract ChunkHolder getVisibleChunkIfPresent(long chunkPosLong);
 
     @Override
-    public void krakk$damageStateChanged(BlockPos blockPos) {
+    public boolean krakk$damageStateChanged(BlockPos blockPos) {
         int chunkX = SectionPos.blockToSectionCoord(blockPos.getX());
         int chunkZ = SectionPos.blockToSectionCoord(blockPos.getZ());
         ChunkHolder chunkHolder = this.getVisibleChunkIfPresent(ChunkPos.asLong(chunkX, chunkZ));
         if (chunkHolder instanceof KrakkChunkHolderAccess access) {
-            access.krakk$damageStateChanged(blockPos);
+            return access.krakk$damageStateChanged(blockPos);
         }
+        return false;
     }
 }

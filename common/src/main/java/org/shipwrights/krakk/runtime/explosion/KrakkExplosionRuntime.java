@@ -34,6 +34,7 @@ import net.minecraft.world.level.block.TntBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
 import org.shipwrights.krakk.api.KrakkApi;
+import org.shipwrights.krakk.api.damage.KrakkDamageType;
 import org.shipwrights.krakk.api.damage.KrakkImpactResult;
 import org.shipwrights.krakk.api.explosion.KrakkExplosionApi;
 import org.shipwrights.krakk.api.explosion.KrakkExplosionProfile;
@@ -171,39 +172,39 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final double VOLUMETRIC_AIR_DISTRIBUTION_BLEND = 0.78D;
     private static final double VOLUMETRIC_MAX_AIR_NORMALIZATION_SCALE = 8.0D;
     private static final double VOLUMETRIC_IMPACT_POWER_PER_ENERGY = 500.0D;
-    private static final double STRUCTURAL_COLLAPSE_IMPACT_POWER = 1_000_000.0D;
+    private static final double STRUCTURAL_COLLAPSE_IMPACT_WEIGHT_SCALE = 0.60D;
     private static final int STRUCTURAL_COLLAPSE_MAX_VOXELS = 24_000_000;
-    private static final double EIKONAL_AIR_SLOWNESS = 1.0D;
-    private static final double EIKONAL_SOLID_SLOWNESS_SCALE = 0.040D;
-    private static final int EIKONAL_BASE_SWEEP_CYCLES = 8;
-    private static final int EIKONAL_MAX_SWEEP_CYCLES = 24;
-    private static final double EIKONAL_CONVERGENCE_EPSILON = 1.0E-3D;
-    private static final double EIKONAL_MAX_ARRIVAL_MULTIPLIER = 1.20D;
-    private static final double EIKONAL_WEIGHT_EXPONENT = 1.35D;
-    private static final double EIKONAL_RESISTANCE_ATTENUATION_PER_OVERRUN = 3.0D;
-    private static final double EIKONAL_RESISTANCE_NORMALIZED_ATTENUATION = 3.5D;
-    private static final double EIKONAL_HARD_BLOCK_NORMALIZED_OVERRUN = 4.0D;
-    private static final double EIKONAL_OVERRUN_DEADZONE = 0.05D;
-    private static final double EIKONAL_SHADOW_SOLID_SLOWNESS_SCALE = 4.0D;
-    private static final double EIKONAL_SHADOW_ATTENUATION_PER_OVERRUN = 4.0D;
-    private static final double EIKONAL_SHADOW_NORMALIZED_ATTENUATION = 7.0D;
-    private static final double EIKONAL_HARD_BLOCK_SHADOW_NORMALIZED_OVERRUN = 2.5D;
-    private static final double EIKONAL_SHADOW_OVERRUN_DEADZONE = 0.02D;
-    private static final boolean EIKONAL_USE_MULTIRES_COARSE_SOLVE = true;
-    private static final int EIKONAL_MULTIRES_DOWNSAMPLE_FACTOR = 2;
-    private static final int EIKONAL_MULTIRES_FINE_REFINE_SWEEP_CYCLES = 2;
-    private static final int EIKONAL_MULTIRES_MIN_AXIS_FOR_COARSE = 24;
-    private static final double EIKONAL_TARGET_MIN_WEIGHT = 2.5E-5D;
-    private static final boolean EIKONAL_ENABLE_LOW_WEIGHT_STOCHASTIC_SAMPLING = true;
-    private static final double EIKONAL_LOW_WEIGHT_STOCHASTIC_THRESHOLD = 2.0E-4D;
-    private static final double EIKONAL_LOW_WEIGHT_STOCHASTIC_MIN_KEEP_PROBABILITY = 0.25D;
-    private static final boolean EIKONAL_ENABLE_VOLUMETRIC_BASELINE_SMOOTHING = true;
-    private static final double EIKONAL_MIN_TRANSMITTANCE = 1.0E-3D;
-    private static final double EIKONAL_ENVELOPE_TRANSMITTANCE_BLEND = 0.25D;
-    private static final double EIKONAL_BASELINE_SMOOTH_BLEND = 0.78D;
-    private static final double EIKONAL_VOLUMETRIC_MECHANICS_SELF_SMOOTH = 0.32D;
-    private static final double EIKONAL_CUTOFF_EDGE_START_NORMALIZED = 0.32D;
-    private static final double EIKONAL_CUTOFF_EDGE_CURVE_EXPONENT = 1.85D;
+    private static final double KRAKK_AIR_SLOWNESS = 1.0D;
+    private static final double KRAKK_SOLID_SLOWNESS_SCALE = 0.040D;
+    private static final int KRAKK_BASE_SWEEP_CYCLES = 8;
+    private static final int KRAKK_MAX_SWEEP_CYCLES = 24;
+    private static final double KRAKK_CONVERGENCE_EPSILON = 1.0E-3D;
+    private static final double KRAKK_MAX_ARRIVAL_MULTIPLIER = 1.20D;
+    private static final double KRAKK_WEIGHT_EXPONENT = 1.35D;
+    private static final double KRAKK_RESISTANCE_ATTENUATION_PER_OVERRUN = 3.0D;
+    private static final double KRAKK_RESISTANCE_NORMALIZED_ATTENUATION = 3.5D;
+    private static final double KRAKK_HARD_BLOCK_NORMALIZED_OVERRUN = 4.0D;
+    private static final double KRAKK_OVERRUN_DEADZONE = 0.05D;
+    private static final double KRAKK_SHADOW_SOLID_SLOWNESS_SCALE = 4.0D;
+    private static final double KRAKK_SHADOW_ATTENUATION_PER_OVERRUN = 4.0D;
+    private static final double KRAKK_SHADOW_NORMALIZED_ATTENUATION = 7.0D;
+    private static final double KRAKK_HARD_BLOCK_SHADOW_NORMALIZED_OVERRUN = 2.5D;
+    private static final double KRAKK_SHADOW_OVERRUN_DEADZONE = 0.02D;
+    private static final boolean KRAKK_USE_MULTIRES_COARSE_SOLVE = true;
+    private static final int KRAKK_MULTIRES_DOWNSAMPLE_FACTOR = 2;
+    private static final int KRAKK_MULTIRES_FINE_REFINE_SWEEP_CYCLES = 2;
+    private static final int KRAKK_MULTIRES_MIN_AXIS_FOR_COARSE = 24;
+    private static final double KRAKK_TARGET_MIN_WEIGHT = 2.5E-5D;
+    private static final boolean KRAKK_ENABLE_LOW_WEIGHT_STOCHASTIC_SAMPLING = true;
+    private static final double KRAKK_LOW_WEIGHT_STOCHASTIC_THRESHOLD = 2.0E-4D;
+    private static final double KRAKK_LOW_WEIGHT_STOCHASTIC_MIN_KEEP_PROBABILITY = 0.25D;
+    private static final boolean KRAKK_ENABLE_VOLUMETRIC_BASELINE_SMOOTHING = true;
+    private static final double KRAKK_MIN_TRANSMITTANCE = 1.0E-3D;
+    private static final double KRAKK_ENVELOPE_TRANSMITTANCE_BLEND = 0.25D;
+    private static final double KRAKK_BASELINE_SMOOTH_BLEND = 0.78D;
+    private static final double KRAKK_VOLUMETRIC_MECHANICS_SELF_SMOOTH = 0.32D;
+    private static final double KRAKK_CUTOFF_EDGE_START_NORMALIZED = 0.32D;
+    private static final double KRAKK_CUTOFF_EDGE_CURVE_EXPONENT = 1.85D;
     private static final int VOLUMETRIC_TARGET_SCAN_PARALLELISM = Math.max(
             1,
             Math.min(8, Runtime.getRuntime().availableProcessors() - 1)
@@ -211,16 +212,18 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final int VOLUMETRIC_TARGET_SCAN_MIN_SOLIDS_FOR_PARALLEL = 262_144;
     private static final int VOLUMETRIC_TARGET_SCAN_SOLIDS_PER_TASK = 262_144;
     private static final int VOLUMETRIC_TARGET_SCAN_MAX_TASKS = 32;
-    private static final int EIKONAL_TARGET_SCAN_MIN_SOLIDS_FOR_PARALLEL = 131_072;
-    private static final int EIKONAL_TARGET_SCAN_SOLIDS_PER_TASK = 262_144;
-    private static final int EIKONAL_TARGET_SCAN_MAX_TASKS = 32;
+    private static final int KRAKK_TARGET_SCAN_MIN_SOLIDS_FOR_PARALLEL = 131_072;
+    private static final int KRAKK_TARGET_SCAN_SOLIDS_PER_TASK = 262_144;
+    private static final int KRAKK_TARGET_SCAN_MAX_TASKS = 32;
     private static final int RESISTANCE_FIELD_MIN_VOXELS_FOR_PARALLEL = 262_144;
-    private static final int RESISTANCE_FIELD_COLUMNS_PER_TASK = 8;
-    private static final int RESISTANCE_FIELD_MAX_TASKS = 32;
-    private static final int EIKONAL_SWEEP_MIN_ROWS_FOR_PARALLEL = 144;
-    private static final int EIKONAL_SWEEP_ROWS_PER_TASK = 24;
-    private static final int EIKONAL_SWEEP_MAX_TASKS = 8;
-    private static final int EIKONAL_SOLVE_PARALLELISM = Math.max(
+    private static final int RESISTANCE_FIELD_MIN_COLUMNS_FOR_PARALLEL = 32;
+    private static final int RESISTANCE_FIELD_COLUMNS_PER_TASK = 16;
+    private static final long RESISTANCE_FIELD_MIN_VOXELS_PER_TASK = 786_432L;
+    private static final int RESISTANCE_FIELD_MAX_TASKS = 16;
+    private static final int KRAKK_SWEEP_MIN_ROWS_FOR_PARALLEL = 144;
+    private static final int KRAKK_SWEEP_ROWS_PER_TASK = 24;
+    private static final int KRAKK_SWEEP_MAX_TASKS = 8;
+    private static final int KRAKK_SOLVE_PARALLELISM = Math.max(
             1,
             Math.min(2, Runtime.getRuntime().availableProcessors() - 1)
     );
@@ -228,13 +231,13 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final ForkJoinPool VOLUMETRIC_TARGET_SCAN_POOL = VOLUMETRIC_TARGET_SCAN_PARALLELISM > 1
             ? new ForkJoinPool(VOLUMETRIC_TARGET_SCAN_PARALLELISM)
             : null;
-    private static final ForkJoinPool EIKONAL_SOLVE_POOL = EIKONAL_SOLVE_PARALLELISM > 1
-            ? new ForkJoinPool(EIKONAL_SOLVE_PARALLELISM)
+    private static final ForkJoinPool KRAKK_SOLVE_POOL = KRAKK_SOLVE_PARALLELISM > 1
+            ? new ForkJoinPool(KRAKK_SOLVE_PARALLELISM)
             : null;
     private static final int[] CHILD_TRAVERSAL_OFFSETS = new int[]{0, 1, 2, 4, 3, 5, 6, 7};
     private static final int[][] CHILD_ORDER_BY_RAY_OCTANT = buildChildOrderByRayOctant();
     private static volatile SpecialBlockHandler specialBlockHandler = SpecialBlockHandler.NOOP;
-    private static volatile boolean parallelResistanceFieldSamplingEnabled = false;
+    private static volatile boolean parallelResistanceFieldSamplingEnabled = true;
     private static volatile double raySplitDistanceThreshold = DEFAULT_RAY_SPLIT_DISTANCE_THRESHOLD;
 
     public KrakkExplosionRuntime() {
@@ -253,12 +256,12 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
     public static String getProfilerTestName() {
         return String.format(
-                "mr%d-ref%d-rad%d-lwSample=%s-baseSmooth=%s-baseIdxLookup=v1-solidIdxScan=off-airArrivalIdx=off-resFieldDense=off",
-                EIKONAL_MULTIRES_DOWNSAMPLE_FACTOR,
-                EIKONAL_MULTIRES_FINE_REFINE_SWEEP_CYCLES,
+                "mr%d-ref%d-rad%d-lw=%s-smooth=%s-idx=v1-frontier=v1-rfParallel=true-tsMath=v1",
+                KRAKK_MULTIRES_DOWNSAMPLE_FACTOR,
+                KRAKK_MULTIRES_FINE_REFINE_SWEEP_CYCLES,
                 VOLUMETRIC_MAX_RADIAL_STEPS,
-                EIKONAL_ENABLE_LOW_WEIGHT_STOCHASTIC_SAMPLING,
-                EIKONAL_ENABLE_VOLUMETRIC_BASELINE_SMOOTHING
+                KRAKK_ENABLE_LOW_WEIGHT_STOCHASTIC_SAMPLING,
+                KRAKK_ENABLE_VOLUMETRIC_BASELINE_SMOOTHING
         );
     }
 
@@ -277,15 +280,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         );
         raySplitDistanceThreshold = clamped;
         return clamped;
-    }
-
-    public static boolean isParallelResistanceFieldSamplingEnabled() {
-        return parallelResistanceFieldSamplingEnabled;
-    }
-
-    public static boolean setParallelResistanceFieldSamplingEnabled(boolean enabled) {
-        parallelResistanceFieldSamplingEnabled = enabled;
-        return parallelResistanceFieldSamplingEnabled;
     }
 
     public record ExplosionProfileReport(
@@ -325,18 +319,22 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             long volumetricResistanceFieldNanos,
             long volumetricDirectionSetupNanos,
             long volumetricPressureSolveNanos,
-            long eikonalSolveNanos,
+            long krakkSolveNanos,
             long volumetricTargetScanNanos,
             long volumetricTargetScanPrecheckNanos,
             long volumetricTargetScanBlendNanos,
             long volumetricImpactApplyNanos,
+            long volumetricImpactApplyDirectNanos,
+            long volumetricImpactApplyCollapseSeedNanos,
+            long volumetricImpactApplyCollapseBfsNanos,
+            long volumetricImpactApplyCollapseApplyNanos,
             int volumetricSampledVoxels,
             int volumetricSampledSolids,
             int volumetricTargetBlocks,
             int volumetricDirectionSamples,
             int volumetricRadialSteps,
-            int eikonalSourceCells,
-            int eikonalSweepCycles,
+            int krakkSourceCells,
+            int krakkSweepCycles,
             int estimatedSyncPackets,
             int estimatedSyncBytes,
             int smokeParticles
@@ -454,7 +452,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
     }
 
-    private static void detonateEikonal(ServerLevel level, double x, double y, double z, Entity source, LivingEntity owner,
+    private static void detonateKrakk(ServerLevel level, double x, double y, double z, Entity source, LivingEntity owner,
                                         double blastRadius, double totalEnergy,
                                         boolean applyWorldChanges, boolean emitEffects,
                                         ExplosionProfileTrace trace) {
@@ -467,7 +465,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
 
         long blockResolveStart = trace != null ? System.nanoTime() : 0L;
-        Runnable propagationPass = () -> runEikonalPropagation(
+        Runnable propagationPass = () -> runKrakkPropagation(
                 level,
                 x,
                 y,
@@ -495,7 +493,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
     }
 
-    private static void runEikonalPropagation(ServerLevel level,
+    private static void runKrakkPropagation(ServerLevel level,
                                               double centerX,
                                               double centerY,
                                               double centerZ,
@@ -512,7 +510,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
         boolean energyLimitedRadius = blastRadius <= 1.0E-9D;
         double resolvedRadius = energyLimitedRadius
-                ? resolveEikonalRadiusFromEnergyCutoff(totalEnergy)
+                ? resolveKrakkRadiusFromEnergyCutoff(totalEnergy)
                 : Math.max(1.0D, blastRadius);
         double radiusSq = resolvedRadius * resolvedRadius;
         int minX = Mth.floor(centerX - resolvedRadius);
@@ -525,7 +523,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         Int2DoubleOpenHashMap resistanceCostCache = new Int2DoubleOpenHashMap(256);
         resistanceCostCache.defaultReturnValue(Double.NaN);
         long fieldStart = trace != null ? System.nanoTime() : 0L;
-        EikonalField eikonalField = buildEikonalField(
+        KrakkField krakkField = buildKrakkField(
                 level,
                 centerX,
                 centerY,
@@ -541,81 +539,81 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         );
         if (trace != null) {
             trace.volumetricResistanceFieldNanos += (System.nanoTime() - fieldStart);
-            trace.volumetricSampledVoxels += eikonalField.sampledVoxelCount();
-            trace.volumetricSampledSolids += eikonalField.solidPositions().size();
+            trace.volumetricSampledVoxels += krakkField.sampledVoxelCount();
+            trace.volumetricSampledSolids += krakkField.solidPositions().size();
         }
-        if (eikonalField.sampledVoxelCount() <= 0 || eikonalField.solidPositions().isEmpty()) {
+        if (krakkField.sampledVoxelCount() <= 0 || krakkField.solidPositions().isEmpty()) {
             return;
         }
 
         boolean profileSubstages = trace != null;
-        Future<EikonalVolumetricBaselineResult> baselineFuture = null;
-        if (EIKONAL_SOLVE_POOL != null) {
-            baselineFuture = EIKONAL_SOLVE_POOL.submit(
-                    () -> buildEikonalVolumetricBaselineByPos(
+        Future<KrakkVolumetricBaselineResult> baselineFuture = null;
+        if (KRAKK_SOLVE_POOL != null) {
+            baselineFuture = KRAKK_SOLVE_POOL.submit(
+                    () -> buildKrakkVolumetricBaselineByPos(
                             centerX,
                             centerY,
                             centerZ,
                             resolvedRadius,
-                            eikonalField,
+                            krakkField,
                             profileSubstages
                     )
             );
         }
 
         long solveStart = trace != null ? System.nanoTime() : 0L;
-        PairedEikonalSolveResult pairedSolveResult = solvePairedEikonalArrivalTimes(
-                eikonalField,
+        PairedKrakkSolveResult pairedSolveResult = solvePairedKrakkArrivalTimes(
+                krakkField,
                 centerX,
                 centerY,
                 centerZ,
                 Float.NaN,
                 1.0F,
-                (float) EIKONAL_SHADOW_SOLID_SLOWNESS_SCALE
+                (float) KRAKK_SHADOW_SOLID_SLOWNESS_SCALE
         );
-        EikonalSolveResult solveResult = pairedSolveResult.normal();
-        EikonalSolveResult shadowSolveResult = pairedSolveResult.shadow();
+        KrakkSolveResult solveResult = pairedSolveResult.normal();
+        KrakkSolveResult shadowSolveResult = pairedSolveResult.shadow();
         if (trace != null) {
             long solveNanos = System.nanoTime() - solveStart;
             trace.volumetricPressureSolveNanos += solveNanos;
-            trace.eikonalSolveNanos += solveNanos;
-            trace.eikonalSourceCells += solveResult.sourceCells() + shadowSolveResult.sourceCells();
-            trace.eikonalSweepCycles += solveResult.sweepCycles() + shadowSolveResult.sweepCycles();
+            trace.krakkSolveNanos += solveNanos;
+            trace.krakkSourceCells += solveResult.sourceCells() + shadowSolveResult.sourceCells();
+            trace.krakkSweepCycles += solveResult.sweepCycles() + shadowSolveResult.sweepCycles();
         }
 
-        EikonalVolumetricBaselineResult baselineResult;
+        KrakkVolumetricBaselineResult baselineResult;
         if (baselineFuture != null) {
             try {
                 baselineResult = baselineFuture.get();
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
                 baselineFuture.cancel(true);
-                baselineResult = buildEikonalVolumetricBaselineByPos(
+                baselineResult = buildKrakkVolumetricBaselineByPos(
                         centerX,
                         centerY,
                         centerZ,
                         resolvedRadius,
-                        eikonalField,
+                        krakkField,
                         profileSubstages
                 );
             } catch (ExecutionException exception) {
                 baselineFuture.cancel(true);
-                baselineResult = buildEikonalVolumetricBaselineByPos(
+                baselineResult = buildKrakkVolumetricBaselineByPos(
                         centerX,
                         centerY,
                         centerZ,
                         resolvedRadius,
-                        eikonalField,
+                        krakkField,
                         profileSubstages
                 );
             }
         } else {
-            baselineResult = buildEikonalVolumetricBaselineByPos(
+            baselineResult = buildKrakkVolumetricBaselineByPos(
                     centerX,
                     centerY,
                     centerZ,
                     resolvedRadius,
-                    eikonalField,
+                    krakkField,
                     profileSubstages
             );
         }
@@ -631,20 +629,20 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
         float[] arrivalTimes = solveResult.arrivalTimes();
         float[] shadowArrivalTimes = shadowSolveResult.arrivalTimes();
-        LongArrayList solidPositions = eikonalField.solidPositions();
+        LongArrayList solidPositions = krakkField.solidPositions();
         Long2FloatOpenHashMap volumetricBaselineByPos = baselineResult.baselineByPos();
-        float[] volumetricBaselineByIndex = buildEikonalBaselineByIndex(
+        float[] volumetricBaselineByIndex = buildKrakkBaselineByIndex(
                 solidPositions,
                 volumetricBaselineByPos
         );
-        double maxArrival = Math.max(1.0E-6D, resolvedRadius * EIKONAL_MAX_ARRIVAL_MULTIPLIER);
+        double maxArrival = Math.max(1.0E-6D, resolvedRadius * KRAKK_MAX_ARRIVAL_MULTIPLIER);
         long targetScanStart = trace != null ? System.nanoTime() : 0L;
-        EikonalTargetScanResult targetScanResult = scanEikonalTargets(
+        KrakkTargetScanResult targetScanResult = scanKrakkTargets(
                 solidPositions,
                 volumetricBaselineByIndex,
                 arrivalTimes,
                 shadowArrivalTimes,
-                eikonalField,
+                krakkField,
                 centerX,
                 centerY,
                 centerZ,
@@ -670,30 +668,41 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
         double powerScale = computeVolumetricRadiusScale(resolvedRadius, VOLUMETRIC_MAX_POWER_RADIUS_SCALE);
         double impactBudget = totalEnergy * VOLUMETRIC_IMPACT_POWER_PER_ENERGY * powerScale;
-        double airNormalizationScale = computeVolumetricAirNormalizationScale(solidPositions.size(), eikonalField.sampledVoxelCount());
+        double airNormalizationScale = computeVolumetricAirNormalizationScale(solidPositions.size(), krakkField.sampledVoxelCount());
         double normalizationWeight = solidWeight * airNormalizationScale;
         if (normalizationWeight <= VOLUMETRIC_MIN_ENERGY) {
             return;
         }
 
+        Long2FloatOpenHashMap collapseWeightsByPos = new Long2FloatOpenHashMap(Math.max(16, targetPositions.size()));
+        collapseWeightsByPos.defaultReturnValue(0.0F);
         BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
         long impactApplyStart = trace != null ? System.nanoTime() : 0L;
+        long impactApplyDirectStart = trace != null ? System.nanoTime() : 0L;
         for (int i = 0; i < targetPositions.size(); i++) {
+            long targetPosLong = targetPositions.getLong(i);
             double weight = targetWeights.getFloat(i);
-            if (weight <= EIKONAL_TARGET_MIN_WEIGHT) {
+            if (weight <= KRAKK_TARGET_MIN_WEIGHT) {
                 continue;
+            }
+            float existingCollapseWeight = collapseWeightsByPos.get(targetPosLong);
+            if (weight > existingCollapseWeight) {
+                collapseWeightsByPos.put(targetPosLong, (float) weight);
             }
             double impactPower = impactBudget * (weight / normalizationWeight);
             applySingleBlockImpact(
                     level,
                     mutablePos,
-                    targetPositions.getLong(i),
+                    targetPosLong,
                     impactPower,
                     source,
                     owner,
                     applyWorldChanges,
                     trace
             );
+        }
+        if (trace != null) {
+            trace.volumetricImpactApplyDirectNanos += (System.nanoTime() - impactApplyDirectStart);
         }
         applyStructuralCollapsePass(
                 level,
@@ -708,6 +717,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 minZ,
                 maxZ,
                 solidPositions,
+                collapseWeightsByPos,
+                impactBudget,
+                normalizationWeight,
                 source,
                 owner,
                 applyWorldChanges,
@@ -718,7 +730,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
     }
 
-    private static EikonalField buildEikonalField(ServerLevel level,
+    private static KrakkField buildKrakkField(ServerLevel level,
                                                   double centerX,
                                                   double centerY,
                                                   double centerZ,
@@ -735,7 +747,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int sizeZ = maxZ - minZ + 1;
         long volumeLong = (long) sizeX * (long) sizeY * (long) sizeZ;
         if (volumeLong <= 0L || volumeLong > Integer.MAX_VALUE - 8L) {
-            return new EikonalField(
+            return new KrakkField(
                     minX,
                     minY,
                     minZ,
@@ -766,7 +778,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int sampledVoxelCount;
         int resistanceTaskCount = resolveResistanceFieldTaskCount(sizeX, sizeY, sizeZ);
         if (resistanceTaskCount <= 1 || VOLUMETRIC_TARGET_SCAN_POOL == null) {
-            EikonalResistanceFieldChunkResult chunkResult = sampleEikonalFieldChunk(
+            KrakkResistanceFieldChunkResult chunkResult = sampleKrakkFieldChunk(
                     level,
                     centerX,
                     centerY,
@@ -803,7 +815,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     radiusSq
             );
             int chunkSize = (sizeX + resistanceTaskCount - 1) / resistanceTaskCount;
-            ArrayList<Future<EikonalResistanceFieldChunkResult>> futures = new ArrayList<>(resistanceTaskCount);
+            ArrayList<Future<KrakkResistanceFieldChunkResult>> futures = new ArrayList<>(resistanceTaskCount);
             for (int taskIndex = 0; taskIndex < resistanceTaskCount; taskIndex++) {
                 int startXOffset = taskIndex * chunkSize;
                 int endXOffset = Math.min(sizeX, startXOffset + chunkSize);
@@ -813,7 +825,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 final int chunkStartX = startXOffset;
                 final int chunkEndX = endXOffset;
                 futures.add(VOLUMETRIC_TARGET_SCAN_POOL.submit(
-                        () -> sampleEikonalFieldChunk(
+                        () -> sampleKrakkFieldChunk(
                                 resistanceFieldSnapshot,
                                 minX,
                                 minY,
@@ -832,8 +844,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             int sampledCountAccumulator = 0;
             boolean mergeFailed = false;
             try {
-                for (Future<EikonalResistanceFieldChunkResult> future : futures) {
-                    EikonalResistanceFieldChunkResult chunkResult = future.get();
+                for (Future<KrakkResistanceFieldChunkResult> future : futures) {
+                    KrakkResistanceFieldChunkResult chunkResult = future.get();
                     sampledCountAccumulator += chunkResult.sampledVoxelCount();
                     LongArrayList chunkPositions = chunkResult.solidPositions();
                     for (int i = 0; i < chunkPositions.size(); i++) {
@@ -842,10 +854,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 }
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
-                cancelEikonalResistanceFieldFutures(futures);
+                cancelKrakkResistanceFieldFutures(futures);
                 mergeFailed = true;
             } catch (ExecutionException exception) {
-                cancelEikonalResistanceFieldFutures(futures);
+                cancelKrakkResistanceFieldFutures(futures);
                 mergeFailed = true;
             }
 
@@ -853,7 +865,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 Arrays.fill(slowness, 0.0F);
                 Arrays.fill(activeCountByRow, 0);
                 solidPositions.clear();
-                EikonalResistanceFieldChunkResult fallback = sampleEikonalFieldChunk(
+                KrakkResistanceFieldChunkResult fallback = sampleKrakkFieldChunk(
                         resistanceFieldSnapshot,
                         minX,
                         minY,
@@ -889,7 +901,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         for (int xOffset = 0; xOffset < sizeX; xOffset++) {
             int baseX = xOffset * strideX;
             for (int yOffset = 0; yOffset < sizeY; yOffset++) {
-                int rowIndex = eikonalRowIndex(xOffset, yOffset, sizeY);
+                int rowIndex = krakkRowIndex(xOffset, yOffset, sizeY);
                 int base = baseX + (yOffset * strideY);
                 for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
                     int index = base + zOffset;
@@ -956,7 +968,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 }
             }
         }
-        return new EikonalField(
+        return new KrakkField(
                 minX,
                 minY,
                 minZ,
@@ -979,28 +991,28 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         );
     }
 
-    private static EikonalVolumetricBaselineResult buildEikonalVolumetricBaselineByPos(double centerX,
+    private static KrakkVolumetricBaselineResult buildKrakkVolumetricBaselineByPos(double centerX,
                                                                                         double centerY,
                                                                                         double centerZ,
                                                                                         double resolvedRadius,
-                                                                                        EikonalField eikonalField,
+                                                                                        KrakkField krakkField,
                                                                                         boolean collectMetrics) {
-        LongArrayList solidPositions = eikonalField.solidPositions();
+        LongArrayList solidPositions = krakkField.solidPositions();
         Long2FloatOpenHashMap empty = new Long2FloatOpenHashMap(16);
         empty.defaultReturnValue(Float.NaN);
         if (solidPositions.isEmpty()) {
-            return new EikonalVolumetricBaselineResult(empty, 0L, 0L, 0L, 0L, 0L, 0, 0);
+            return new KrakkVolumetricBaselineResult(empty, 0L, 0L, 0L, 0L, 0L, 0, 0);
         }
 
-        float[] fieldSlowness = eikonalField.slowness();
-        int fieldMinX = eikonalField.minX();
-        int fieldMinY = eikonalField.minY();
-        int fieldMinZ = eikonalField.minZ();
-        int fieldSizeX = eikonalField.sizeX();
-        int fieldSizeY = eikonalField.sizeY();
-        int fieldSizeZ = eikonalField.sizeZ();
-        float airSlowness = (float) EIKONAL_AIR_SLOWNESS;
-        float resistanceScaleInv = (float) (1.0D / Math.max(1.0E-6D, EIKONAL_SOLID_SLOWNESS_SCALE));
+        float[] fieldSlowness = krakkField.slowness();
+        int fieldMinX = krakkField.minX();
+        int fieldMinY = krakkField.minY();
+        int fieldMinZ = krakkField.minZ();
+        int fieldSizeX = krakkField.sizeX();
+        int fieldSizeY = krakkField.sizeY();
+        int fieldSizeZ = krakkField.sizeZ();
+        float airSlowness = (float) KRAKK_AIR_SLOWNESS;
+        float resistanceScaleInv = (float) (1.0D / Math.max(1.0E-6D, KRAKK_SOLID_SLOWNESS_SCALE));
 
         long directionSetupStart = collectMetrics ? System.nanoTime() : 0L;
         double pointScale = computeVolumetricRadiusScale(resolvedRadius, VOLUMETRIC_MAX_POINT_RADIUS_SCALE);
@@ -1047,7 +1059,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                         && sampleYOffset < fieldSizeY
                         && sampleZOffset >= 0
                         && sampleZOffset < fieldSizeZ) {
-                    int sampleIndex = eikonalGridIndex(sampleXOffset, sampleYOffset, sampleZOffset, fieldSizeY, fieldSizeZ);
+                    int sampleIndex = krakkGridIndex(sampleXOffset, sampleYOffset, sampleZOffset, fieldSizeY, fieldSizeZ);
                     float sampleSlowness = fieldSlowness[sampleIndex];
                     if (sampleSlowness > airSlowness) {
                         sampleResistance = (sampleSlowness - airSlowness) * resistanceScaleInv;
@@ -1124,10 +1136,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         for (int i = 0; i < targetPositions.size(); i++) {
             baselineByPos.put(targetPositions.getLong(i), targetWeights.getFloat(i));
         }
-        Long2FloatOpenHashMap smoothed = EIKONAL_ENABLE_VOLUMETRIC_BASELINE_SMOOTHING
-                ? smoothEikonalVolumetricMechanics(baselineByPos, solidPositions)
+        Long2FloatOpenHashMap smoothed = KRAKK_ENABLE_VOLUMETRIC_BASELINE_SMOOTHING
+                ? smoothKrakkVolumetricMechanics(baselineByPos, solidPositions)
                 : baselineByPos;
-        return new EikonalVolumetricBaselineResult(
+        return new KrakkVolumetricBaselineResult(
                 smoothed,
                 directionSetupNanos,
                 pressureSolveNanos,
@@ -1139,11 +1151,11 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         );
     }
 
-    private static Long2FloatOpenHashMap smoothEikonalVolumetricMechanics(Long2FloatOpenHashMap pressureByPos,
+    private static Long2FloatOpenHashMap smoothKrakkVolumetricMechanics(Long2FloatOpenHashMap pressureByPos,
                                                                           LongArrayList solidPositions) {
         Long2FloatOpenHashMap smoothed = new Long2FloatOpenHashMap(Math.max(64, (int) Math.ceil(pressureByPos.size() / 0.75D)));
         smoothed.defaultReturnValue(Float.NaN);
-        double selfWeight = Mth.clamp(EIKONAL_VOLUMETRIC_MECHANICS_SELF_SMOOTH, 0.0D, 1.0D);
+        double selfWeight = Mth.clamp(KRAKK_VOLUMETRIC_MECHANICS_SELF_SMOOTH, 0.0D, 1.0D);
         for (int i = 0; i < solidPositions.size(); i++) {
             long posLong = solidPositions.getLong(i);
             float self = pressureByPos.get(posLong);
@@ -1192,17 +1204,17 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return smoothed;
     }
 
-    private static double computeEikonalCutoffEdgeRetention(double normalizedArrival) {
+    private static double computeKrakkCutoffEdgeRetention(double normalizedArrival) {
         double normalized = Mth.clamp(normalizedArrival, 0.0D, 1.0D);
-        double edgeStart = Mth.clamp(EIKONAL_CUTOFF_EDGE_START_NORMALIZED, 1.0E-4D, 1.0D);
+        double edgeStart = Mth.clamp(KRAKK_CUTOFF_EDGE_START_NORMALIZED, 1.0E-4D, 1.0D);
         if (normalized >= edgeStart) {
             return 1.0D;
         }
         double edgeProgress = normalized / edgeStart;
-        return Math.pow(Math.max(0.0D, edgeProgress), EIKONAL_CUTOFF_EDGE_CURVE_EXPONENT);
+        return Math.pow(Math.max(0.0D, edgeProgress), KRAKK_CUTOFF_EDGE_CURVE_EXPONENT);
     }
 
-    private static double computeAnalyticEikonalAirArrival(double centerX,
+    private static double computeAnalyticKrakkAirArrival(double centerX,
                                                            double centerY,
                                                            double centerZ,
                                                            int x,
@@ -1211,10 +1223,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         double dx = (x + 0.5D) - centerX;
         double dy = (y + 0.5D) - centerY;
         double dz = (z + 0.5D) - centerZ;
-        return Math.sqrt((dx * dx) + (dy * dy) + (dz * dz)) * EIKONAL_AIR_SLOWNESS;
+        return Math.sqrt((dx * dx) + (dy * dy) + (dz * dz)) * KRAKK_AIR_SLOWNESS;
     }
 
-    private static float[] buildEikonalBaselineByIndex(LongArrayList solidPositions,
+    private static float[] buildKrakkBaselineByIndex(LongArrayList solidPositions,
                                                        Long2FloatOpenHashMap volumetricBaselineByPos) {
         int solidCount = solidPositions.size();
         float[] volumetricBaselineByIndex = new float[solidCount];
@@ -1224,7 +1236,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return volumetricBaselineByIndex;
     }
 
-    private static EikonalSolveResult solveEikonalArrivalTimes(EikonalField field,
+    private static KrakkSolveResult solveKrakkArrivalTimes(KrakkField field,
                                                                double centerX,
                                                                double centerY,
                                                                double centerZ,
@@ -1233,9 +1245,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         float[] arrivalTimes = new float[field.slowness().length];
         Arrays.fill(arrivalTimes, Float.POSITIVE_INFINITY);
         BitSet traversableMask = field.activeMask();
-        float[] resolvedSlowness = resolveEikonalSlownessField(field, uniformSlownessOverride, solidSlownessScale);
+        float[] resolvedSlowness = resolveKrakkSlownessField(field, uniformSlownessOverride, solidSlownessScale);
         BitSet sourceMask = new BitSet(arrivalTimes.length);
-        int sourceCount = initializeEikonalSources(
+        int sourceCount = initializeKrakkSources(
                 arrivalTimes,
                 sourceMask,
                 field,
@@ -1245,7 +1257,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 centerY,
                 centerZ
         );
-        return solveEikonalArrivalTimesPreparedMultires(
+        return solveKrakkArrivalTimesPreparedMultires(
                 arrivalTimes,
                 resolvedSlowness,
                 field,
@@ -1255,7 +1267,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         );
     }
 
-    private static PairedEikonalSolveResult solvePairedEikonalArrivalTimes(EikonalField field,
+    private static PairedKrakkSolveResult solvePairedKrakkArrivalTimes(KrakkField field,
                                                                            double centerX,
                                                                            double centerY,
                                                                            double centerZ,
@@ -1267,7 +1279,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         Arrays.fill(normalArrivalTimes, Float.POSITIVE_INFINITY);
         Arrays.fill(shadowArrivalTimes, Float.POSITIVE_INFINITY);
         BitSet traversableMask = field.activeMask();
-        PairedEikonalSlownessResult slownessResult = resolvePairedEikonalSlownessField(
+        PairedKrakkSlownessResult slownessResult = resolvePairedKrakkSlownessField(
                 field,
                 uniformSlownessOverride,
                 normalSolidSlownessScale,
@@ -1275,7 +1287,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         );
         BitSet normalSourceMask = new BitSet(normalArrivalTimes.length);
         BitSet shadowSourceMask = new BitSet(shadowArrivalTimes.length);
-        PairedEikonalSourceResult sourceResult = initializePairedEikonalSources(
+        PairedKrakkSourceResult sourceResult = initializePairedKrakkSources(
                 normalArrivalTimes,
                 normalSourceMask,
                 slownessResult.normalSlowness(),
@@ -1289,11 +1301,11 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 centerZ
         );
 
-        EikonalSolveResult normalSolveResult;
-        EikonalSolveResult shadowSolveResult;
-        if (EIKONAL_SOLVE_POOL != null) {
-            Future<EikonalSolveResult> shadowFuture = EIKONAL_SOLVE_POOL.submit(
-                    () -> solveEikonalArrivalTimesPreparedMultires(
+        KrakkSolveResult normalSolveResult;
+        KrakkSolveResult shadowSolveResult;
+        if (KRAKK_SOLVE_POOL != null) {
+            Future<KrakkSolveResult> shadowFuture = KRAKK_SOLVE_POOL.submit(
+                    () -> solveKrakkArrivalTimesPreparedMultires(
                             shadowArrivalTimes,
                             slownessResult.shadowSlowness(),
                             field,
@@ -1302,7 +1314,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                             true
                     )
             );
-            normalSolveResult = solveEikonalArrivalTimesPreparedMultires(
+            normalSolveResult = solveKrakkArrivalTimesPreparedMultires(
                     normalArrivalTimes,
                     slownessResult.normalSlowness(),
                     field,
@@ -1315,7 +1327,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
                 shadowFuture.cancel(true);
-                shadowSolveResult = solveEikonalArrivalTimesPreparedMultires(
+                shadowSolveResult = solveKrakkArrivalTimesPreparedMultires(
                         shadowArrivalTimes,
                         slownessResult.shadowSlowness(),
                         field,
@@ -1325,7 +1337,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 );
             } catch (ExecutionException exception) {
                 shadowFuture.cancel(true);
-                shadowSolveResult = solveEikonalArrivalTimesPreparedMultires(
+                shadowSolveResult = solveKrakkArrivalTimesPreparedMultires(
                         shadowArrivalTimes,
                         slownessResult.shadowSlowness(),
                         field,
@@ -1335,7 +1347,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 );
             }
         } else {
-            normalSolveResult = solveEikonalArrivalTimesPreparedMultires(
+            normalSolveResult = solveKrakkArrivalTimesPreparedMultires(
                     normalArrivalTimes,
                     slownessResult.normalSlowness(),
                     field,
@@ -1343,7 +1355,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     sourceResult.normalSourceCount(),
                     true
             );
-            shadowSolveResult = solveEikonalArrivalTimesPreparedMultires(
+            shadowSolveResult = solveKrakkArrivalTimesPreparedMultires(
                     shadowArrivalTimes,
                     slownessResult.shadowSlowness(),
                     field,
@@ -1352,15 +1364,15 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     true
             );
         }
-        return new PairedEikonalSolveResult(normalSolveResult, shadowSolveResult);
+        return new PairedKrakkSolveResult(normalSolveResult, shadowSolveResult);
     }
 
-    private static EikonalSolveResult solveEikonalArrivalTimesPrepared(float[] arrivalTimes,
+    private static KrakkSolveResult solveKrakkArrivalTimesPrepared(float[] arrivalTimes,
                                                                        float[] resolvedSlowness,
-                                                                       EikonalField field,
+                                                                       KrakkField field,
                                                                        BitSet sourceMask,
                                                                        int sourceCount) {
-        return solveEikonalArrivalTimesPrepared(
+        return solveKrakkArrivalTimesPrepared(
                 arrivalTimes,
                 resolvedSlowness,
                 field,
@@ -1370,17 +1382,17 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         );
     }
 
-    private static EikonalSolveResult solveEikonalArrivalTimesPrepared(float[] arrivalTimes,
+    private static KrakkSolveResult solveKrakkArrivalTimesPrepared(float[] arrivalTimes,
                                                                        float[] resolvedSlowness,
-                                                                       EikonalField field,
+                                                                       KrakkField field,
                                                                        BitSet sourceMask,
                                                                        int sourceCount,
                                                                        boolean allowParallelSweep) {
         if (sourceCount <= 0) {
-            return new EikonalSolveResult(arrivalTimes, 0, 0);
+            return new KrakkSolveResult(arrivalTimes, 0, 0);
         }
-        int maxSweepCycles = computeEikonalMaxSweepCycles(field);
-        int sweepCycles = refineEikonalArrivalTimes(
+        int maxSweepCycles = computeKrakkMaxSweepCycles(field);
+        int sweepCycles = refineKrakkArrivalTimes(
                 arrivalTimes,
                 resolvedSlowness,
                 field,
@@ -1388,17 +1400,17 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 allowParallelSweep,
                 maxSweepCycles
         );
-        return new EikonalSolveResult(arrivalTimes, sourceCount, sweepCycles);
+        return new KrakkSolveResult(arrivalTimes, sourceCount, sweepCycles);
     }
 
-    private static EikonalSolveResult solveEikonalArrivalTimesPreparedMultires(float[] arrivalTimes,
+    private static KrakkSolveResult solveKrakkArrivalTimesPreparedMultires(float[] arrivalTimes,
                                                                                 float[] resolvedSlowness,
-                                                                                EikonalField field,
+                                                                                KrakkField field,
                                                                                 BitSet sourceMask,
                                                                                 int sourceCount,
                                                                                 boolean allowParallelSweep) {
-        if (!EIKONAL_USE_MULTIRES_COARSE_SOLVE || sourceCount <= 0) {
-            return solveEikonalArrivalTimesPrepared(
+        if (!KRAKK_USE_MULTIRES_COARSE_SOLVE || sourceCount <= 0) {
+            return solveKrakkArrivalTimesPrepared(
                     arrivalTimes,
                     resolvedSlowness,
                     field,
@@ -1408,15 +1420,15 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             );
         }
 
-        EikonalCoarseSolveContext coarseContext = buildCoarseEikonalSolveContext(
+        KrakkCoarseSolveContext coarseContext = buildCoarseKrakkSolveContext(
                 field,
                 resolvedSlowness,
                 sourceMask,
                 arrivalTimes,
-                EIKONAL_MULTIRES_DOWNSAMPLE_FACTOR
+                KRAKK_MULTIRES_DOWNSAMPLE_FACTOR
         );
         if (coarseContext == null || coarseContext.coarseSourceCount() <= 0) {
-            return solveEikonalArrivalTimesPrepared(
+            return solveKrakkArrivalTimesPrepared(
                     arrivalTimes,
                     resolvedSlowness,
                     field,
@@ -1426,7 +1438,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             );
         }
 
-        solveEikonalArrivalTimesPrepared(
+        solveKrakkArrivalTimesPrepared(
                 coarseContext.coarseArrivalTimes(),
                 coarseContext.coarseSlowness(),
                 coarseContext.coarseField(),
@@ -1442,44 +1454,94 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 sourceMask,
                 coarseContext
         );
-        int fineSweepCycles = refineEikonalArrivalTimes(
+        int fineSweepCycles = refineKrakkArrivalTimes(
                 arrivalTimes,
                 resolvedSlowness,
                 field,
                 sourceMask,
                 allowParallelSweep,
-                EIKONAL_MULTIRES_FINE_REFINE_SWEEP_CYCLES
+                KRAKK_MULTIRES_FINE_REFINE_SWEEP_CYCLES
         );
-        return new EikonalSolveResult(arrivalTimes, sourceCount, fineSweepCycles);
+        return new KrakkSolveResult(arrivalTimes, sourceCount, fineSweepCycles);
     }
 
-    private static int refineEikonalArrivalTimes(float[] arrivalTimes,
+    private static int refineKrakkArrivalTimes(float[] arrivalTimes,
                                                  float[] resolvedSlowness,
-                                                 EikonalField field,
+                                                 KrakkField field,
                                                  BitSet sourceMask,
                                                  boolean allowParallelSweep,
                                                  int maxSweepCycles) {
-        int boundedCycles = Math.max(0, Math.min(maxSweepCycles, computeEikonalMaxSweepCycles(field)));
+        int boundedCycles = Math.max(0, Math.min(maxSweepCycles, computeKrakkMaxSweepCycles(field)));
+        int rowCount = field.sizeX() * field.sizeY();
+        BitSet sourceRows = buildKrakkSourceRowMask(field, sourceMask);
+        BitSet dirtyRows = null;
         int sweepCycles = 0;
         for (int cycle = 0; cycle < boundedCycles; cycle++) {
+            BitSet activeRowsMask = null;
+            if (cycle > 0) {
+                if (dirtyRows == null || dirtyRows.isEmpty()) {
+                    break;
+                }
+                activeRowsMask = buildExpandedKrakkRowMask(dirtyRows, sourceRows, field.sizeX(), field.sizeY());
+            }
+            BitSet nextDirtyRows = new BitSet(Math.max(1, rowCount));
             double maxDelta = 0.0D;
-            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, true, true, true));
-            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, true, true, false));
-            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, true, false, true));
-            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, true, false, false));
-            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, false, true, true));
-            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, false, true, false));
-            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, false, false, true));
-            maxDelta = Math.max(maxDelta, sweepEikonalPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, false, false, false));
+            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, true, true, true, activeRowsMask, nextDirtyRows));
+            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, true, true, false, activeRowsMask, nextDirtyRows));
+            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, true, false, true, activeRowsMask, nextDirtyRows));
+            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, true, false, false, activeRowsMask, nextDirtyRows));
+            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, false, true, true, activeRowsMask, nextDirtyRows));
+            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, false, true, false, activeRowsMask, nextDirtyRows));
+            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, false, false, true, activeRowsMask, nextDirtyRows));
+            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, false, false, false, activeRowsMask, nextDirtyRows));
+            dirtyRows = nextDirtyRows;
             sweepCycles++;
-            if (maxDelta <= EIKONAL_CONVERGENCE_EPSILON) {
+            if (maxDelta <= KRAKK_CONVERGENCE_EPSILON) {
                 break;
             }
         }
         return sweepCycles;
     }
 
-    private static EikonalCoarseSolveContext buildCoarseEikonalSolveContext(EikonalField fineField,
+    private static BitSet buildKrakkSourceRowMask(KrakkField field, BitSet sourceMask) {
+        int rowCount = Math.max(1, field.sizeX() * field.sizeY());
+        BitSet sourceRows = new BitSet(rowCount);
+        int strideX = field.sizeY() * field.sizeZ();
+        int strideY = field.sizeZ();
+        for (int index = sourceMask.nextSetBit(0); index >= 0; index = sourceMask.nextSetBit(index + 1)) {
+            int x = index / strideX;
+            int yz = index - (x * strideX);
+            int y = yz / strideY;
+            sourceRows.set(krakkRowIndex(x, y, field.sizeY()));
+        }
+        return sourceRows;
+    }
+
+    private static BitSet buildExpandedKrakkRowMask(BitSet dirtyRows, BitSet sourceRows, int sizeX, int sizeY) {
+        BitSet expanded = (BitSet) dirtyRows.clone();
+        if (sourceRows != null) {
+            expanded.or(sourceRows);
+        }
+        for (int rowIndex = dirtyRows.nextSetBit(0); rowIndex >= 0; rowIndex = dirtyRows.nextSetBit(rowIndex + 1)) {
+            int x = rowIndex / sizeY;
+            int y = rowIndex - (x * sizeY);
+            if (x > 0) {
+                expanded.set(krakkRowIndex(x - 1, y, sizeY));
+            }
+            if (x + 1 < sizeX) {
+                expanded.set(krakkRowIndex(x + 1, y, sizeY));
+            }
+            if (y > 0) {
+                expanded.set(krakkRowIndex(x, y - 1, sizeY));
+            }
+            if (y + 1 < sizeY) {
+                expanded.set(krakkRowIndex(x, y + 1, sizeY));
+            }
+        }
+        return expanded;
+    }
+
+    private static KrakkCoarseSolveContext buildCoarseKrakkSolveContext(KrakkField fineField,
                                                                              float[] fineSlowness,
                                                                              BitSet fineSourceMask,
                                                                              float[] fineArrivalTimes,
@@ -1491,7 +1553,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int fineSizeY = fineField.sizeY();
         int fineSizeZ = fineField.sizeZ();
         int longestAxis = Math.max(fineSizeX, Math.max(fineSizeY, fineSizeZ));
-        if (longestAxis < EIKONAL_MULTIRES_MIN_AXIS_FOR_COARSE) {
+        if (longestAxis < KRAKK_MULTIRES_MIN_AXIS_FOR_COARSE) {
             return null;
         }
 
@@ -1513,7 +1575,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int coarseSourceCount = 0;
         LongArrayList coarseSolidPositions = new LongArrayList(Math.max(16, fineField.solidPositions().size() / Math.max(1, downsampleFactor * downsampleFactor)));
 
-        float airSlowness = (float) EIKONAL_AIR_SLOWNESS;
+        float airSlowness = (float) KRAKK_AIR_SLOWNESS;
         int fineStrideX = fineSizeY * fineSizeZ;
         int fineStrideY = fineSizeZ;
         for (int coarseX = 0; coarseX < coarseSizeX; coarseX++) {
@@ -1555,7 +1617,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                         continue;
                     }
 
-                    int coarseIndex = eikonalGridIndex(coarseX, coarseY, coarseZ, coarseSizeY, coarseSizeZ);
+                    int coarseIndex = krakkGridIndex(coarseX, coarseY, coarseZ, coarseSizeY, coarseSizeZ);
                     coarseSlowness[coarseIndex] = minSlowness;
                     if (hasSolid) {
                         coarseSolidPositions.add(BlockPos.asLong(
@@ -1579,7 +1641,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             return null;
         }
         int coarseSampledVoxels = Math.max(1, fineField.sampledVoxelCount() / Math.max(1, downsampleFactor * downsampleFactor * downsampleFactor));
-        EikonalField coarseField = buildPreparedEikonalFieldFromSlowness(
+        KrakkField coarseField = buildPreparedKrakkFieldFromSlowness(
                 fineField.minX(),
                 fineField.minY(),
                 fineField.minZ(),
@@ -1593,7 +1655,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         if (coarseField.activeMask().isEmpty()) {
             return null;
         }
-        return new EikonalCoarseSolveContext(
+        return new KrakkCoarseSolveContext(
                 coarseField,
                 coarseArrivalTimes,
                 coarseSlowness,
@@ -1603,7 +1665,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         );
     }
 
-    private static EikonalField buildPreparedEikonalFieldFromSlowness(int minX,
+    private static KrakkField buildPreparedKrakkFieldFromSlowness(int minX,
                                                                        int minY,
                                                                        int minZ,
                                                                        int sizeX,
@@ -1622,7 +1684,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         for (int xOffset = 0; xOffset < sizeX; xOffset++) {
             int baseX = xOffset * strideX;
             for (int yOffset = 0; yOffset < sizeY; yOffset++) {
-                int rowIndex = eikonalRowIndex(xOffset, yOffset, sizeY);
+                int rowIndex = krakkRowIndex(xOffset, yOffset, sizeY);
                 int base = baseX + (yOffset * strideY);
                 int activeCount = 0;
                 for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
@@ -1648,7 +1710,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         for (int xOffset = 0; xOffset < sizeX; xOffset++) {
             int baseX = xOffset * strideX;
             for (int yOffset = 0; yOffset < sizeY; yOffset++) {
-                int rowIndex = eikonalRowIndex(xOffset, yOffset, sizeY);
+                int rowIndex = krakkRowIndex(xOffset, yOffset, sizeY);
                 int base = baseX + (yOffset * strideY);
                 for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
                     int index = base + zOffset;
@@ -1714,7 +1776,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 }
             }
         }
-        return new EikonalField(
+        return new KrakkField(
                 minX,
                 minY,
                 minZ,
@@ -1739,10 +1801,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
     private static void seedFineArrivalTimesFromCoarse(float[] fineArrivalTimes,
                                                        float[] fineSlowness,
-                                                       EikonalField fineField,
+                                                       KrakkField fineField,
                                                        BitSet fineSourceMask,
-                                                       EikonalCoarseSolveContext coarseContext) {
-        EikonalField coarseField = coarseContext.coarseField();
+                                                       KrakkCoarseSolveContext coarseContext) {
+        KrakkField coarseField = coarseContext.coarseField();
         float[] coarseArrivalTimes = coarseContext.coarseArrivalTimes();
         int downsampleFactor = coarseContext.downsampleFactor();
         int fineSizeY = fineField.sizeY();
@@ -1787,10 +1849,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
     }
 
-    private static float[] resolveEikonalSlownessField(EikonalField field,
+    private static float[] resolveKrakkSlownessField(KrakkField field,
                                                        float uniformSlownessOverride,
                                                        float solidSlownessScale) {
-        return resolvePairedEikonalSlownessField(
+        return resolvePairedKrakkSlownessField(
                 field,
                 uniformSlownessOverride,
                 solidSlownessScale,
@@ -1798,7 +1860,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         ).normalSlowness();
     }
 
-    private static PairedEikonalSlownessResult resolvePairedEikonalSlownessField(EikonalField field,
+    private static PairedKrakkSlownessResult resolvePairedKrakkSlownessField(KrakkField field,
                                                                                   float uniformSlownessOverride,
                                                                                   float normalSolidSlownessScale,
                                                                                   float shadowSolidSlownessScale) {
@@ -1813,7 +1875,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         if (!uniformOverrideActive
                 && Math.abs(resolvedNormalScale - 1.0F) <= 1.0E-6F
                 && Math.abs(resolvedShadowScale - 1.0F) <= 1.0E-6F) {
-            return new PairedEikonalSlownessResult(baseSlowness, baseSlowness);
+            return new PairedKrakkSlownessResult(baseSlowness, baseSlowness);
         }
 
         int[] activeIndices = field.activeRowIndices();
@@ -1824,33 +1886,33 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     resolvedSlowness[index] = uniformSlownessOverride;
                 }
             }
-            return new PairedEikonalSlownessResult(resolvedSlowness, resolvedSlowness);
+            return new PairedKrakkSlownessResult(resolvedSlowness, resolvedSlowness);
         }
 
         boolean normalIsBase = Math.abs(resolvedNormalScale - 1.0F) <= 1.0E-6F;
         boolean shadowIsBase = Math.abs(resolvedShadowScale - 1.0F) <= 1.0E-6F;
         if (!normalIsBase && !shadowIsBase && Math.abs(resolvedNormalScale - resolvedShadowScale) <= 1.0E-6F) {
             float[] resolvedSlowness = new float[baseSlowness.length];
-            applyEikonalSlownessScale(resolvedSlowness, baseSlowness, activeIndices, resolvedNormalScale);
-            return new PairedEikonalSlownessResult(resolvedSlowness, resolvedSlowness);
+            applyKrakkSlownessScale(resolvedSlowness, baseSlowness, activeIndices, resolvedNormalScale);
+            return new PairedKrakkSlownessResult(resolvedSlowness, resolvedSlowness);
         }
 
         float[] normalSlowness = normalIsBase ? baseSlowness : new float[baseSlowness.length];
         float[] shadowSlowness = shadowIsBase ? baseSlowness : new float[baseSlowness.length];
         if (!normalIsBase) {
-            applyEikonalSlownessScale(normalSlowness, baseSlowness, activeIndices, resolvedNormalScale);
+            applyKrakkSlownessScale(normalSlowness, baseSlowness, activeIndices, resolvedNormalScale);
         }
         if (!shadowIsBase) {
-            applyEikonalSlownessScale(shadowSlowness, baseSlowness, activeIndices, resolvedShadowScale);
+            applyKrakkSlownessScale(shadowSlowness, baseSlowness, activeIndices, resolvedShadowScale);
         }
-        return new PairedEikonalSlownessResult(normalSlowness, shadowSlowness);
+        return new PairedKrakkSlownessResult(normalSlowness, shadowSlowness);
     }
 
-    private static void applyEikonalSlownessScale(float[] outputSlowness,
+    private static void applyKrakkSlownessScale(float[] outputSlowness,
                                                   float[] baseSlowness,
                                                   int[] activeIndices,
                                                   float scale) {
-        float airSlowness = (float) EIKONAL_AIR_SLOWNESS;
+        float airSlowness = (float) KRAKK_AIR_SLOWNESS;
         for (int index : activeIndices) {
             float base = baseSlowness[index];
             if (base <= 0.0F) {
@@ -1865,15 +1927,15 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
     }
 
-    private static int initializeEikonalSources(float[] arrivalTimes,
+    private static int initializeKrakkSources(float[] arrivalTimes,
                                                 BitSet sourceMask,
-                                                EikonalField field,
+                                                KrakkField field,
                                                 BitSet traversableMask,
                                                 float[] resolvedSlowness,
                                                 double centerX,
                                                 double centerY,
                                                 double centerZ) {
-        PairedEikonalSourceResult sourceResult = initializePairedEikonalSources(
+        PairedKrakkSourceResult sourceResult = initializePairedKrakkSources(
                 arrivalTimes,
                 sourceMask,
                 resolvedSlowness,
@@ -1889,13 +1951,13 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return sourceResult.normalSourceCount();
     }
 
-    private static PairedEikonalSourceResult initializePairedEikonalSources(float[] normalArrivalTimes,
+    private static PairedKrakkSourceResult initializePairedKrakkSources(float[] normalArrivalTimes,
                                                                              BitSet normalSourceMask,
                                                                              float[] normalSlowness,
                                                                              float[] shadowArrivalTimes,
                                                                              BitSet shadowSourceMask,
                                                                              float[] shadowSlowness,
-                                                                             EikonalField field,
+                                                                             KrakkField field,
                                                                              BitSet traversableMask,
                                                                              double centerX,
                                                                              double centerY,
@@ -1915,7 +1977,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         for (int x = minX; x <= maxX; x++) {
             for (int y = minY; y <= maxY; y++) {
                 for (int z = minZ; z <= maxZ; z++) {
-                    int index = eikonalGridIndex(x, y, z, field.sizeY(), field.sizeZ());
+                    int index = krakkGridIndex(x, y, z, field.sizeY(), field.sizeZ());
                     if (!traversableMask.get(index)) {
                         continue;
                     }
@@ -1959,7 +2021,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
         int seedIndex = -1;
         if (normalSourceCount <= 0 || (computeShadow && shadowSourceCount <= 0)) {
-            seedIndex = resolveEikonalSeedIndex(field, traversableMask, centerX, centerY, centerZ);
+            seedIndex = resolveKrakkSeedIndex(field, traversableMask, centerX, centerY, centerZ);
         }
         if (normalSourceCount <= 0 && seedIndex >= 0 && normalSlowness[seedIndex] > 0.0F) {
             normalArrivalTimes[seedIndex] = 0.0F;
@@ -1971,16 +2033,16 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             shadowSourceMask.set(seedIndex);
             shadowSourceCount = 1;
         }
-        return new PairedEikonalSourceResult(normalSourceCount, shadowSourceCount);
+        return new PairedKrakkSourceResult(normalSourceCount, shadowSourceCount);
     }
 
-    private static int computeEikonalMaxSweepCycles(EikonalField field) {
+    private static int computeKrakkMaxSweepCycles(KrakkField field) {
         int longestAxis = Math.max(field.sizeX(), Math.max(field.sizeY(), field.sizeZ()));
         int growthCycles = Math.max(0, Mth.ceil((longestAxis - 32) / 12.0D));
-        return Mth.clamp(EIKONAL_BASE_SWEEP_CYCLES + growthCycles, EIKONAL_BASE_SWEEP_CYCLES, EIKONAL_MAX_SWEEP_CYCLES);
+        return Mth.clamp(KRAKK_BASE_SWEEP_CYCLES + growthCycles, KRAKK_BASE_SWEEP_CYCLES, KRAKK_MAX_SWEEP_CYCLES);
     }
 
-    private static int resolveEikonalSeedIndex(EikonalField field,
+    private static int resolveKrakkSeedIndex(KrakkField field,
                                                BitSet traversableMask,
                                                double centerX,
                                                double centerY,
@@ -1988,7 +2050,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int seedX = Mth.clamp(Mth.floor(centerX), field.minX(), field.minX() + field.sizeX() - 1);
         int seedY = Mth.clamp(Mth.floor(centerY), field.minY(), field.minY() + field.sizeY() - 1);
         int seedZ = Mth.clamp(Mth.floor(centerZ), field.minZ(), field.minZ() + field.sizeZ() - 1);
-        int seedIndex = eikonalGridIndex(seedX - field.minX(), seedY - field.minY(), seedZ - field.minZ(), field.sizeY(), field.sizeZ());
+        int seedIndex = krakkGridIndex(seedX - field.minX(), seedY - field.minY(), seedZ - field.minZ(), field.sizeY(), field.sizeZ());
         if (traversableMask.get(seedIndex)) {
             return seedIndex;
         }
@@ -1998,7 +2060,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         for (int x = 0; x < field.sizeX(); x++) {
             for (int y = 0; y < field.sizeY(); y++) {
                 for (int z = 0; z < field.sizeZ(); z++) {
-                    int index = eikonalGridIndex(x, y, z, field.sizeY(), field.sizeZ());
+                    int index = krakkGridIndex(x, y, z, field.sizeY(), field.sizeZ());
                     if (!traversableMask.get(index)) {
                         continue;
                     }
@@ -2019,14 +2081,16 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return bestIndex;
     }
 
-    private static double sweepEikonalPass(float[] arrivalTimes,
+    private static double sweepKrakkPass(float[] arrivalTimes,
                                            float[] resolvedSlowness,
-                                           EikonalField field,
+                                           KrakkField field,
                                            BitSet sourceMask,
                                            boolean allowParallelSweep,
                                            boolean xForward,
                                            boolean yForward,
-                                           boolean zForward) {
+                                           boolean zForward,
+                                           BitSet activeRowsMask,
+                                           BitSet dirtyRowsOut) {
         int sizeX = field.sizeX();
         int sizeY = field.sizeY();
         int diagonalCount = sizeX + sizeY - 1;
@@ -2044,37 +2108,37 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             int minXOrder = Math.max(0, diagonal - (sizeY - 1));
             int maxXOrder = Math.min(sizeX - 1, diagonal);
             int rowSpan = maxXOrder - minXOrder + 1;
-            int taskCount = resolveEikonalSweepTaskCount(rowSpan);
+            int taskCount = resolveKrakkSweepTaskCount(rowSpan);
             if (!allowParallelSweep || taskCount <= 1 || VOLUMETRIC_TARGET_SCAN_POOL == null) {
-                maxDelta = Math.max(
-                        maxDelta,
-                        sweepEikonalDiagonalChunk(
-                                arrivalTimes,
-                                resolvedSlowness,
-                                field,
-                                sourceMask,
-                                xForward,
-                                yForward,
-                                zForward,
-                                diagonal,
-                                minXOrder,
-                                maxXOrder + 1,
-                                activeRowOffsets,
-                                activeRowLengths,
-                                activeRowIndices,
-                                neighborNegX,
-                                neighborPosX,
-                                neighborNegY,
-                                neighborPosY,
-                                neighborNegZ,
-                                neighborPosZ
-                        )
+                KrakkSweepChunkResult chunkResult = sweepKrakkDiagonalChunk(
+                        arrivalTimes,
+                        resolvedSlowness,
+                        field,
+                        sourceMask,
+                        xForward,
+                        yForward,
+                        zForward,
+                        diagonal,
+                        minXOrder,
+                        maxXOrder + 1,
+                        activeRowOffsets,
+                        activeRowLengths,
+                        activeRowIndices,
+                        neighborNegX,
+                        neighborPosX,
+                        neighborNegY,
+                        neighborPosY,
+                        neighborNegZ,
+                        neighborPosZ,
+                        activeRowsMask
                 );
+                maxDelta = Math.max(maxDelta, chunkResult.maxDelta());
+                mergeKrakkDirtyRows(dirtyRowsOut, chunkResult.dirtyRows());
                 continue;
             }
 
             int chunkSize = (rowSpan + taskCount - 1) / taskCount;
-            ArrayList<Future<Double>> futures = new ArrayList<>(taskCount);
+            ArrayList<Future<KrakkSweepChunkResult>> futures = new ArrayList<>(taskCount);
             final int diagonalIndex = diagonal;
             for (int taskIndex = 0; taskIndex < taskCount; taskIndex++) {
                 int startXOrder = minXOrder + (taskIndex * chunkSize);
@@ -2085,7 +2149,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 final int chunkStartXOrder = startXOrder;
                 final int chunkEndXOrder = endXOrder;
                 futures.add(VOLUMETRIC_TARGET_SCAN_POOL.submit(
-                        () -> sweepEikonalDiagonalChunk(
+                        () -> sweepKrakkDiagonalChunk(
                                 arrivalTimes,
                                 resolvedSlowness,
                                 field,
@@ -2104,47 +2168,52 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                 neighborNegY,
                                 neighborPosY,
                                 neighborNegZ,
-                                neighborPosZ
+                                neighborPosZ,
+                                activeRowsMask
                         )
                 ));
             }
 
             try {
-                for (Future<Double> future : futures) {
-                    maxDelta = Math.max(maxDelta, future.get());
+                for (Future<KrakkSweepChunkResult> future : futures) {
+                    KrakkSweepChunkResult chunkResult = future.get();
+                    maxDelta = Math.max(maxDelta, chunkResult.maxDelta());
+                    mergeKrakkDirtyRows(dirtyRowsOut, chunkResult.dirtyRows());
                 }
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
-                cancelEikonalSweepFutures(futures);
+                cancelKrakkSweepFutures(futures);
             } catch (ExecutionException exception) {
-                cancelEikonalSweepFutures(futures);
+                cancelKrakkSweepFutures(futures);
             }
         }
         return maxDelta;
     }
 
-    private static double sweepEikonalDiagonalChunk(float[] arrivalTimes,
-                                                    float[] resolvedSlowness,
-                                                    EikonalField field,
-                                                    BitSet sourceMask,
-                                                    boolean xForward,
-                                                    boolean yForward,
-                                                    boolean zForward,
-                                                    int diagonal,
-                                                    int startXOrderInclusive,
-                                                    int endXOrderExclusive,
-                                                    int[] activeRowOffsets,
-                                                    int[] activeRowLengths,
-                                                    int[] activeRowIndices,
-                                                    int[] neighborNegX,
-                                                    int[] neighborPosX,
-                                                    int[] neighborNegY,
-                                                    int[] neighborPosY,
-                                                    int[] neighborNegZ,
-                                                    int[] neighborPosZ) {
+    private static KrakkSweepChunkResult sweepKrakkDiagonalChunk(float[] arrivalTimes,
+                                                                     float[] resolvedSlowness,
+                                                                     KrakkField field,
+                                                                     BitSet sourceMask,
+                                                                     boolean xForward,
+                                                                     boolean yForward,
+                                                                     boolean zForward,
+                                                                     int diagonal,
+                                                                     int startXOrderInclusive,
+                                                                     int endXOrderExclusive,
+                                                                     int[] activeRowOffsets,
+                                                                     int[] activeRowLengths,
+                                                                     int[] activeRowIndices,
+                                                                     int[] neighborNegX,
+                                                                     int[] neighborPosX,
+                                                                     int[] neighborNegY,
+                                                                     int[] neighborPosY,
+                                                                     int[] neighborNegZ,
+                                                                     int[] neighborPosZ,
+                                                                     BitSet activeRowsMask) {
         int sizeX = field.sizeX();
         int sizeY = field.sizeY();
         double maxDelta = 0.0D;
+        IntArrayList dirtyRows = new IntArrayList(Math.max(4, endXOrderExclusive - startXOrderInclusive));
         for (int xOrder = startXOrderInclusive; xOrder < endXOrderExclusive; xOrder++) {
             int yOrder = diagonal - xOrder;
             if (yOrder < 0 || yOrder >= sizeY) {
@@ -2152,12 +2221,16 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             }
             int x = xForward ? xOrder : (sizeX - 1 - xOrder);
             int y = yForward ? yOrder : (sizeY - 1 - yOrder);
-            int rowIndex = eikonalRowIndex(x, y, sizeY);
+            int rowIndex = krakkRowIndex(x, y, sizeY);
+            if (activeRowsMask != null && !activeRowsMask.get(rowIndex)) {
+                continue;
+            }
             int rowOffset = activeRowOffsets[rowIndex];
             int rowLength = activeRowLengths[rowIndex];
             if (rowLength <= 0) {
                 continue;
             }
+            boolean rowChanged = false;
             if (zForward) {
                 int rowEnd = rowOffset + rowLength;
                 for (int i = rowOffset; i < rowEnd; i++) {
@@ -2165,7 +2238,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     if (sourceMask.get(index)) {
                         continue;
                     }
-                    double candidate = solveEikonalCell(
+                    double candidate = solveKrakkCell(
                             arrivalTimes,
                             resolvedSlowness,
                             index,
@@ -2182,12 +2255,16 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     double previous = arrivalTimes[index];
                     if (candidate + 1.0E-9D < previous) {
                         arrivalTimes[index] = (float) candidate;
+                        rowChanged = true;
                         if (Double.isFinite(previous)) {
                             maxDelta = Math.max(maxDelta, previous - candidate);
                         } else {
                             maxDelta = Math.max(maxDelta, candidate);
                         }
                     }
+                }
+                if (rowChanged) {
+                    dirtyRows.add(rowIndex);
                 }
                 continue;
             }
@@ -2196,7 +2273,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 if (sourceMask.get(index)) {
                     continue;
                 }
-                double candidate = solveEikonalCell(
+                double candidate = solveKrakkCell(
                         arrivalTimes,
                         resolvedSlowness,
                         index,
@@ -2213,6 +2290,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 double previous = arrivalTimes[index];
                 if (candidate + 1.0E-9D < previous) {
                     arrivalTimes[index] = (float) candidate;
+                    rowChanged = true;
                     if (Double.isFinite(previous)) {
                         maxDelta = Math.max(maxDelta, previous - candidate);
                     } else {
@@ -2220,11 +2298,23 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     }
                 }
             }
+            if (rowChanged) {
+                dirtyRows.add(rowIndex);
+            }
         }
-        return maxDelta;
+        return new KrakkSweepChunkResult(maxDelta, dirtyRows);
     }
 
-    private static double solveEikonalCell(float[] arrivalTimes,
+    private static void mergeKrakkDirtyRows(BitSet dirtyRowsOut, IntArrayList dirtyRows) {
+        if (dirtyRowsOut == null || dirtyRows == null || dirtyRows.isEmpty()) {
+            return;
+        }
+        for (int i = 0; i < dirtyRows.size(); i++) {
+            dirtyRowsOut.set(dirtyRows.getInt(i));
+        }
+    }
+
+    private static double solveKrakkCell(float[] arrivalTimes,
                                            float[] resolvedSlowness,
                                            int index,
                                            int[] neighborNegX,
@@ -2266,10 +2356,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         if (!Double.isFinite(a) && !Double.isFinite(b) && !Double.isFinite(c)) {
             return Double.POSITIVE_INFINITY;
         }
-        return solveEikonalDistance(a, b, c, resolvedSlowness[index]);
+        return solveKrakkDistance(a, b, c, resolvedSlowness[index]);
     }
 
-    private static double solveEikonalCellFromAccepted(float[] arrivalTimes,
+    private static double solveKrakkCellFromAccepted(float[] arrivalTimes,
                                                        float[] resolvedSlowness,
                                                        BitSet accepted,
                                                        int index,
@@ -2279,21 +2369,21 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                        int[] neighborPosY,
                                                        int[] neighborNegZ,
                                                        int[] neighborPosZ) {
-        double a = minAcceptedEikonalAxisNeighbor(
+        double a = minAcceptedKrakkAxisNeighbor(
                 arrivalTimes,
                 resolvedSlowness,
                 accepted,
                 neighborNegX[index],
                 neighborPosX[index]
         );
-        double b = minAcceptedEikonalAxisNeighbor(
+        double b = minAcceptedKrakkAxisNeighbor(
                 arrivalTimes,
                 resolvedSlowness,
                 accepted,
                 neighborNegY[index],
                 neighborPosY[index]
         );
-        double c = minAcceptedEikonalAxisNeighbor(
+        double c = minAcceptedKrakkAxisNeighbor(
                 arrivalTimes,
                 resolvedSlowness,
                 accepted,
@@ -2303,13 +2393,13 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         if (!Double.isFinite(a) && !Double.isFinite(b) && !Double.isFinite(c)) {
             return Double.POSITIVE_INFINITY;
         }
-        return solveEikonalDistance(a, b, c, resolvedSlowness[index]);
+        return solveKrakkDistance(a, b, c, resolvedSlowness[index]);
     }
 
-    private static void updateEikonalNeighborFromAccepted(float[] arrivalTimes,
+    private static void updateKrakkNeighborFromAccepted(float[] arrivalTimes,
                                                           float[] resolvedSlowness,
                                                           BitSet accepted,
-                                                          EikonalMinHeap heap,
+                                                          KrakkMinHeap heap,
                                                           int neighborIndex,
                                                           int[] neighborNegX,
                                                           int[] neighborPosX,
@@ -2320,7 +2410,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         if (neighborIndex < 0 || accepted.get(neighborIndex) || resolvedSlowness[neighborIndex] <= 0.0F) {
             return;
         }
-        double candidate = solveEikonalCellFromAccepted(
+        double candidate = solveKrakkCellFromAccepted(
                 arrivalTimes,
                 resolvedSlowness,
                 accepted,
@@ -2341,7 +2431,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
     }
 
-    private static double minAcceptedEikonalAxisNeighbor(float[] arrivalTimes,
+    private static double minAcceptedKrakkAxisNeighbor(float[] arrivalTimes,
                                                          float[] resolvedSlowness,
                                                          BitSet accepted,
                                                          int negativeIndex,
@@ -2356,7 +2446,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return min;
     }
 
-    private static double solveEikonalDistance(double a, double b, double c, double slowness) {
+    private static double solveKrakkDistance(double a, double b, double c, double slowness) {
         double t0 = a;
         double t1 = b;
         double t2 = c;
@@ -2410,11 +2500,11 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return value * value;
     }
 
-    private static int eikonalGridIndex(int xOffset, int yOffset, int zOffset, int sizeY, int sizeZ) {
+    private static int krakkGridIndex(int xOffset, int yOffset, int zOffset, int sizeY, int sizeZ) {
         return ((xOffset * sizeY) + yOffset) * sizeZ + zOffset;
     }
 
-    private static int eikonalRowIndex(int xOffset, int yOffset, int sizeY) {
+    private static int krakkRowIndex(int xOffset, int yOffset, int sizeY) {
         return (xOffset * sizeY) + yOffset;
     }
 
@@ -2430,6 +2520,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                     int minZ,
                                                     int maxZ,
                                                     LongArrayList candidateSolidPositions,
+                                                    Long2FloatOpenHashMap collapseWeightsByPos,
+                                                    double impactBudget,
+                                                    double normalizationWeight,
                                                     Entity source,
                                                     LivingEntity owner,
                                                     boolean applyWorldChanges,
@@ -2438,6 +2531,12 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             return;
         }
         if (candidateSolidPositions.isEmpty()) {
+            return;
+        }
+        if (collapseWeightsByPos == null
+                || collapseWeightsByPos.isEmpty()
+                || impactBudget <= MIN_RESOLVED_RAY_IMPACT
+                || normalizationWeight <= VOLUMETRIC_MIN_ENERGY) {
             return;
         }
 
@@ -2453,6 +2552,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         BitSet unsupportedMask = new BitSet((int) volumeLong);
         IntArrayList bfsQueue = new IntArrayList(Math.max(64, candidateSolidPositions.size() / 32));
         BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        long collapseSeedStart = trace != null ? System.nanoTime() : 0L;
         for (int i = 0; i < candidateSolidPositions.size(); i++) {
             long posLong = candidateSolidPositions.getLong(i);
             int x = BlockPos.getX(posLong);
@@ -2462,7 +2562,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 continue;
             }
 
-            int index = eikonalGridIndex(x - minX, y - minY, z - minZ, sizeY, sizeZ);
+            int index = krakkGridIndex(x - minX, y - minY, z - minZ, sizeY, sizeZ);
             if (unsupportedMask.get(index)) {
                 continue;
             }
@@ -2478,7 +2578,11 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 bfsQueue.add(index);
             }
         }
+        if (trace != null) {
+            trace.volumetricImpactApplyCollapseSeedNanos += (System.nanoTime() - collapseSeedStart);
+        }
 
+        long collapseBfsStart = trace != null ? System.nanoTime() : 0L;
         for (int head = 0; head < bfsQueue.size(); head++) {
             int index = bfsQueue.getInt(head);
             int xOffset = index / yzStride;
@@ -2529,28 +2633,44 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 }
             }
         }
+        if (trace != null) {
+            trace.volumetricImpactApplyCollapseBfsNanos += (System.nanoTime() - collapseBfsStart);
+        }
 
         if (unsupportedMask.isEmpty()) {
             return;
         }
 
+        double collapseImpactScale = (impactBudget / normalizationWeight) * STRUCTURAL_COLLAPSE_IMPACT_WEIGHT_SCALE;
         BlockPos.MutableBlockPos collapsePos = new BlockPos.MutableBlockPos();
+        long collapseApplyStart = trace != null ? System.nanoTime() : 0L;
         for (int index = unsupportedMask.nextSetBit(0); index >= 0; index = unsupportedMask.nextSetBit(index + 1)) {
             int xOffset = index / yzStride;
             int rem = index - (xOffset * yzStride);
             int yOffset = rem / sizeZ;
             int zOffset = rem - (yOffset * sizeZ);
             long posLong = BlockPos.asLong(minX + xOffset, minY + yOffset, minZ + zOffset);
+            float collapseWeight = collapseWeightsByPos.get(posLong);
+            if (collapseWeight <= VOLUMETRIC_MIN_ENERGY) {
+                continue;
+            }
+            double collapseImpactPower = collapseImpactScale * collapseWeight;
+            if (collapseImpactPower <= MIN_RESOLVED_RAY_IMPACT) {
+                continue;
+            }
             applySingleBlockImpact(
                     level,
                     collapsePos,
                     posLong,
-                    STRUCTURAL_COLLAPSE_IMPACT_POWER,
+                    collapseImpactPower,
                     source,
                     owner,
                     applyWorldChanges,
                     trace
             );
+        }
+        if (trace != null) {
+            trace.volumetricImpactApplyCollapseApplyNanos += (System.nanoTime() - collapseApplyStart);
         }
     }
 
@@ -2771,24 +2891,35 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         double impactBudget = totalEnergy * VOLUMETRIC_IMPACT_POWER_PER_ENERGY * powerScale;
         double airNormalizationScale = computeVolumetricAirNormalizationScale(sampledSolidCount, sampledVoxelCount);
         double normalizationWeight = solidWeight * airNormalizationScale;
+        Long2FloatOpenHashMap collapseWeightsByPos = new Long2FloatOpenHashMap(Math.max(16, targetPositions.size()));
+        collapseWeightsByPos.defaultReturnValue(0.0F);
         BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
         long impactApplyStart = trace != null ? System.nanoTime() : 0L;
+        long impactApplyDirectStart = trace != null ? System.nanoTime() : 0L;
         for (int i = 0; i < targetPositions.size(); i++) {
+            long targetPosLong = targetPositions.getLong(i);
             double weight = targetWeights.getFloat(i);
             if (weight <= VOLUMETRIC_MIN_ENERGY) {
                 continue;
+            }
+            float existingCollapseWeight = collapseWeightsByPos.get(targetPosLong);
+            if (weight > existingCollapseWeight) {
+                collapseWeightsByPos.put(targetPosLong, (float) weight);
             }
             double impactPower = impactBudget * (weight / normalizationWeight);
             applySingleBlockImpact(
                     level,
                     mutablePos,
-                    targetPositions.getLong(i),
+                    targetPosLong,
                     impactPower,
                     source,
                     owner,
                     applyWorldChanges,
                     trace
             );
+        }
+        if (trace != null) {
+            trace.volumetricImpactApplyDirectNanos += (System.nanoTime() - impactApplyDirectStart);
         }
         applyStructuralCollapsePass(
                 level,
@@ -2803,6 +2934,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 minZ,
                 maxZ,
                 solidPositions,
+                collapseWeightsByPos,
+                impactBudget,
+                normalizationWeight,
                 source,
                 owner,
                 applyWorldChanges,
@@ -3043,7 +3177,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return new VolumetricResistanceFieldChunkResult(localPositions, localResistance, sampledVoxelCount);
     }
 
-    private static EikonalResistanceFieldChunkResult sampleEikonalFieldChunk(ServerLevel level,
+    private static KrakkResistanceFieldChunkResult sampleKrakkFieldChunk(ServerLevel level,
                                                                              double centerX,
                                                                              double centerY,
                                                                              double centerZ,
@@ -3067,14 +3201,14 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         LongArrayList localSolidPositions = new LongArrayList(Math.max(16, (endXOffsetExclusive - startXOffsetInclusive) * sizeY));
         BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
         int sampledVoxelCount = 0;
-        float airSlowness = (float) EIKONAL_AIR_SLOWNESS;
-        float solidScale = (float) EIKONAL_SOLID_SLOWNESS_SCALE;
+        float airSlowness = (float) KRAKK_AIR_SLOWNESS;
+        float solidScale = (float) KRAKK_SOLID_SLOWNESS_SCALE;
         for (int xOffset = startXOffsetInclusive; xOffset < endXOffsetExclusive; xOffset++) {
             int x = minX + xOffset;
             int baseX = xOffset * sizeY * sizeZ;
             for (int yOffset = 0; yOffset < sizeY; yOffset++) {
                 int y = minY + yOffset;
-                int rowIndex = eikonalRowIndex(xOffset, yOffset, sizeY);
+                int rowIndex = krakkRowIndex(xOffset, yOffset, sizeY);
                 int baseIndex = baseX + (yOffset * sizeZ);
                 int rowActiveCount = 0;
                 for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
@@ -3106,7 +3240,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 activeCountByRow[rowIndex] = rowActiveCount;
             }
         }
-        return new EikonalResistanceFieldChunkResult(localSolidPositions, sampledVoxelCount);
+        return new KrakkResistanceFieldChunkResult(localSolidPositions, sampledVoxelCount);
     }
 
     private static ResistanceFieldSnapshot sampleResistanceFieldSnapshot(ServerLevel level,
@@ -3205,7 +3339,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return new VolumetricResistanceFieldChunkResult(localPositions, localResistance, sampledVoxelCount);
     }
 
-    private static EikonalResistanceFieldChunkResult sampleEikonalFieldChunk(ResistanceFieldSnapshot resistanceFieldSnapshot,
+    private static KrakkResistanceFieldChunkResult sampleKrakkFieldChunk(ResistanceFieldSnapshot resistanceFieldSnapshot,
                                                                              int minX,
                                                                              int minY,
                                                                              int minZ,
@@ -3225,14 +3359,14 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         LongArrayList localSolidPositions = new LongArrayList(Math.max(16, (endXOffsetExclusive - startXOffsetInclusive) * sizeY));
         BlockState[] sampledStates = resistanceFieldSnapshot.sampledStates();
         int sampledVoxelCount = 0;
-        float airSlowness = (float) EIKONAL_AIR_SLOWNESS;
-        float solidScale = (float) EIKONAL_SOLID_SLOWNESS_SCALE;
+        float airSlowness = (float) KRAKK_AIR_SLOWNESS;
+        float solidScale = (float) KRAKK_SOLID_SLOWNESS_SCALE;
         for (int xOffset = startXOffsetInclusive; xOffset < endXOffsetExclusive; xOffset++) {
             int x = minX + xOffset;
             int baseX = xOffset * sizeY * sizeZ;
             for (int yOffset = 0; yOffset < sizeY; yOffset++) {
                 int y = minY + yOffset;
-                int rowIndex = eikonalRowIndex(xOffset, yOffset, sizeY);
+                int rowIndex = krakkRowIndex(xOffset, yOffset, sizeY);
                 int baseIndex = baseX + (yOffset * sizeZ);
                 int rowActiveCount = 0;
                 for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
@@ -3256,21 +3390,26 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 activeCountByRow[rowIndex] = rowActiveCount;
             }
         }
-        return new EikonalResistanceFieldChunkResult(localSolidPositions, sampledVoxelCount);
+        return new KrakkResistanceFieldChunkResult(localSolidPositions, sampledVoxelCount);
     }
 
     private static int resolveResistanceFieldTaskCount(int sizeX, int sizeY, int sizeZ) {
         if (!parallelResistanceFieldSamplingEnabled || VOLUMETRIC_TARGET_SCAN_POOL == null) {
             return 1;
         }
+        if (sizeX < RESISTANCE_FIELD_MIN_COLUMNS_FOR_PARALLEL) {
+            return 1;
+        }
         long voxelCount = (long) sizeX * (long) sizeY * (long) sizeZ;
         if (voxelCount < RESISTANCE_FIELD_MIN_VOXELS_FOR_PARALLEL) {
             return 1;
         }
-        int tasksByColumns = Math.max(1, (sizeX + RESISTANCE_FIELD_COLUMNS_PER_TASK - 1) / RESISTANCE_FIELD_COLUMNS_PER_TASK);
-        int tasksByWorkers = Math.max(1, VOLUMETRIC_TARGET_SCAN_PARALLELISM * 2);
-        int taskCount = Math.min(tasksByColumns, tasksByWorkers);
-        return Math.max(1, Math.min(RESISTANCE_FIELD_MAX_TASKS, taskCount));
+        int tasksByColumns = Math.max(1, sizeX / RESISTANCE_FIELD_COLUMNS_PER_TASK);
+        int tasksByVoxels = (int) Math.max(1L, voxelCount / RESISTANCE_FIELD_MIN_VOXELS_PER_TASK);
+        int tasksByWorkers = Math.max(1, VOLUMETRIC_TARGET_SCAN_PARALLELISM);
+        int taskCount = Math.min(tasksByColumns, Math.min(tasksByVoxels, tasksByWorkers));
+        taskCount = Math.min(taskCount, RESISTANCE_FIELD_MAX_TASKS);
+        return taskCount >= 2 ? taskCount : 1;
     }
 
     private static void cancelVolumetricResistanceFieldFutures(List<Future<VolumetricResistanceFieldChunkResult>> futures) {
@@ -3279,24 +3418,24 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
     }
 
-    private static void cancelEikonalResistanceFieldFutures(List<Future<EikonalResistanceFieldChunkResult>> futures) {
-        for (Future<EikonalResistanceFieldChunkResult> future : futures) {
+    private static void cancelKrakkResistanceFieldFutures(List<Future<KrakkResistanceFieldChunkResult>> futures) {
+        for (Future<KrakkResistanceFieldChunkResult> future : futures) {
             future.cancel(true);
         }
     }
 
-    private static int resolveEikonalSweepTaskCount(int rowSpan) {
-        if (VOLUMETRIC_TARGET_SCAN_POOL == null || rowSpan < EIKONAL_SWEEP_MIN_ROWS_FOR_PARALLEL) {
+    private static int resolveKrakkSweepTaskCount(int rowSpan) {
+        if (VOLUMETRIC_TARGET_SCAN_POOL == null || rowSpan < KRAKK_SWEEP_MIN_ROWS_FOR_PARALLEL) {
             return 1;
         }
-        int tasksBySize = Math.max(1, (rowSpan + EIKONAL_SWEEP_ROWS_PER_TASK - 1) / EIKONAL_SWEEP_ROWS_PER_TASK);
+        int tasksBySize = Math.max(1, (rowSpan + KRAKK_SWEEP_ROWS_PER_TASK - 1) / KRAKK_SWEEP_ROWS_PER_TASK);
         int tasksByWorkers = Math.max(1, VOLUMETRIC_TARGET_SCAN_PARALLELISM);
         int taskCount = Math.min(tasksBySize, tasksByWorkers);
-        return Math.max(1, Math.min(EIKONAL_SWEEP_MAX_TASKS, taskCount));
+        return Math.max(1, Math.min(KRAKK_SWEEP_MAX_TASKS, taskCount));
     }
 
-    private static void cancelEikonalSweepFutures(List<Future<Double>> futures) {
-        for (Future<Double> future : futures) {
+    private static void cancelKrakkSweepFutures(List<? extends Future<?>> futures) {
+        for (Future<?> future : futures) {
             future.cancel(true);
         }
     }
@@ -3362,6 +3501,23 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         FloatArrayList targetWeights = new FloatArrayList(expectedTargets);
         long precheckNanos = 0L;
         long blendNanos = 0L;
+        double centerX = context.centerX();
+        double centerY = context.centerY();
+        double centerZ = context.centerZ();
+        double radialStepSize = Math.max(context.radialStepSize(), 1.0E-9D);
+        double invRadialStepSize = 1.0D / radialStepSize;
+        double resolvedRadius = Math.max(context.resolvedRadius(), 1.0E-9D);
+        double invResolvedRadius = 1.0D / resolvedRadius;
+        int radialSteps = context.radialSteps();
+        float[] maxPressureByShell = context.maxPressureByShell();
+        float[] pressureByShell = context.pressureByShell();
+        int directionCount = context.directionCount();
+        double[] dirX = context.dirX();
+        double[] dirY = context.dirY();
+        double[] dirZ = context.dirZ();
+        int[][] directionNeighbors = context.directionNeighbors();
+        int[] directionLookup = context.directionLookup();
+        int directionLookupResolution = context.directionLookupResolution();
         for (int i = startInclusive; i < endExclusive; i++) {
             long posLong = solidPositions.getLong(i);
             int x = BlockPos.getX(posLong);
@@ -3369,12 +3525,12 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             int z = BlockPos.getZ(posLong);
             long precheckStart = profileSubstages ? System.nanoTime() : 0L;
 
-            double dx = (x + 0.5D) - context.centerX();
-            double dy = (y + 0.5D) - context.centerY();
-            double dz = (z + 0.5D) - context.centerZ();
+            double dx = (x + 0.5D) - centerX;
+            double dy = (y + 0.5D) - centerY;
+            double dz = (z + 0.5D) - centerZ;
             double distSq = (dx * dx) + (dy * dy) + (dz * dz);
             double dist = Math.sqrt(distSq);
-            double shellPosition = dist / Math.max(context.radialStepSize(), 1.0E-9D);
+            double shellPosition = dist * invRadialStepSize;
             double nx;
             double ny;
             double nz;
@@ -3383,22 +3539,23 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 ny = 1.0D;
                 nz = 0.0D;
             } else {
-                nx = dx / dist;
-                ny = dy / dist;
-                nz = dz / dist;
+                double invDist = 1.0D / dist;
+                nx = dx * invDist;
+                ny = dy * invDist;
+                nz = dz * invDist;
             }
-            double radialFraction = dist / Math.max(context.resolvedRadius(), 1.0E-9D);
+            double radialFraction = dist * invResolvedRadius;
             if (radialFraction >= VOLUMETRIC_EDGE_SPIKE_START_FRACTION) {
                 double edgeRadiusScale = computeVolumetricEdgeRadiusScale(
-                        context.centerX(),
-                        context.centerY(),
-                        context.centerZ(),
+                        centerX,
+                        centerY,
+                        centerZ,
                         radialFraction,
                         nx,
                         ny,
                         nz
                 );
-                radialFraction = dist / Math.max(context.resolvedRadius() * edgeRadiusScale, 1.0E-9D);
+                radialFraction = dist / Math.max(resolvedRadius * edgeRadiusScale, 1.0E-9D);
             }
             if (radialFraction >= 1.0D) {
                 if (profileSubstages) {
@@ -3428,15 +3585,17 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 continue;
             }
 
-            double clampedShell = Mth.clamp(shellPosition, 0.0D, context.radialSteps());
-            int lowerShell = Mth.floor(clampedShell);
-            int upperShell = Math.min(context.radialSteps(), lowerShell + 1);
+            double clampedShell = shellPosition;
+            if (clampedShell < 0.0D) {
+                clampedShell = 0.0D;
+            } else if (clampedShell > radialSteps) {
+                clampedShell = radialSteps;
+            }
+            int lowerShell = (int) clampedShell;
+            int upperShell = lowerShell < radialSteps ? (lowerShell + 1) : radialSteps;
             double shellAlpha = clampedShell - lowerShell;
-            double shellPressureUpper = Mth.lerp(
-                    shellAlpha,
-                    context.maxPressureByShell()[lowerShell],
-                    context.maxPressureByShell()[upperShell]
-            );
+            double lowerShellPressure = maxPressureByShell[lowerShell];
+            double shellPressureUpper = lowerShellPressure + ((maxPressureByShell[upperShell] - lowerShellPressure) * shellAlpha);
             if ((maxWeight * shellPressureUpper) <= VOLUMETRIC_MIN_ENERGY) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
@@ -3450,22 +3609,27 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
             long blendStart = profileSubstages ? System.nanoTime() : 0L;
             double localPressure = sampleBlendedVolumetricPressure(
-                    context.pressureByShell(),
-                    context.directionCount(),
-                    lowerShell * context.directionCount(),
-                    upperShell * context.directionCount(),
+                    pressureByShell,
+                    directionCount,
+                    lowerShell * directionCount,
+                    upperShell * directionCount,
                     shellAlpha,
                     nx,
                     ny,
                     nz,
-                    context.dirX(),
-                    context.dirY(),
-                    context.dirZ(),
-                    context.directionNeighbors(),
-                    context.directionLookup(),
-                    context.directionLookupResolution()
+                    dirX,
+                    dirY,
+                    dirZ,
+                    directionNeighbors,
+                    directionLookup,
+                    directionLookupResolution
             );
-            double pressureFactor = Mth.clamp(localPressure, 0.0D, 1.0D);
+            double pressureFactor = localPressure;
+            if (pressureFactor < 0.0D) {
+                pressureFactor = 0.0D;
+            } else if (pressureFactor > 1.0D) {
+                pressureFactor = 1.0D;
+            }
             double weight = maxWeight * pressureFactor;
             if (profileSubstages) {
                 blendNanos += (System.nanoTime() - blendStart);
@@ -3496,11 +3660,11 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
     }
 
-    private static EikonalTargetScanResult scanEikonalTargets(LongArrayList solidPositions,
+    private static KrakkTargetScanResult scanKrakkTargets(LongArrayList solidPositions,
                                                               float[] volumetricBaselineByIndex,
                                                               float[] arrivalTimes,
                                                               float[] shadowArrivalTimes,
-                                                              EikonalField eikonalField,
+                                                              KrakkField krakkField,
                                                               double centerX,
                                                               double centerY,
                                                               double centerZ,
@@ -3508,16 +3672,16 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                               boolean allowParallel,
                                                               boolean profileSubstages) {
         int solidCount = solidPositions.size();
-        int taskCount = resolveEikonalTargetScanTaskCount(solidCount);
+        int taskCount = resolveKrakkTargetScanTaskCount(solidCount);
         if (!allowParallel || taskCount <= 1 || VOLUMETRIC_TARGET_SCAN_POOL == null) {
-            return scanEikonalTargetScanChunk(
+            return scanKrakkTargetScanChunk(
                     solidPositions,
                     0,
                     solidCount,
                     volumetricBaselineByIndex,
                     arrivalTimes,
                     shadowArrivalTimes,
-                    eikonalField,
+                    krakkField,
                     centerX,
                     centerY,
                     centerZ,
@@ -3527,7 +3691,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
 
         int chunkSize = (solidCount + taskCount - 1) / taskCount;
-        ArrayList<Future<EikonalTargetScanResult>> futures = new ArrayList<>(taskCount);
+        ArrayList<Future<KrakkTargetScanResult>> futures = new ArrayList<>(taskCount);
         for (int taskIndex = 0; taskIndex < taskCount; taskIndex++) {
             int startIndex = taskIndex * chunkSize;
             int endIndex = Math.min(solidCount, startIndex + chunkSize);
@@ -3537,14 +3701,14 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             final int chunkStart = startIndex;
             final int chunkEnd = endIndex;
             futures.add(VOLUMETRIC_TARGET_SCAN_POOL.submit(
-                    () -> scanEikonalTargetScanChunk(
+                    () -> scanKrakkTargetScanChunk(
                             solidPositions,
                             chunkStart,
                             chunkEnd,
                             volumetricBaselineByIndex,
                             arrivalTimes,
                             shadowArrivalTimes,
-                            eikonalField,
+                            krakkField,
                             centerX,
                             centerY,
                             centerZ,
@@ -3559,8 +3723,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         double solidWeight = 0.0D;
         long precheckNanos = 0L;
         try {
-            for (Future<EikonalTargetScanResult> future : futures) {
-                EikonalTargetScanResult chunkResult = future.get();
+            for (Future<KrakkTargetScanResult> future : futures) {
+                KrakkTargetScanResult chunkResult = future.get();
                 precheckNanos += chunkResult.precheckNanos();
                 solidWeight += chunkResult.solidWeight();
                 LongArrayList chunkPositions = chunkResult.targetPositions();
@@ -3570,21 +3734,21 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     mergedWeights.add(chunkWeights.getFloat(i));
                 }
             }
-            return new EikonalTargetScanResult(mergedPositions, mergedWeights, solidWeight, precheckNanos);
+            return new KrakkTargetScanResult(mergedPositions, mergedWeights, solidWeight, precheckNanos);
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-            cancelEikonalTargetScanFutures(futures);
+            cancelKrakkTargetScanFutures(futures);
         } catch (ExecutionException exception) {
-            cancelEikonalTargetScanFutures(futures);
+            cancelKrakkTargetScanFutures(futures);
         }
-        return scanEikonalTargetScanChunk(
+        return scanKrakkTargetScanChunk(
                 solidPositions,
                 0,
                 solidCount,
                 volumetricBaselineByIndex,
                 arrivalTimes,
                 shadowArrivalTimes,
-                eikonalField,
+                krakkField,
                 centerX,
                 centerY,
                 centerZ,
@@ -3593,13 +3757,13 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         );
     }
 
-    private static EikonalTargetScanResult scanEikonalTargetScanChunk(LongArrayList solidPositions,
+    private static KrakkTargetScanResult scanKrakkTargetScanChunk(LongArrayList solidPositions,
                                                                        int startInclusive,
                                                                        int endExclusive,
                                                                        float[] volumetricBaselineByIndex,
                                                                        float[] arrivalTimes,
                                                                        float[] shadowArrivalTimes,
-                                                                       EikonalField eikonalField,
+                                                                       KrakkField krakkField,
                                                                        double centerX,
                                                                        double centerY,
                                                                        double centerZ,
@@ -3610,18 +3774,18 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         FloatArrayList targetWeights = new FloatArrayList(expectedTargets);
         long precheckNanos = 0L;
         double solidWeight = 0.0D;
-        int fieldMinX = eikonalField.minX();
-        int fieldMinY = eikonalField.minY();
-        int fieldMinZ = eikonalField.minZ();
-        int fieldSizeY = eikonalField.sizeY();
-        int fieldSizeZ = eikonalField.sizeZ();
+        int fieldMinX = krakkField.minX();
+        int fieldMinY = krakkField.minY();
+        int fieldMinZ = krakkField.minZ();
+        int fieldSizeY = krakkField.sizeY();
+        int fieldSizeZ = krakkField.sizeZ();
         for (int i = startInclusive; i < endExclusive; i++) {
             long posLong = solidPositions.getLong(i);
             long precheckStart = profileSubstages ? System.nanoTime() : 0L;
             float baselineWeight = i >= 0 && i < volumetricBaselineByIndex.length
                     ? volumetricBaselineByIndex[i]
                     : Float.NaN;
-            if (!Float.isFinite(baselineWeight) || baselineWeight <= EIKONAL_TARGET_MIN_WEIGHT) {
+            if (!Float.isFinite(baselineWeight) || baselineWeight <= KRAKK_TARGET_MIN_WEIGHT) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
                 }
@@ -3630,7 +3794,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             int x = BlockPos.getX(posLong);
             int y = BlockPos.getY(posLong);
             int z = BlockPos.getZ(posLong);
-            int index = eikonalGridIndex(
+            int index = krakkGridIndex(
                     x - fieldMinX,
                     y - fieldMinY,
                     z - fieldMinZ,
@@ -3651,7 +3815,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 }
                 continue;
             }
-            double airArrival = computeAnalyticEikonalAirArrival(centerX, centerY, centerZ, x, y, z);
+            double airArrival = computeAnalyticKrakkAirArrival(centerX, centerY, centerZ, x, y, z);
             if (!Double.isFinite(airArrival)) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
@@ -3659,19 +3823,19 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 continue;
             }
             double resistanceOverrun = Math.max(0.0D, arrival - airArrival);
-            double effectiveOverrun = Math.max(0.0D, resistanceOverrun - EIKONAL_OVERRUN_DEADZONE);
+            double effectiveOverrun = Math.max(0.0D, resistanceOverrun - KRAKK_OVERRUN_DEADZONE);
             double normalizedOverrun = effectiveOverrun / Math.max(1.0D, airArrival);
-            if (normalizedOverrun >= EIKONAL_HARD_BLOCK_NORMALIZED_OVERRUN) {
+            if (normalizedOverrun >= KRAKK_HARD_BLOCK_NORMALIZED_OVERRUN) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
                 }
                 continue;
             }
             double transmittance = Math.exp(
-                    -(effectiveOverrun * EIKONAL_RESISTANCE_ATTENUATION_PER_OVERRUN)
-                            - (normalizedOverrun * EIKONAL_RESISTANCE_NORMALIZED_ATTENUATION)
+                    -(effectiveOverrun * KRAKK_RESISTANCE_ATTENUATION_PER_OVERRUN)
+                            - (normalizedOverrun * KRAKK_RESISTANCE_NORMALIZED_ATTENUATION)
             );
-            if (transmittance <= EIKONAL_MIN_TRANSMITTANCE) {
+            if (transmittance <= KRAKK_MIN_TRANSMITTANCE) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
                 }
@@ -3685,52 +3849,52 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 continue;
             }
             double shadowOverrun = Math.max(0.0D, shadowArrival - arrival);
-            double effectiveShadowOverrun = Math.max(0.0D, shadowOverrun - EIKONAL_SHADOW_OVERRUN_DEADZONE);
+            double effectiveShadowOverrun = Math.max(0.0D, shadowOverrun - KRAKK_SHADOW_OVERRUN_DEADZONE);
             double normalizedShadowOverrun = effectiveShadowOverrun / Math.max(0.25D, airArrival);
-            if (normalizedShadowOverrun >= EIKONAL_HARD_BLOCK_SHADOW_NORMALIZED_OVERRUN) {
+            if (normalizedShadowOverrun >= KRAKK_HARD_BLOCK_SHADOW_NORMALIZED_OVERRUN) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
                 }
                 continue;
             }
             double shadowTransmittance = Math.exp(
-                    -(effectiveShadowOverrun * EIKONAL_SHADOW_ATTENUATION_PER_OVERRUN)
-                            - (normalizedShadowOverrun * EIKONAL_SHADOW_NORMALIZED_ATTENUATION)
+                    -(effectiveShadowOverrun * KRAKK_SHADOW_ATTENUATION_PER_OVERRUN)
+                            - (normalizedShadowOverrun * KRAKK_SHADOW_NORMALIZED_ATTENUATION)
             );
-            if (shadowTransmittance <= EIKONAL_MIN_TRANSMITTANCE) {
+            if (shadowTransmittance <= KRAKK_MIN_TRANSMITTANCE) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
                 }
                 continue;
             }
-            double eikEnvelope = Math.pow(normalized, EIKONAL_WEIGHT_EXPONENT);
-            double eikonalTransFactor = Mth.lerp(
-                    EIKONAL_ENVELOPE_TRANSMITTANCE_BLEND,
+            double eikEnvelope = Math.pow(normalized, KRAKK_WEIGHT_EXPONENT);
+            double krakkTransFactor = Mth.lerp(
+                    KRAKK_ENVELOPE_TRANSMITTANCE_BLEND,
                     1.0D,
                     transmittance * shadowTransmittance
             );
             double smoothingFactor = Mth.lerp(
-                    EIKONAL_BASELINE_SMOOTH_BLEND,
+                    KRAKK_BASELINE_SMOOTH_BLEND,
                     1.0D,
-                    eikEnvelope * eikonalTransFactor
+                    eikEnvelope * krakkTransFactor
             );
-            double cutoffRetention = computeEikonalCutoffEdgeRetention(normalized);
+            double cutoffRetention = computeKrakkCutoffEdgeRetention(normalized);
             double weight = baselineWeight * smoothingFactor * cutoffRetention;
-            if (weight <= EIKONAL_TARGET_MIN_WEIGHT) {
+            if (weight <= KRAKK_TARGET_MIN_WEIGHT) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
                 }
                 continue;
             }
             double sampledWeight = weight;
-            if (EIKONAL_ENABLE_LOW_WEIGHT_STOCHASTIC_SAMPLING
-                    && weight < EIKONAL_LOW_WEIGHT_STOCHASTIC_THRESHOLD) {
+            if (KRAKK_ENABLE_LOW_WEIGHT_STOCHASTIC_SAMPLING
+                    && weight < KRAKK_LOW_WEIGHT_STOCHASTIC_THRESHOLD) {
                 double keepProbability = Mth.clamp(
-                        weight / EIKONAL_LOW_WEIGHT_STOCHASTIC_THRESHOLD,
-                        EIKONAL_LOW_WEIGHT_STOCHASTIC_MIN_KEEP_PROBABILITY,
+                        weight / KRAKK_LOW_WEIGHT_STOCHASTIC_THRESHOLD,
+                        KRAKK_LOW_WEIGHT_STOCHASTIC_MIN_KEEP_PROBABILITY,
                         1.0D
                 );
-                double keepRoll = sampleEikonalLowWeightKeepNoise(x, y, z, centerX, centerY, centerZ);
+                double keepRoll = sampleKrakkLowWeightKeepNoise(x, y, z, centerX, centerY, centerZ);
                 if (keepRoll > keepProbability) {
                     if (profileSubstages) {
                         precheckNanos += (System.nanoTime() - precheckStart);
@@ -3746,10 +3910,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             targetWeights.add((float) sampledWeight);
             solidWeight += sampledWeight;
         }
-        return new EikonalTargetScanResult(targetPositions, targetWeights, solidWeight, precheckNanos);
+        return new KrakkTargetScanResult(targetPositions, targetWeights, solidWeight, precheckNanos);
     }
 
-    private static double sampleEikonalLowWeightKeepNoise(int x, int y, int z, double centerX, double centerY, double centerZ) {
+    private static double sampleKrakkLowWeightKeepNoise(int x, int y, int z, double centerX, double centerY, double centerZ) {
         int cx = Mth.floor(centerX * 2.0D);
         int cy = Mth.floor(centerY * 2.0D);
         int cz = Mth.floor(centerZ * 2.0D);
@@ -3768,18 +3932,18 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return ((hash >>> 11) & 0x1FFFFFL) / 2097151.0D;
     }
 
-    private static int resolveEikonalTargetScanTaskCount(int solidCount) {
-        if (VOLUMETRIC_TARGET_SCAN_POOL == null || solidCount < EIKONAL_TARGET_SCAN_MIN_SOLIDS_FOR_PARALLEL) {
+    private static int resolveKrakkTargetScanTaskCount(int solidCount) {
+        if (VOLUMETRIC_TARGET_SCAN_POOL == null || solidCount < KRAKK_TARGET_SCAN_MIN_SOLIDS_FOR_PARALLEL) {
             return 1;
         }
-        int tasksBySize = Math.max(1, (solidCount + EIKONAL_TARGET_SCAN_SOLIDS_PER_TASK - 1) / EIKONAL_TARGET_SCAN_SOLIDS_PER_TASK);
+        int tasksBySize = Math.max(1, (solidCount + KRAKK_TARGET_SCAN_SOLIDS_PER_TASK - 1) / KRAKK_TARGET_SCAN_SOLIDS_PER_TASK);
         int tasksByWorkers = Math.max(1, VOLUMETRIC_TARGET_SCAN_PARALLELISM * 2);
         int taskCount = Math.min(tasksBySize, tasksByWorkers);
-        return Math.max(1, Math.min(EIKONAL_TARGET_SCAN_MAX_TASKS, taskCount));
+        return Math.max(1, Math.min(KRAKK_TARGET_SCAN_MAX_TASKS, taskCount));
     }
 
-    private static void cancelEikonalTargetScanFutures(List<Future<EikonalTargetScanResult>> futures) {
-        for (Future<EikonalTargetScanResult> future : futures) {
+    private static void cancelKrakkTargetScanFutures(List<Future<KrakkTargetScanResult>> futures) {
+        for (Future<KrakkTargetScanResult> future : futures) {
             future.cancel(true);
         }
     }
@@ -4265,9 +4429,25 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             var damageApi = KrakkApi.damage();
             KrakkImpactResult result;
             if (damageApi instanceof KrakkDamageRuntime damageRuntime) {
-                result = damageRuntime.applyImpactPrevalidated(level, mutablePos, blockState, source, resolvedImpactPower, false);
+                result = damageRuntime.applyImpactPrevalidated(
+                        level,
+                        mutablePos,
+                        blockState,
+                        source,
+                        resolvedImpactPower,
+                        false,
+                        KrakkDamageType.KRAKK_DAMAGE_EXPLOSION
+                );
             } else {
-                result = damageApi.applyImpact(level, mutablePos, blockState, source, resolvedImpactPower, false);
+                result = damageApi.applyImpact(
+                        level,
+                        mutablePos,
+                        blockState,
+                        source,
+                        resolvedImpactPower,
+                        false,
+                        KrakkDamageType.KRAKK_DAMAGE_EXPLOSION
+                );
             }
             if (trace != null) {
                 if (result.broken()) {
@@ -6661,13 +6841,13 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private record VolumetricResistanceField(Long2FloatOpenHashMap resistanceByPos, LongArrayList solidPositions, int sampledVoxelCount) {
     }
 
-    private static final class EikonalMinHeap {
+    private static final class KrakkMinHeap {
         private int[] indices;
         private double[] priorities;
         private int size;
         private double polledPriority;
 
-        private EikonalMinHeap(int initialCapacity) {
+        private KrakkMinHeap(int initialCapacity) {
             int capacity = Math.max(16, initialCapacity);
             this.indices = new int[capacity];
             this.priorities = new double[capacity];
@@ -6782,13 +6962,13 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private record ResistanceFieldSnapshot(BlockState[] sampledStates, int sampledVoxelCount) {
     }
 
-    private record EikonalResistanceFieldChunkResult(
+    private record KrakkResistanceFieldChunkResult(
             LongArrayList solidPositions,
             int sampledVoxelCount
     ) {
     }
 
-    private record EikonalTargetScanResult(
+    private record KrakkTargetScanResult(
             LongArrayList targetPositions,
             FloatArrayList targetWeights,
             double solidWeight,
@@ -6796,7 +6976,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     ) {
     }
 
-    private record EikonalVolumetricBaselineResult(
+    private record KrakkVolumetricBaselineResult(
             Long2FloatOpenHashMap baselineByPos,
             long directionSetupNanos,
             long pressureSolveNanos,
@@ -6808,7 +6988,13 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     ) {
     }
 
-    private record EikonalField(
+    private record KrakkSweepChunkResult(
+            double maxDelta,
+            IntArrayList dirtyRows
+    ) {
+    }
+
+    private record KrakkField(
             int minX,
             int minY,
             int minZ,
@@ -6831,8 +7017,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     ) {
     }
 
-    private record EikonalCoarseSolveContext(
-            EikonalField coarseField,
+    private record KrakkCoarseSolveContext(
+            KrakkField coarseField,
             float[] coarseArrivalTimes,
             float[] coarseSlowness,
             BitSet coarseSourceMask,
@@ -6841,55 +7027,22 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     ) {
     }
 
-    private record EikonalSolveResult(float[] arrivalTimes, int sourceCells, int sweepCycles) {
+    private record KrakkSolveResult(float[] arrivalTimes, int sourceCells, int sweepCycles) {
     }
 
-    private record PairedEikonalSolveResult(EikonalSolveResult normal, EikonalSolveResult shadow) {
+    private record PairedKrakkSolveResult(KrakkSolveResult normal, KrakkSolveResult shadow) {
     }
 
-    private record PairedEikonalSlownessResult(float[] normalSlowness, float[] shadowSlowness) {
+    private record PairedKrakkSlownessResult(float[] normalSlowness, float[] shadowSlowness) {
     }
 
-    private record PairedEikonalSourceResult(int normalSourceCount, int shadowSourceCount) {
+    private record PairedKrakkSourceResult(int normalSourceCount, int shadowSourceCount) {
     }
 
     @Override
     public void detonate(ServerLevel level, double x, double y, double z, Entity source, LivingEntity owner, KrakkExplosionProfile profile) {
         ExplosionResolution resolution = resolveProfile(profile);
-        if (resolution.mode == ExplosionMode.VOLUMETRIC) {
-            detonateVolumetric(
-                    level,
-                    x,
-                    y,
-                    z,
-                    source,
-                    owner,
-                    resolution.radius,
-                    resolution.energy,
-                    true,
-                    true,
-                    null
-            );
-            return;
-        }
-        if (resolution.mode == ExplosionMode.EIKONAL) {
-            detonateEikonal(
-                    level,
-                    x,
-                    y,
-                    z,
-                    source,
-                    owner,
-                    resolution.radius,
-                    resolution.energy,
-                    true,
-                    true,
-                    null
-            );
-            return;
-        }
-
-        detonateRaycast(
+        detonateKrakk(
                 level,
                 x,
                 y,
@@ -6897,8 +7050,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 source,
                 owner,
                 resolution.radius,
-                resolution.power,
-                level.random,
+                resolution.energy,
                 true,
                 true,
                 null
@@ -6910,51 +7062,19 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         ExplosionResolution resolution = resolveProfile(profile);
         ExplosionProfileTrace trace = new ExplosionProfileTrace();
         long start = System.nanoTime();
-        if (resolution.mode == ExplosionMode.VOLUMETRIC) {
-            detonateVolumetric(
-                    level,
-                    x,
-                    y,
-                    z,
-                    source,
-                    owner,
-                    resolution.radius,
-                    resolution.energy,
-                    applyWorldChanges,
-                    applyWorldChanges,
-                    trace
-            );
-        } else if (resolution.mode == ExplosionMode.EIKONAL) {
-            detonateEikonal(
-                    level,
-                    x,
-                    y,
-                    z,
-                    source,
-                    owner,
-                    resolution.radius,
-                    resolution.energy,
-                    applyWorldChanges,
-                    applyWorldChanges,
-                    trace
-            );
-        } else {
-            RandomSource random = RandomSource.create(seed);
-            detonateRaycast(
-                    level,
-                    x,
-                    y,
-                    z,
-                    source,
-                    owner,
-                    resolution.radius,
-                    resolution.power,
-                    random,
-                    applyWorldChanges,
-                    applyWorldChanges,
-                    trace
-            );
-        }
+        detonateKrakk(
+                level,
+                x,
+                y,
+                z,
+                source,
+                owner,
+                resolution.radius,
+                resolution.energy,
+                applyWorldChanges,
+                applyWorldChanges,
+                trace
+        );
         long elapsed = System.nanoTime() - start;
         return new ExplosionProfileReport(
                 elapsed,
@@ -6993,18 +7113,22 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 trace.volumetricResistanceFieldNanos,
                 trace.volumetricDirectionSetupNanos,
                 trace.volumetricPressureSolveNanos,
-                trace.eikonalSolveNanos,
+                trace.krakkSolveNanos,
                 trace.volumetricTargetScanNanos,
                 trace.volumetricTargetScanPrecheckNanos,
                 trace.volumetricTargetScanBlendNanos,
                 trace.volumetricImpactApplyNanos,
+                trace.volumetricImpactApplyDirectNanos,
+                trace.volumetricImpactApplyCollapseSeedNanos,
+                trace.volumetricImpactApplyCollapseBfsNanos,
+                trace.volumetricImpactApplyCollapseApplyNanos,
                 trace.volumetricSampledVoxels,
                 trace.volumetricSampledSolids,
                 trace.volumetricTargetBlocks,
                 trace.volumetricDirectionSamples,
                 trace.volumetricRadialSteps,
-                trace.eikonalSourceCells,
-                trace.eikonalSweepCycles,
+                trace.krakkSourceCells,
+                trace.krakkSweepCycles,
                 trace.syncPacketsEstimated,
                 trace.syncBytesEstimated,
                 trace.smokeParticles
@@ -7013,44 +7137,19 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
     private static ExplosionResolution resolveProfile(KrakkExplosionProfile profile) {
         if (profile == null) {
-            double resolvedPower = KrakkExplosionCurves.DEFAULT_IMPACT_POWER;
-            double resolvedRadius = KrakkExplosionCurves.computeBlastRadius(resolvedPower);
-            return new ExplosionResolution(ExplosionMode.RAYCAST, resolvedRadius, resolvedPower, Double.NaN, false);
+            double fallbackPower = KrakkExplosionCurves.DEFAULT_IMPACT_POWER;
+            double resolvedRadius = sanitizeKrakkRadius(Double.NaN, fallbackPower);
+            double resolvedEnergy = sanitizeKrakkEnergy(Double.NaN, fallbackPower);
+            return new ExplosionResolution(resolvedRadius, resolvedEnergy);
         }
 
-        KrakkExplosionProfile.Mode mode = profile.mode();
-        double fallbackPower = profile.impactPower();
-        if (!Double.isFinite(fallbackPower) || fallbackPower <= 0.0D) {
-            fallbackPower = KrakkExplosionCurves.DEFAULT_IMPACT_POWER;
-        } else {
-            fallbackPower = KrakkExplosionCurves.sanitizeImpactPower(fallbackPower);
-        }
-
-        if (mode == KrakkExplosionProfile.Mode.VOLUMETRIC) {
-            double resolvedRadius = sanitizeVolumetricRadius(profile.volumetricRadius(), fallbackPower);
-            double resolvedEnergy = sanitizeVolumetricEnergy(profile.volumetricEnergy(), fallbackPower, resolvedRadius);
-            return new ExplosionResolution(ExplosionMode.VOLUMETRIC, resolvedRadius, fallbackPower, resolvedEnergy, profile.debugVisuals());
-        }
-        if (mode == KrakkExplosionProfile.Mode.EIKONAL) {
-            double resolvedRadius = sanitizeEikonalRadius(profile.volumetricRadius(), fallbackPower);
-            double resolvedEnergy = sanitizeVolumetricEnergy(profile.volumetricEnergy(), fallbackPower, resolvedRadius);
-            return new ExplosionResolution(ExplosionMode.EIKONAL, resolvedRadius, fallbackPower, resolvedEnergy, profile.debugVisuals());
-        }
-
-        double resolvedPower = KrakkExplosionCurves.sanitizeImpactPower(fallbackPower);
-        double resolvedRadius = KrakkExplosionCurves.computeBlastRadius(resolvedPower);
-        return new ExplosionResolution(ExplosionMode.RAYCAST, resolvedRadius, resolvedPower, Double.NaN, profile.debugVisuals());
+        double fallbackPower = KrakkExplosionCurves.DEFAULT_IMPACT_POWER;
+        double resolvedRadius = sanitizeKrakkRadius(profile.radius(), fallbackPower);
+        double resolvedEnergy = sanitizeKrakkEnergy(profile.energy(), fallbackPower);
+        return new ExplosionResolution(resolvedRadius, resolvedEnergy);
     }
 
-    private static double sanitizeVolumetricRadius(double radius, double fallbackPower) {
-        if (Double.isFinite(radius) && radius > 0.0D) {
-            return Mth.clamp(radius, 1.0D, VOLUMETRIC_MAX_RADIUS);
-        }
-        double fallbackRadius = KrakkExplosionCurves.computeBlastRadius(fallbackPower);
-        return Mth.clamp(fallbackRadius, 1.0D, VOLUMETRIC_MAX_RADIUS);
-    }
-
-    private static double sanitizeEikonalRadius(double radius, double fallbackPower) {
+    private static double sanitizeKrakkRadius(double radius, double fallbackPower) {
         if (Double.isFinite(radius)) {
             if (Math.abs(radius) <= 1.0E-9D) {
                 return 0.0D;
@@ -7063,7 +7162,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return Math.max(1.0D, fallbackRadius);
     }
 
-    private static double resolveEikonalRadiusFromEnergyCutoff(double totalEnergy) {
+    private static double resolveKrakkRadiusFromEnergyCutoff(double totalEnergy) {
         double normalizedEnergy = Math.max(totalEnergy, VOLUMETRIC_MIN_ENERGY);
         double decayPerBlock = Mth.clamp(VOLUMETRIC_PRESSURE_AIR_DECAY_PER_BLOCK, 1.0E-4D, 0.95D);
         double logDecay = Math.log1p(-decayPerBlock);
@@ -7075,21 +7174,14 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return Math.max(1.0D, distance);
     }
 
-    private static double sanitizeVolumetricEnergy(double energy, double fallbackPower, double resolvedRadius) {
+    private static double sanitizeKrakkEnergy(double energy, double fallbackPower) {
         if (Double.isFinite(energy) && energy > VOLUMETRIC_MIN_ENERGY) {
             return energy;
         }
-        double fallbackEnergy = fallbackPower * Math.max(1.0D, resolvedRadius);
-        return Math.max(VOLUMETRIC_MIN_ENERGY, fallbackEnergy);
+        return Math.max(VOLUMETRIC_MIN_ENERGY, fallbackPower);
     }
 
-    private enum ExplosionMode {
-        RAYCAST,
-        VOLUMETRIC,
-        EIKONAL
-    }
-
-    private record ExplosionResolution(ExplosionMode mode, double radius, double power, double energy, boolean debugVisuals) {
+    private record ExplosionResolution(double radius, double energy) {
     }
 
     private static final class ExplosionProfileTrace {
@@ -7126,18 +7218,22 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         private long volumetricResistanceFieldNanos;
         private long volumetricDirectionSetupNanos;
         private long volumetricPressureSolveNanos;
-        private long eikonalSolveNanos;
+        private long krakkSolveNanos;
         private long volumetricTargetScanNanos;
         private long volumetricTargetScanPrecheckNanos;
         private long volumetricTargetScanBlendNanos;
         private long volumetricImpactApplyNanos;
+        private long volumetricImpactApplyDirectNanos;
+        private long volumetricImpactApplyCollapseSeedNanos;
+        private long volumetricImpactApplyCollapseBfsNanos;
+        private long volumetricImpactApplyCollapseApplyNanos;
         private int volumetricSampledVoxels;
         private int volumetricSampledSolids;
         private int volumetricTargetBlocks;
         private int volumetricDirectionSamples;
         private int volumetricRadialSteps;
-        private int eikonalSourceCells;
-        private int eikonalSweepCycles;
+        private int krakkSourceCells;
+        private int krakkSweepCycles;
         private int syncPacketsEstimated;
         private int syncBytesEstimated;
         private int smokeParticles;

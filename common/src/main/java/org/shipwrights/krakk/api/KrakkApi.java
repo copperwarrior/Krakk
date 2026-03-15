@@ -13,6 +13,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import org.shipwrights.krakk.api.client.KrakkClientOverlayApi;
 import org.shipwrights.krakk.api.damage.KrakkDamageApi;
 import org.shipwrights.krakk.api.damage.KrakkImpactResult;
+import org.shipwrights.krakk.api.damage.KrakkDamageType;
 import org.shipwrights.krakk.api.explosion.KrakkExplosionApi;
 import org.shipwrights.krakk.api.explosion.KrakkExplosionProfile;
 import org.shipwrights.krakk.api.network.KrakkNetworkApi;
@@ -93,7 +94,7 @@ public final class KrakkApi {
     private static final class NoOpDamageApi implements KrakkDamageApi {
         @Override
         public KrakkImpactResult applyImpact(ServerLevel level, BlockPos pos, BlockState state, Entity source,
-                                             double impactPower, boolean dropOnBreak) {
+                                             double impactPower, boolean dropOnBreak, KrakkDamageType damageType) {
             return new KrakkImpactResult(false, 0);
         }
 
@@ -248,6 +249,10 @@ public final class KrakkApi {
 
         @Override
         public void sendChunkUnload(ServerPlayer player, ResourceLocation dimensionId, int chunkX, int chunkZ) {
+        }
+
+        @Override
+        public void sendChunkInit(ServerPlayer player, ResourceLocation dimensionId, int chunkX, int chunkZ) {
         }
     }
 }

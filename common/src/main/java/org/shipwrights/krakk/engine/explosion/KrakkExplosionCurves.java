@@ -2,7 +2,8 @@ package org.shipwrights.krakk.engine.explosion;
 
 public final class KrakkExplosionCurves {
     public static final double DEFAULT_BLAST_RADIUS = 4.0D;
-    public static final double DEFAULT_IMPACT_POWER = 420.0D;
+    // Calibrated to the Krakk approximation target: power=25 maps to radius=4 (roughly TNT-equivalent).
+    public static final double DEFAULT_IMPACT_POWER = 25.0D;
 
     private KrakkExplosionCurves() {
     }

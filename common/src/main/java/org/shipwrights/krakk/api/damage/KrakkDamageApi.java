@@ -20,10 +20,27 @@ public interface KrakkDamageApi {
      * @param source source entity causing the impact, may be null depending on caller
      * @param impactPower impact magnitude used by damage curves
      * @param dropOnBreak whether to spawn normal drops when a break occurs
+     * @param damageType damage pipeline mode used for break/removal behavior
      * @return impact result containing break flag and resulting damage state
      */
     KrakkImpactResult applyImpact(ServerLevel level, BlockPos pos, BlockState state, Entity source,
-                                  double impactPower, boolean dropOnBreak);
+                                  double impactPower, boolean dropOnBreak, KrakkDamageType damageType);
+
+    /**
+     * Applies impact using basic damage mode.
+     */
+    default KrakkImpactResult applyImpact(ServerLevel level, BlockPos pos, BlockState state, Entity source,
+                                          double impactPower, boolean dropOnBreak) {
+        return applyImpact(level, pos, state, source, impactPower, dropOnBreak, KrakkDamageType.KRAKK_DAMAGE_BASIC);
+    }
+
+    /**
+     * Applies impact using basic damage mode and default drop behavior.
+     */
+    default KrakkImpactResult applyImpact(ServerLevel level, BlockPos pos, BlockState state, Entity source,
+                                          double impactPower) {
+        return applyImpact(level, pos, state, source, impactPower, true, KrakkDamageType.KRAKK_DAMAGE_BASIC);
+    }
 
     /**
      * Clears tracked Krakk damage state at a block position.

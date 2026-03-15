@@ -48,25 +48,26 @@ public abstract class KrakkChunkHolderMixin implements KrakkChunkHolderAccess {
     private ShortSet[] krakk$changedDamagePerSection;
 
     @Override
-    public void krakk$damageStateChanged(BlockPos blockPos) {
+    public boolean krakk$damageStateChanged(BlockPos blockPos) {
         LevelChunk levelChunk = this.getTickingChunk();
         if (levelChunk == null) {
-            return;
+            return false;
         }
 
         this.krakk$ensureChangedSectionStorage();
         int sectionIndex = this.levelHeightAccessor.getSectionIndex(blockPos.getY());
         if (sectionIndex < 0 || sectionIndex >= this.krakk$changedDamagePerSection.length) {
-            return;
+            return false;
         }
 
         ShortSet changedDamage = this.krakk$changedDamagePerSection[sectionIndex];
         if (changedDamage == null) {
             changedDamage = new ShortOpenHashSet();
             this.krakk$changedDamagePerSection[sectionIndex] = changedDamage;
-            this.hasChangedSections = true;
         }
+        this.hasChangedSections = true;
         changedDamage.add(SectionPos.sectionRelativePos(blockPos));
+        return true;
     }
 
     @Inject(method = "broadcastChanges", at = @At("TAIL"))
