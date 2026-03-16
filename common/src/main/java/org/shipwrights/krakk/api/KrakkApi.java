@@ -217,6 +217,11 @@ public final class KrakkApi {
         public Long2ByteOpenHashMap snapshotSection(ResourceLocation dimensionId, long sectionKey) {
             return new Long2ByteOpenHashMap();
         }
+
+        @Override
+        public long[] snapshotSectionsInChunkRange(ResourceLocation dimensionId, int minChunkX, int maxChunkX, int minChunkZ, int maxChunkZ) {
+            return new long[0];
+        }
     }
 
     private static final class NoOpNetworkApi implements KrakkNetworkApi {

@@ -44,6 +44,7 @@ import org.shipwrights.krakk.state.chunk.KrakkBlockDamageChunkStorage;
 import org.shipwrights.krakk.state.network.KrakkServerChunkCacheAccess;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -1366,13 +1367,13 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
     }
 
     private static long flushBatchedSyncViaSectionBatches(SyncBatchContext context) {
-        List<ServerPlayer> players = context.level.players();
-        if (players.isEmpty()) {
+        List<ServerPlayer> fallbackPlayers = context.level.players();
+        if (fallbackPlayers.isEmpty()) {
             return 0L;
         }
 
         ResourceLocation dimensionId = context.level.dimension().location();
-        int viewDistance = context.level.getServer().getPlayerList().getViewDistance() + 1;
+        int fallbackViewDistance = context.level.getServer().getPlayerList().getViewDistance() + 1;
         long flushed = 0L;
         boolean profile = damageRuntimeProfilingEnabled;
         List<SectionBatchPlan> sectionPlans = new ArrayList<>();
@@ -1382,14 +1383,13 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
             int sectionX = SectionPos.x(sectionKey);
             int sectionY = SectionPos.y(sectionKey);
             int sectionZ = SectionPos.z(sectionKey);
-            List<ServerPlayer> recipients = new ArrayList<>();
-            for (ServerPlayer player : players) {
-                ChunkPos playerChunk = player.chunkPosition();
-                if (Math.abs(playerChunk.x - sectionX) > viewDistance || Math.abs(playerChunk.z - sectionZ) > viewDistance) {
-                    continue;
-                }
-                recipients.add(player);
-            }
+            List<ServerPlayer> recipients = collectTrackingPlayersForChunk(
+                    context.level,
+                    sectionX,
+                    sectionZ,
+                    fallbackPlayers,
+                    fallbackViewDistance
+            );
             if (recipients.isEmpty()) {
                 continue;
             }
@@ -1447,6 +1447,35 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
             }
         }
         return flushed;
+    }
+
+    private static List<ServerPlayer> collectTrackingPlayersForChunk(ServerLevel level,
+                                                                     int chunkX,
+                                                                     int chunkZ,
+                                                                     List<ServerPlayer> fallbackPlayers,
+                                                                     int fallbackViewDistance) {
+        Object chunkSource = level.getChunkSource();
+        if (chunkSource instanceof KrakkServerChunkCacheAccess access) {
+            List<ServerPlayer> trackedPlayers = access.krakk$getTrackingPlayers(chunkX, chunkZ, false);
+            if (!trackedPlayers.isEmpty()) {
+                return new ArrayList<>(trackedPlayers);
+            }
+            return Collections.emptyList();
+        }
+
+        if (fallbackPlayers.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<ServerPlayer> recipients = new ArrayList<>();
+        for (ServerPlayer player : fallbackPlayers) {
+            ChunkPos playerChunk = player.chunkPosition();
+            if (Math.abs(playerChunk.x - chunkX) > fallbackViewDistance || Math.abs(playerChunk.z - chunkZ) > fallbackViewDistance) {
+                continue;
+            }
+            recipients.add(player);
+        }
+        return recipients;
     }
 
     private static PreparedSectionBatch prepareSectionBatchPayload(ServerLevel level, ResourceLocation dimensionId, SectionBatchPlan plan) {

@@ -4,12 +4,16 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.server.level.ChunkHolder;
 import net.minecraft.server.level.ServerChunkCache;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.ChunkPos;
 import org.jetbrains.annotations.Nullable;
 import org.shipwrights.krakk.state.network.KrakkChunkHolderAccess;
 import org.shipwrights.krakk.state.network.KrakkServerChunkCacheAccess;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
+
+import java.util.Collections;
+import java.util.List;
 
 @Mixin(ServerChunkCache.class)
 public abstract class KrakkServerChunkCacheMixin implements KrakkServerChunkCacheAccess {
@@ -26,5 +30,14 @@ public abstract class KrakkServerChunkCacheMixin implements KrakkServerChunkCach
             return access.krakk$damageStateChanged(blockPos);
         }
         return false;
+    }
+
+    @Override
+    public List<ServerPlayer> krakk$getTrackingPlayers(int chunkX, int chunkZ, boolean onlyOnWatchDistanceEdge) {
+        ChunkHolder chunkHolder = this.getVisibleChunkIfPresent(ChunkPos.asLong(chunkX, chunkZ));
+        if (chunkHolder instanceof KrakkChunkHolderAccess access) {
+            return access.krakk$getTrackingPlayers(new ChunkPos(chunkX, chunkZ), onlyOnWatchDistanceEdge);
+        }
+        return Collections.emptyList();
     }
 }

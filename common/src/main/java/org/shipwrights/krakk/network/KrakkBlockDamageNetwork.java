@@ -18,12 +18,15 @@ import net.minecraft.world.level.ChunkPos;
 import org.shipwrights.krakk.api.KrakkApi;
 import org.shipwrights.krakk.api.network.KrakkNetworkApi;
 import org.shipwrights.krakk.runtime.damage.KrakkDamageRuntime;
+import org.shipwrights.krakk.state.network.KrakkServerChunkCacheAccess;
 
+import java.util.ArrayList;
 import java.util.List;
 
 public final class KrakkBlockDamageNetwork implements KrakkNetworkApi {
     private static final int CHUNK_RESYNC_REQUEST_COOLDOWN_TICKS = 20;
     private static volatile boolean commonReceiversInitialized = false;
+    private static volatile boolean clientReceiversInitialized = false;
 
     private final ResourceLocation blockDamageSyncPacket;
     private final ResourceLocation blockDamageSectionPacket;
@@ -88,6 +91,12 @@ public final class KrakkBlockDamageNetwork implements KrakkNetworkApi {
     public void initClientReceivers() {
         if (Platform.getEnvironment() != Env.CLIENT) {
             return;
+        }
+        synchronized (KrakkBlockDamageNetwork.class) {
+            if (clientReceiversInitialized) {
+                return;
+            }
+            clientReceiversInitialized = true;
         }
 
         NetworkManager.registerReceiver(NetworkManager.s2c(), blockDamageSyncPacket, (buf, context) -> {
@@ -197,20 +206,7 @@ public final class KrakkBlockDamageNetwork implements KrakkNetworkApi {
         int clampedState = clampDamageState(damageState);
         ResourceLocation dimensionId = level.dimension().location();
         ChunkPos targetChunk = new ChunkPos(pos);
-        int viewDistance = level.getServer().getPlayerList().getViewDistance() + 1;
-        java.util.ArrayList<ServerPlayer> recipients = new java.util.ArrayList<>();
-
-        for (ServerPlayer player : level.players()) {
-            if (player.level() != level) {
-                continue;
-            }
-
-            ChunkPos playerChunk = player.chunkPosition();
-            if (Math.abs(playerChunk.x - targetChunk.x) > viewDistance || Math.abs(playerChunk.z - targetChunk.z) > viewDistance) {
-                continue;
-            }
-            recipients.add(player);
-        }
+        List<ServerPlayer> recipients = collectTrackedPlayers(level, targetChunk.x, targetChunk.z);
         sendDamageSyncBatch(recipients, dimensionId, pos.asLong(), clampedState);
     }
 
@@ -299,13 +295,32 @@ public final class KrakkBlockDamageNetwork implements KrakkNetworkApi {
     }
 
     private static boolean isChunkRelevantToPlayer(ServerLevel level, ServerPlayer player, int chunkX, int chunkZ) {
-        if (player.level() != level) {
-            return false;
+        return collectTrackedPlayers(level, chunkX, chunkZ).contains(player);
+    }
+
+    private static List<ServerPlayer> collectTrackedPlayers(ServerLevel level, int chunkX, int chunkZ) {
+        Object chunkSource = level.getChunkSource();
+        if (chunkSource instanceof KrakkServerChunkCacheAccess access) {
+            List<ServerPlayer> trackedPlayers = access.krakk$getTrackingPlayers(chunkX, chunkZ, false);
+            if (!trackedPlayers.isEmpty()) {
+                return new ArrayList<>(trackedPlayers);
+            }
+            return List.of();
         }
+
         int viewDistance = level.getServer().getPlayerList().getViewDistance() + 1;
-        ChunkPos playerChunk = player.chunkPosition();
-        return Math.abs(playerChunk.x - chunkX) <= viewDistance
-                && Math.abs(playerChunk.z - chunkZ) <= viewDistance;
+        ArrayList<ServerPlayer> fallback = new ArrayList<>();
+        for (ServerPlayer player : level.players()) {
+            if (player.level() != level) {
+                continue;
+            }
+            ChunkPos playerChunk = player.chunkPosition();
+            if (Math.abs(playerChunk.x - chunkX) > viewDistance || Math.abs(playerChunk.z - chunkZ) > viewDistance) {
+                continue;
+            }
+            fallback.add(player);
+        }
+        return fallback;
     }
 
     private void ensureClientTrackingDimension(ResourceLocation dimensionId) {

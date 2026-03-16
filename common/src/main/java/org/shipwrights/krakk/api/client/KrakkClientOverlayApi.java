@@ -47,4 +47,9 @@ public interface KrakkClientOverlayApi {
      * Returns a copy of currently cached states for one section.
      */
     Long2ByteOpenHashMap snapshotSection(ResourceLocation dimensionId, long sectionKey);
+
+    /**
+     * Returns currently known damaged section keys within a chunk range.
+     */
+    long[] snapshotSectionsInChunkRange(ResourceLocation dimensionId, int minChunkX, int maxChunkX, int minChunkZ, int maxChunkZ);
 }

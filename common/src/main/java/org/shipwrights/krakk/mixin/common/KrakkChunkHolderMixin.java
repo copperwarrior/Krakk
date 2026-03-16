@@ -70,6 +70,11 @@ public abstract class KrakkChunkHolderMixin implements KrakkChunkHolderAccess {
         return true;
     }
 
+    @Override
+    public List<ServerPlayer> krakk$getTrackingPlayers(ChunkPos chunkPos, boolean onlyOnWatchDistanceEdge) {
+        return this.playerProvider.getPlayers(chunkPos, onlyOnWatchDistanceEdge);
+    }
+
     @Inject(method = "broadcastChanges", at = @At("TAIL"))
     private void krakk$broadcastDamageStateChanges(LevelChunk levelChunk, CallbackInfo ci) {
         if (this.krakk$changedDamagePerSection == null) {
