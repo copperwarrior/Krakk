@@ -13,6 +13,7 @@ import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongIterator;
+import it.unimi.dsi.fastutil.longs.LongLinkedOpenHashSet;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
@@ -33,6 +34,7 @@ import org.joml.Matrix3f;
 import org.joml.Matrix4f;
 import org.shipwrights.krakk.api.KrakkApi;
 import org.shipwrights.krakk.runtime.client.KrakkClientShaders;
+import org.shipwrights.krakk.state.chunk.KrakkChunkSectionDamageBridge;
 import org.slf4j.Logger;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -51,23 +53,25 @@ public abstract class KrakkLevelRendererMixin {
     @Unique
     private static final int KRAKK_MAX_DIRTY_SCANS_PER_FRAME = 256;
     @Unique
-    private static final long KRAKK_VISIBLE_SECTION_SYNC_INTERVAL_TICKS = 20L;
-    @Unique
     private static final long KRAKK_CACHE_SWEEP_INTERVAL_TICKS = 40L;
+    @Unique
+    private static final long KRAKK_SECTION_DISCOVERY_INTERVAL_TICKS = 20L;
     @Unique
     private static final int KRAKK_BUFFER_BUILDER_CAPACITY = 256;
 
     @Unique
     private final LongOpenHashSet krakk$pendingDirtySections = new LongOpenHashSet();
     @Unique
+    private final LongLinkedOpenHashSet krakk$urgentDirtySections = new LongLinkedOpenHashSet();
+    @Unique
     private final Long2ObjectOpenHashMap<SectionRenderCache> krakk$sectionCaches = new Long2ObjectOpenHashMap<>();
     private ResourceLocation krakk$activeDimensionId = null;
     @Unique
     private ClientLevel krakk$activeLevel = null;
     @Unique
-    private long krakk$lastVisibleSectionSyncTick = Long.MIN_VALUE;
-    @Unique
     private long krakk$lastCacheSweepTick = Long.MIN_VALUE;
+    @Unique
+    private long krakk$lastSectionDiscoveryTick = Long.MIN_VALUE;
     @Unique
     private boolean krakk$loggedRendererInit = false;
 
@@ -101,6 +105,7 @@ public abstract class KrakkLevelRendererMixin {
         }
         this.krakk$sectionCaches.clear();
         this.krakk$pendingDirtySections.clear();
+        this.krakk$urgentDirtySections.clear();
     }
 
     @Inject(
@@ -115,8 +120,8 @@ public abstract class KrakkLevelRendererMixin {
         if (level == null) {
             this.krakk$activeLevel = null;
             this.krakk$activeDimensionId = null;
-            this.krakk$lastVisibleSectionSyncTick = Long.MIN_VALUE;
             this.krakk$lastCacheSweepTick = Long.MIN_VALUE;
+            this.krakk$lastSectionDiscoveryTick = Long.MIN_VALUE;
             this.krakk$clearRenderCache();
             return;
         }
@@ -124,8 +129,8 @@ public abstract class KrakkLevelRendererMixin {
         if (level != this.krakk$activeLevel) {
             this.krakk$activeLevel = level;
             this.krakk$activeDimensionId = level.dimension().location();
-            this.krakk$lastVisibleSectionSyncTick = Long.MIN_VALUE;
             this.krakk$lastCacheSweepTick = Long.MIN_VALUE;
+            this.krakk$lastSectionDiscoveryTick = Long.MIN_VALUE;
             this.krakk$clearRenderCache();
             this.krakk$loggedRendererInit = false;
         }
@@ -133,8 +138,8 @@ public abstract class KrakkLevelRendererMixin {
         ResourceLocation dimensionId = level.dimension().location();
         if (!dimensionId.equals(this.krakk$activeDimensionId)) {
             this.krakk$activeDimensionId = dimensionId;
-            this.krakk$lastVisibleSectionSyncTick = Long.MIN_VALUE;
             this.krakk$lastCacheSweepTick = Long.MIN_VALUE;
+            this.krakk$lastSectionDiscoveryTick = Long.MIN_VALUE;
             this.krakk$clearRenderCache();
             this.krakk$loggedRendererInit = false;
         }
@@ -142,6 +147,8 @@ public abstract class KrakkLevelRendererMixin {
         long[] dirtySections = KrakkApi.clientOverlay().consumeDirtySections(dimensionId);
         for (long sectionKey : dirtySections) {
             this.krakk$pendingDirtySections.add(sectionKey);
+            // Prioritize newly-updated sections so live damage changes are visible immediately.
+            this.krakk$urgentDirtySections.add(sectionKey);
         }
     }
 
@@ -209,6 +216,7 @@ public abstract class KrakkLevelRendererMixin {
                 if (!stageRendered) {
                     stageRenderType.setupRenderState();
                     stageRendered = true;
+                    KrakkClientShaders.syncFogUniforms(overlayShader);
                 }
 
                 Matrix4f modelViewMatrix = new Matrix4f(poseStack.last().pose())
@@ -232,6 +240,7 @@ public abstract class KrakkLevelRendererMixin {
                     }
 
                     overlayShader = fallbackShader;
+                    KrakkClientShaders.syncFogUniforms(overlayShader);
                     buffer.drawWithShader(modelViewMatrix, projectionMatrix, overlayShader);
                 }
             }
@@ -249,13 +258,6 @@ public abstract class KrakkLevelRendererMixin {
             return;
         }
 
-        long gameTick = level.getGameTime();
-        if (this.krakk$lastVisibleSectionSyncTick != Long.MIN_VALUE
-                && (gameTick - this.krakk$lastVisibleSectionSyncTick) < KRAKK_VISIBLE_SECTION_SYNC_INTERVAL_TICKS) {
-            return;
-        }
-        this.krakk$lastVisibleSectionSyncTick = gameTick;
-
         long[] visibleSections = KrakkApi.clientOverlay().snapshotSectionsInChunkRange(
                 this.krakk$activeDimensionId,
                 minChunkX,
@@ -266,28 +268,35 @@ public abstract class KrakkLevelRendererMixin {
         LongOpenHashSet visibleSet = new LongOpenHashSet(visibleSections.length);
         for (long sectionKey : visibleSections) {
             visibleSet.add(sectionKey);
-            this.krakk$pendingDirtySections.add(sectionKey);
+        }
+        long gameTick = level.getGameTime();
+        if (this.krakk$lastSectionDiscoveryTick == Long.MIN_VALUE
+                || gameTick < this.krakk$lastSectionDiscoveryTick
+                || (gameTick - this.krakk$lastSectionDiscoveryTick) >= KRAKK_SECTION_DISCOVERY_INTERVAL_TICKS) {
+            // Safety net for chunk-load timing races: discover damage directly from chunk section state,
+            // not only overlay cache.
+            KrakkChunkSectionDamageBridge.collectSectionKeysInChunkRange(
+                    level,
+                    minChunkX,
+                    maxChunkX,
+                    minChunkZ,
+                    maxChunkZ,
+                    visibleSet
+            );
+            this.krakk$lastSectionDiscoveryTick = gameTick;
         }
 
-        if (this.krakk$sectionCaches.isEmpty()) {
-            return;
-        }
-        LongArrayList staleSectionKeys = new LongArrayList();
-        LongIterator iterator = this.krakk$sectionCaches.keySet().iterator();
-        while (iterator.hasNext()) {
-            long sectionKey = iterator.nextLong();
-            int sectionX = SectionPos.x(sectionKey);
-            int sectionZ = SectionPos.z(sectionKey);
-            if (sectionX < minChunkX || sectionX > maxChunkX || sectionZ < minChunkZ || sectionZ > maxChunkZ) {
-                continue;
-            }
-            if (!visibleSet.contains(sectionKey)) {
-                staleSectionKeys.add(sectionKey);
+        // Only queue sections that do not already have a built cache.
+        LongIterator visibleIterator = visibleSet.iterator();
+        while (visibleIterator.hasNext()) {
+            long sectionKey = visibleIterator.nextLong();
+            if (!this.krakk$sectionCaches.containsKey(sectionKey)) {
+                this.krakk$pendingDirtySections.add(sectionKey);
             }
         }
-        for (int i = 0; i < staleSectionKeys.size(); i++) {
-            this.krakk$clearSectionCacheEntry(staleSectionKeys.getLong(i));
-        }
+
+        // Keep in-range cache entries stable. They are invalidated by dirty section rebuilds,
+        // and out-of-range/unloaded entries are swept separately.
     }
 
     @Unique
@@ -299,22 +308,60 @@ public abstract class KrakkLevelRendererMixin {
 
         int rebuilds = 0;
         int scanned = 0;
-        LongIterator iterator = this.krakk$pendingDirtySections.iterator();
-        while (iterator.hasNext() && rebuilds < KRAKK_MAX_SECTION_REBUILDS_PER_FRAME && scanned < KRAKK_MAX_DIRTY_SCANS_PER_FRAME) {
-            long sectionKey = iterator.nextLong();
+
+        LongIterator urgentIterator = this.krakk$urgentDirtySections.iterator();
+        while (urgentIterator.hasNext() && rebuilds < KRAKK_MAX_SECTION_REBUILDS_PER_FRAME && scanned < KRAKK_MAX_DIRTY_SCANS_PER_FRAME) {
+            long sectionKey = urgentIterator.nextLong();
+            urgentIterator.remove();
             scanned++;
-            iterator.remove();
 
             int sectionX = SectionPos.x(sectionKey);
             int sectionZ = SectionPos.z(sectionKey);
-            if (sectionX < minChunkX || sectionX > maxChunkX || sectionZ < minChunkZ || sectionZ > maxChunkZ) {
-                continue;
-            }
-            if (level.getChunkSource().getChunkNow(sectionX, sectionZ) == null) {
+            boolean inRange = sectionX >= minChunkX && sectionX <= maxChunkX
+                    && sectionZ >= minChunkZ && sectionZ <= maxChunkZ;
+            if (!inRange || level.getChunkSource().getChunkNow(sectionX, sectionZ) == null) {
+                this.krakk$pendingDirtySections.remove(sectionKey);
                 continue;
             }
 
             this.krakk$rebuildSectionCache(level, blockRenderer, sectionKey);
+            this.krakk$pendingDirtySections.remove(sectionKey);
+            rebuilds++;
+        }
+
+        if (rebuilds >= KRAKK_MAX_SECTION_REBUILDS_PER_FRAME) {
+            return;
+        }
+
+        LongArrayList candidates = new LongArrayList(Math.min(this.krakk$pendingDirtySections.size(), KRAKK_MAX_DIRTY_SCANS_PER_FRAME));
+        LongIterator iterator = this.krakk$pendingDirtySections.iterator();
+        while (iterator.hasNext() && scanned < KRAKK_MAX_DIRTY_SCANS_PER_FRAME) {
+            long sectionKey = iterator.nextLong();
+            scanned++;
+
+            int sectionX = SectionPos.x(sectionKey);
+            int sectionZ = SectionPos.z(sectionKey);
+            boolean inRange = sectionX >= minChunkX && sectionX <= maxChunkX
+                    && sectionZ >= minChunkZ && sectionZ <= maxChunkZ;
+            if (!inRange) {
+                // Drop stale pending work outside the current render window.
+                // Visible sections are re-queued by discovery when needed.
+                iterator.remove();
+                continue;
+            }
+            if (level.getChunkSource().getChunkNow(sectionX, sectionZ) == null) {
+                // Drop work for unloaded chunks to avoid starvation of valid sections.
+                iterator.remove();
+                continue;
+            }
+
+            candidates.add(sectionKey);
+        }
+
+        for (int i = 0; i < candidates.size() && rebuilds < KRAKK_MAX_SECTION_REBUILDS_PER_FRAME; i++) {
+            long sectionKey = candidates.getLong(i);
+            this.krakk$rebuildSectionCache(level, blockRenderer, sectionKey);
+            this.krakk$pendingDirtySections.remove(sectionKey);
             rebuilds++;
         }
     }
@@ -324,6 +371,9 @@ public abstract class KrakkLevelRendererMixin {
         this.krakk$clearSectionCacheEntry(sectionKey);
 
         Long2ByteOpenHashMap snapshot = KrakkApi.clientOverlay().snapshotSection(this.krakk$activeDimensionId, sectionKey);
+        if (snapshot.isEmpty()) {
+            snapshot = KrakkChunkSectionDamageBridge.snapshotSection(level, sectionKey);
+        }
         if (snapshot.isEmpty()) {
             return;
         }

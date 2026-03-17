@@ -1,13 +1,12 @@
 package org.shipwrights.krakk.network;
 
+import com.mojang.logging.LogUtils;
 import dev.architectury.networking.NetworkManager;
 import dev.architectury.platform.Platform;
 import dev.architectury.utils.Env;
-import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
-import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import io.netty.buffer.Unpooled;
 import it.unimi.dsi.fastutil.shorts.Short2ByteMap;
 import it.unimi.dsi.fastutil.shorts.Short2ByteOpenHashMap;
-import io.netty.buffer.Unpooled;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.network.FriendlyByteBuf;
@@ -15,76 +14,34 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.ChunkPos;
-import org.shipwrights.krakk.api.KrakkApi;
+import net.minecraft.world.level.Level;
 import org.shipwrights.krakk.api.network.KrakkNetworkApi;
+import org.shipwrights.krakk.api.KrakkApi;
 import org.shipwrights.krakk.runtime.damage.KrakkDamageRuntime;
-import org.shipwrights.krakk.state.network.KrakkServerChunkCacheAccess;
+import org.shipwrights.krakk.state.chunk.KrakkChunkSectionDamageBridge;
+import org.slf4j.Logger;
 
-import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * Dedicated Krakk damage sync packets sent from chunk broadcast hooks.
+ */
 public final class KrakkBlockDamageNetwork implements KrakkNetworkApi {
-    private static final int CHUNK_RESYNC_REQUEST_COOLDOWN_TICKS = 20;
-    private static volatile boolean commonReceiversInitialized = false;
-    private static volatile boolean clientReceiversInitialized = false;
+    private static final Logger LOGGER = LogUtils.getLogger();
 
-    private final ResourceLocation blockDamageSyncPacket;
-    private final ResourceLocation blockDamageSectionPacket;
-    private final ResourceLocation blockDamageSectionDeltaPacket;
-    private final ResourceLocation blockDamageChunkUnloadPacket;
-    private final ResourceLocation blockDamageChunkInitPacket;
-    private final ResourceLocation blockDamageChunkResyncRequestPacket;
-    private final LongOpenHashSet clientInitializedChunks = new LongOpenHashSet();
-    private final Long2LongOpenHashMap clientResyncCooldownByChunk = new Long2LongOpenHashMap();
-    private ResourceLocation clientTrackingDimension = null;
+    private final ResourceLocation damageSyncPacketId;
+    private final ResourceLocation sectionSnapshotPacketId;
+    private final ResourceLocation sectionDeltaPacketId;
+    private final ResourceLocation chunkUnloadPacketId;
+    private final ResourceLocation chunkInitPacketId;
+    private boolean clientReceiversInitialized = false;
 
     public KrakkBlockDamageNetwork(String namespace) {
-        this.blockDamageSyncPacket = new ResourceLocation(namespace, "block_damage_sync");
-        this.blockDamageSectionPacket = new ResourceLocation(namespace, "block_damage_section");
-        this.blockDamageSectionDeltaPacket = new ResourceLocation(namespace, "block_damage_section_delta");
-        this.blockDamageChunkUnloadPacket = new ResourceLocation(namespace, "block_damage_chunk_unload");
-        this.blockDamageChunkInitPacket = new ResourceLocation(namespace, "block_damage_chunk_init");
-        this.blockDamageChunkResyncRequestPacket = new ResourceLocation(namespace, "block_damage_chunk_resync_request");
-        initCommonReceivers();
-    }
-
-    private void initCommonReceivers() {
-        synchronized (KrakkBlockDamageNetwork.class) {
-            if (commonReceiversInitialized) {
-                return;
-            }
-            commonReceiversInitialized = true;
-        }
-
-        NetworkManager.registerReceiver(NetworkManager.c2s(), blockDamageChunkResyncRequestPacket, (buf, context) -> {
-            ResourceLocation dimensionId = buf.readResourceLocation();
-            int chunkX = buf.readVarInt();
-            int chunkZ = buf.readVarInt();
-
-            context.queue(() -> {
-                if (!(context.getPlayer() instanceof ServerPlayer player) || player.connection == null) {
-                    return;
-                }
-
-                ServerLevel level = player.serverLevel();
-                if (!level.dimension().location().equals(dimensionId)) {
-                    return;
-                }
-
-                KrakkDamageRuntime.recordRecoveryResyncRequested(player, dimensionId, chunkX, chunkZ);
-                if (!isChunkRelevantToPlayer(level, player, chunkX, chunkZ)) {
-                    return;
-                }
-                if (level.getChunkSource().getChunkNow(chunkX, chunkZ) == null) {
-                    return;
-                }
-
-                sendChunkUnload(player, dimensionId, chunkX, chunkZ);
-                sendChunkInit(player, dimensionId, chunkX, chunkZ);
-                KrakkApi.damage().syncChunkToPlayer(player, level, chunkX, chunkZ, false);
-                KrakkDamageRuntime.recordRecoveryResyncServed(player, dimensionId, chunkX, chunkZ);
-            });
-        });
+        this.damageSyncPacketId = new ResourceLocation(namespace, "damage_sync");
+        this.sectionSnapshotPacketId = new ResourceLocation(namespace, "damage_section_snapshot");
+        this.sectionDeltaPacketId = new ResourceLocation(namespace, "damage_section_delta");
+        this.chunkUnloadPacketId = new ResourceLocation(namespace, "damage_chunk_unload");
+        this.chunkInitPacketId = new ResourceLocation(namespace, "damage_chunk_init");
     }
 
     @Override
@@ -92,122 +49,262 @@ public final class KrakkBlockDamageNetwork implements KrakkNetworkApi {
         if (Platform.getEnvironment() != Env.CLIENT) {
             return;
         }
-        synchronized (KrakkBlockDamageNetwork.class) {
-            if (clientReceiversInitialized) {
-                return;
-            }
-            clientReceiversInitialized = true;
+        if (this.clientReceiversInitialized) {
+            return;
         }
+        this.clientReceiversInitialized = true;
 
-        NetworkManager.registerReceiver(NetworkManager.s2c(), blockDamageSyncPacket, (buf, context) -> {
+        NetworkManager.registerReceiver(NetworkManager.s2c(), this.damageSyncPacketId, (buf, context) -> {
             ResourceLocation dimensionId = buf.readResourceLocation();
             long posLong = buf.readLong();
-            int damageState = buf.readByte();
-
+            int damageState = clampDamageState(buf.readByte());
+            if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                LOGGER.debug(
+                        "Krakk net recv damage_sync: dim={} pos=({}, {}, {}) state={} playerPresent={}",
+                        dimensionId,
+                        BlockPos.getX(posLong),
+                        BlockPos.getY(posLong),
+                        BlockPos.getZ(posLong),
+                        damageState,
+                        context.getPlayer() != null
+                );
+            }
             context.queue(() -> {
-                if (context.getPlayer() == null || context.getPlayer().level() == null) {
+                if (context.getPlayer() == null) {
+                    if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                        LOGGER.debug("Krakk net recv damage_sync dropped: no client player context");
+                    }
                     return;
                 }
-                if (!context.getPlayer().level().dimension().location().equals(dimensionId)) {
+                Level level = context.getPlayer().level();
+                if (level == null) {
+                    if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                        LOGGER.debug("Krakk net recv damage_sync dropped: player level is null");
+                    }
                     return;
                 }
-                ensureClientTrackingDimension(dimensionId);
-                int chunkX = SectionPos.blockToSectionCoord(BlockPos.getX(posLong));
-                int chunkZ = SectionPos.blockToSectionCoord(BlockPos.getZ(posLong));
-                if (!isChunkInitialized(chunkX, chunkZ)) {
-                    requestClientChunkResync(dimensionId, chunkX, chunkZ, context.getPlayer().level().getGameTime());
+                if (!dimensionId.equals(level.dimension().location())) {
+                    if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                        LOGGER.debug(
+                                "Krakk net recv damage_sync dropped: dimension mismatch packetDim={} clientDim={}",
+                                dimensionId,
+                                level.dimension().location()
+                        );
+                    }
+                    return;
                 }
+                KrakkChunkSectionDamageBridge.applyBlockDamage(level, posLong, damageState);
                 KrakkApi.clientOverlay().applyDamage(dimensionId, posLong, damageState);
+                if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                    LOGGER.debug(
+                            "Krakk net recv damage_sync applied: dim={} pos=({}, {}, {}) state={}",
+                            dimensionId,
+                            BlockPos.getX(posLong),
+                            BlockPos.getY(posLong),
+                            BlockPos.getZ(posLong),
+                            damageState
+                    );
+                }
             });
         });
 
-        NetworkManager.registerReceiver(NetworkManager.s2c(), blockDamageSectionPacket, (buf, context) -> {
-            ResourceLocation dimensionId = buf.readResourceLocation();
-            int sectionX = buf.readVarInt();
-            int sectionY = buf.readVarInt();
-            int sectionZ = buf.readVarInt();
-            int size = buf.readVarInt();
-            Short2ByteOpenHashMap sectionStates = parseSectionStates(buf, size, false);
-
+        NetworkManager.registerReceiver(NetworkManager.s2c(), this.sectionSnapshotPacketId, (buf, context) -> {
+            SectionPayload payload = readSectionPayload(buf);
+            if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                LOGGER.debug(
+                        "Krakk net recv damage_section_snapshot: dim={} section=({}, {}, {}) entries={} playerPresent={}",
+                        payload.dimensionId(),
+                        payload.sectionX(),
+                        payload.sectionY(),
+                        payload.sectionZ(),
+                        payload.states().size(),
+                        context.getPlayer() != null
+                );
+            }
             context.queue(() -> {
-                if (context.getPlayer() == null || context.getPlayer().level() == null) {
+                if (context.getPlayer() == null) {
+                    if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                        LOGGER.debug("Krakk net recv damage_section_snapshot dropped: no client player context");
+                    }
                     return;
                 }
-                if (!context.getPlayer().level().dimension().location().equals(dimensionId)) {
+                Level level = context.getPlayer().level();
+                if (level == null) {
+                    if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                        LOGGER.debug("Krakk net recv damage_section_snapshot dropped: player level is null");
+                    }
                     return;
                 }
-                ensureClientTrackingDimension(dimensionId);
-                markChunkInitialized(sectionX, sectionZ);
-                KrakkApi.clientOverlay().applySection(dimensionId, sectionX, sectionY, sectionZ, sectionStates);
+                if (!payload.dimensionId().equals(level.dimension().location())) {
+                    if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                        LOGGER.debug(
+                                "Krakk net recv damage_section_snapshot dropped: dimension mismatch packetDim={} clientDim={}",
+                                payload.dimensionId(),
+                                level.dimension().location()
+                        );
+                    }
+                    return;
+                }
+                KrakkChunkSectionDamageBridge.applySection(
+                        level,
+                        payload.sectionX(),
+                        payload.sectionY(),
+                        payload.sectionZ(),
+                        payload.states(),
+                        true
+                );
+                KrakkApi.clientOverlay().applySection(
+                        payload.dimensionId(),
+                        payload.sectionX(),
+                        payload.sectionY(),
+                        payload.sectionZ(),
+                        payload.states()
+                );
+                if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                    LOGGER.debug(
+                            "Krakk net recv damage_section_snapshot applied: dim={} section=({}, {}, {}) entries={}",
+                            payload.dimensionId(),
+                            payload.sectionX(),
+                            payload.sectionY(),
+                            payload.sectionZ(),
+                            payload.states().size()
+                    );
+                }
             });
         });
 
-        NetworkManager.registerReceiver(NetworkManager.s2c(), blockDamageSectionDeltaPacket, (buf, context) -> {
-            ResourceLocation dimensionId = buf.readResourceLocation();
-            int sectionX = buf.readVarInt();
-            int sectionY = buf.readVarInt();
-            int sectionZ = buf.readVarInt();
-            int size = buf.readVarInt();
-            Short2ByteOpenHashMap sectionStates = parseSectionStates(buf, size, true);
-
+        NetworkManager.registerReceiver(NetworkManager.s2c(), this.sectionDeltaPacketId, (buf, context) -> {
+            SectionPayload payload = readSectionPayload(buf);
+            if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                LOGGER.debug(
+                        "Krakk net recv damage_section_delta: dim={} section=({}, {}, {}) entries={} playerPresent={}",
+                        payload.dimensionId(),
+                        payload.sectionX(),
+                        payload.sectionY(),
+                        payload.sectionZ(),
+                        payload.states().size(),
+                        context.getPlayer() != null
+                );
+            }
             context.queue(() -> {
-                if (context.getPlayer() == null || context.getPlayer().level() == null) {
+                if (context.getPlayer() == null) {
+                    if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                        LOGGER.debug("Krakk net recv damage_section_delta dropped: no client player context");
+                    }
                     return;
                 }
-                if (!context.getPlayer().level().dimension().location().equals(dimensionId)) {
+                Level level = context.getPlayer().level();
+                if (level == null) {
+                    if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                        LOGGER.debug("Krakk net recv damage_section_delta dropped: player level is null");
+                    }
                     return;
                 }
-                ensureClientTrackingDimension(dimensionId);
-                if (!isChunkInitialized(sectionX, sectionZ)) {
-                    requestClientChunkResync(dimensionId, sectionX, sectionZ, context.getPlayer().level().getGameTime());
+                if (!payload.dimensionId().equals(level.dimension().location())) {
+                    if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                        LOGGER.debug(
+                                "Krakk net recv damage_section_delta dropped: dimension mismatch packetDim={} clientDim={}",
+                                payload.dimensionId(),
+                                level.dimension().location()
+                        );
+                    }
+                    return;
                 }
-                KrakkApi.clientOverlay().applySectionDelta(dimensionId, sectionX, sectionY, sectionZ, sectionStates);
+                KrakkChunkSectionDamageBridge.applySection(
+                        level,
+                        payload.sectionX(),
+                        payload.sectionY(),
+                        payload.sectionZ(),
+                        payload.states(),
+                        false
+                );
+                KrakkApi.clientOverlay().applySectionDelta(
+                        payload.dimensionId(),
+                        payload.sectionX(),
+                        payload.sectionY(),
+                        payload.sectionZ(),
+                        payload.states()
+                );
+                if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                    LOGGER.debug(
+                            "Krakk net recv damage_section_delta applied: dim={} section=({}, {}, {}) entries={}",
+                            payload.dimensionId(),
+                            payload.sectionX(),
+                            payload.sectionY(),
+                            payload.sectionZ(),
+                            payload.states().size()
+                    );
+                }
             });
         });
 
-        NetworkManager.registerReceiver(NetworkManager.s2c(), blockDamageChunkUnloadPacket, (buf, context) -> {
+        NetworkManager.registerReceiver(NetworkManager.s2c(), this.chunkUnloadPacketId, (buf, context) -> {
             ResourceLocation dimensionId = buf.readResourceLocation();
-            int chunkX = buf.readVarInt();
-            int chunkZ = buf.readVarInt();
-
-            context.queue(() -> {
-                if (context.getPlayer() == null || context.getPlayer().level() == null) {
-                    return;
-                }
-                if (!context.getPlayer().level().dimension().location().equals(dimensionId)) {
-                    return;
-                }
-                ensureClientTrackingDimension(dimensionId);
-                clearChunkInitialized(chunkX, chunkZ);
-                KrakkApi.clientOverlay().clearChunk(dimensionId, chunkX, chunkZ);
-            });
+            int chunkX = buf.readInt();
+            int chunkZ = buf.readInt();
+            if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                LOGGER.debug(
+                        "Krakk net recv damage_chunk_unload: dim={} chunk=({}, {})",
+                        dimensionId,
+                        chunkX,
+                        chunkZ
+                );
+            }
+            context.queue(() -> KrakkApi.clientOverlay().clearChunk(dimensionId, chunkX, chunkZ));
         });
 
-        NetworkManager.registerReceiver(NetworkManager.s2c(), blockDamageChunkInitPacket, (buf, context) -> {
+        NetworkManager.registerReceiver(NetworkManager.s2c(), this.chunkInitPacketId, (buf, context) -> {
             ResourceLocation dimensionId = buf.readResourceLocation();
-            int chunkX = buf.readVarInt();
-            int chunkZ = buf.readVarInt();
-
-            context.queue(() -> {
-                if (context.getPlayer() == null || context.getPlayer().level() == null) {
-                    return;
-                }
-                if (!context.getPlayer().level().dimension().location().equals(dimensionId)) {
-                    return;
-                }
-                ensureClientTrackingDimension(dimensionId);
-                markChunkInitialized(chunkX, chunkZ);
-            });
+            int chunkX = buf.readInt();
+            int chunkZ = buf.readInt();
+            if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                LOGGER.debug(
+                        "Krakk net recv damage_chunk_init: dim={} chunk=({}, {})",
+                        dimensionId,
+                        chunkX,
+                        chunkZ
+                );
+            }
         });
     }
 
     @Override
     public void sendDamageSync(ServerLevel level, BlockPos pos, int damageState) {
-        int clampedState = clampDamageState(damageState);
+        int targetChunkX = SectionPos.blockToSectionCoord(pos.getX());
+        int targetChunkZ = SectionPos.blockToSectionCoord(pos.getZ());
+        int viewDistance = level.getServer().getPlayerList().getViewDistance() + 1;
+
         ResourceLocation dimensionId = level.dimension().location();
-        ChunkPos targetChunk = new ChunkPos(pos);
-        List<ServerPlayer> recipients = collectTrackedPlayers(level, targetChunk.x, targetChunk.z);
-        sendDamageSyncBatch(recipients, dimensionId, pos.asLong(), clampedState);
+        int clampedState = clampDamageState(damageState);
+        int sent = 0;
+        for (ServerPlayer player : level.players()) {
+            if (player.level() != level) {
+                continue;
+            }
+            ChunkPos playerChunk = player.chunkPosition();
+            if (Math.abs(playerChunk.x - targetChunkX) > viewDistance || Math.abs(playerChunk.z - targetChunkZ) > viewDistance) {
+                continue;
+            }
+
+            FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
+            buf.writeResourceLocation(dimensionId);
+            buf.writeLong(pos.asLong());
+            buf.writeByte(clampedState);
+            NetworkManager.sendToPlayer(player, this.damageSyncPacketId, buf);
+            sent++;
+        }
+        if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+            LOGGER.debug(
+                    "Krakk net send damage_sync: dim={} pos=({}, {}, {}) state={} recipients={} viewDistance={}",
+                    dimensionId,
+                    pos.getX(),
+                    pos.getY(),
+                    pos.getZ(),
+                    clampedState,
+                    sent,
+                    viewDistance
+            );
+        }
     }
 
     @Override
@@ -215,15 +312,44 @@ public final class KrakkBlockDamageNetwork implements KrakkNetworkApi {
         if (players.isEmpty()) {
             return;
         }
-        FriendlyByteBuf serialized = serializeDamageSync(dimensionId, posLong, clampDamageState(damageState));
-        sendSharedPayload(players, this.blockDamageSyncPacket, serialized);
+        int clampedState = clampDamageState(damageState);
+        for (ServerPlayer player : players) {
+            FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
+            buf.writeResourceLocation(dimensionId);
+            buf.writeLong(posLong);
+            buf.writeByte(clampedState);
+            NetworkManager.sendToPlayer(player, this.damageSyncPacketId, buf);
+        }
+        if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+            LOGGER.debug(
+                    "Krakk net send damage_sync batch: dim={} pos=({}, {}, {}) state={} recipients={}",
+                    dimensionId,
+                    BlockPos.getX(posLong),
+                    BlockPos.getY(posLong),
+                    BlockPos.getZ(posLong),
+                    clampedState,
+                    players.size()
+            );
+        }
     }
 
     @Override
     public void sendSectionSnapshot(ServerPlayer player, ResourceLocation dimensionId,
                                     int sectionX, int sectionY, int sectionZ, Short2ByteOpenHashMap states) {
-        FriendlyByteBuf buf = serializeSectionSnapshot(dimensionId, sectionX, sectionY, sectionZ, states);
-        NetworkManager.sendToPlayer(player, blockDamageSectionPacket, buf);
+        FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
+        writeSectionPayload(buf, dimensionId, sectionX, sectionY, sectionZ, states);
+        NetworkManager.sendToPlayer(player, this.sectionSnapshotPacketId, buf);
+        if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+            LOGGER.debug(
+                    "Krakk net send damage_section_snapshot: dim={} section=({}, {}, {}) entries={} recipient={}",
+                    dimensionId,
+                    sectionX,
+                    sectionY,
+                    sectionZ,
+                    states.size(),
+                    player.getGameProfile().getName()
+            );
+        }
     }
 
     @Override
@@ -232,9 +358,23 @@ public final class KrakkBlockDamageNetwork implements KrakkNetworkApi {
         if (players.isEmpty()) {
             return;
         }
-
-        SharedPayload payload = serializeSectionSnapshotPayload(dimensionId, sectionX, sectionY, sectionZ, states);
-        sendSharedPayloadBatch(players, payload);
+        byte[] payload = encodeSectionPayload(dimensionId, sectionX, sectionY, sectionZ, states);
+        for (ServerPlayer player : players) {
+            FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.wrappedBuffer(payload));
+            NetworkManager.sendToPlayer(player, this.sectionSnapshotPacketId, buf);
+        }
+        if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+            LOGGER.debug(
+                    "Krakk net send damage_section_snapshot batch: dim={} section=({}, {}, {}) entries={} recipients={} bytes={}",
+                    dimensionId,
+                    sectionX,
+                    sectionY,
+                    sectionZ,
+                    states.size(),
+                    players.size(),
+                    payload.length
+            );
+        }
     }
 
     @Override
@@ -243,29 +383,33 @@ public final class KrakkBlockDamageNetwork implements KrakkNetworkApi {
         if (players.isEmpty()) {
             return;
         }
-
-        SharedPayload payload = serializeSectionDeltaPayload(dimensionId, sectionX, sectionY, sectionZ, states);
-        sendSharedPayloadBatch(players, payload);
+        byte[] payload = encodeSectionPayload(dimensionId, sectionX, sectionY, sectionZ, states);
+        for (ServerPlayer player : players) {
+            FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.wrappedBuffer(payload));
+            NetworkManager.sendToPlayer(player, this.sectionDeltaPacketId, buf);
+        }
+        if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+            LOGGER.debug(
+                    "Krakk net send damage_section_delta batch: dim={} section=({}, {}, {}) entries={} recipients={} bytes={}",
+                    dimensionId,
+                    sectionX,
+                    sectionY,
+                    sectionZ,
+                    states.size(),
+                    players.size(),
+                    payload.length
+            );
+        }
     }
 
     @Override
-    public SharedPayload serializeSectionSnapshotPayload(ResourceLocation dimensionId,
-                                                         int sectionX,
-                                                         int sectionY,
-                                                         int sectionZ,
-                                                         Short2ByteOpenHashMap states) {
-        FriendlyByteBuf serialized = serializeSectionSnapshot(dimensionId, sectionX, sectionY, sectionZ, states);
-        return new SharedPayload(this.blockDamageSectionPacket, copyPayload(serialized));
+    public SharedPayload serializeSectionSnapshotPayload(ResourceLocation dimensionId, int sectionX, int sectionY, int sectionZ, Short2ByteOpenHashMap states) {
+        return new SharedPayload(this.sectionSnapshotPacketId, encodeSectionPayload(dimensionId, sectionX, sectionY, sectionZ, states));
     }
 
     @Override
-    public SharedPayload serializeSectionDeltaPayload(ResourceLocation dimensionId,
-                                                      int sectionX,
-                                                      int sectionY,
-                                                      int sectionZ,
-                                                      Short2ByteOpenHashMap states) {
-        FriendlyByteBuf serialized = serializeSectionDelta(dimensionId, sectionX, sectionY, sectionZ, states);
-        return new SharedPayload(this.blockDamageSectionDeltaPacket, copyPayload(serialized));
+    public SharedPayload serializeSectionDeltaPayload(ResourceLocation dimensionId, int sectionX, int sectionY, int sectionZ, Short2ByteOpenHashMap states) {
+        return new SharedPayload(this.sectionDeltaPacketId, encodeSectionPayload(dimensionId, sectionX, sectionY, sectionZ, states));
     }
 
     @Override
@@ -273,182 +417,104 @@ public final class KrakkBlockDamageNetwork implements KrakkNetworkApi {
         if (players.isEmpty() || payload == null || payload.payload() == null) {
             return;
         }
-        sendSharedPayloadBytes(players, payload.packetId(), payload.payload());
+        for (ServerPlayer player : players) {
+            FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.wrappedBuffer(payload.payload()));
+            NetworkManager.sendToPlayer(player, payload.packetId(), buf);
+        }
+        if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+            LOGGER.debug(
+                    "Krakk net send shared payload batch: packet={} recipients={} bytes={}",
+                    payload.packetId(),
+                    players.size(),
+                    payload.payload().length
+            );
+        }
     }
 
     @Override
     public void sendChunkUnload(ServerPlayer player, ResourceLocation dimensionId, int chunkX, int chunkZ) {
         FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
         buf.writeResourceLocation(dimensionId);
-        buf.writeVarInt(chunkX);
-        buf.writeVarInt(chunkZ);
-        NetworkManager.sendToPlayer(player, blockDamageChunkUnloadPacket, buf);
+        buf.writeInt(chunkX);
+        buf.writeInt(chunkZ);
+        NetworkManager.sendToPlayer(player, this.chunkUnloadPacketId, buf);
+        if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+            LOGGER.debug(
+                    "Krakk net send damage_chunk_unload: dim={} chunk=({}, {}) recipient={}",
+                    dimensionId,
+                    chunkX,
+                    chunkZ,
+                    player.getGameProfile().getName()
+            );
+        }
     }
 
     @Override
     public void sendChunkInit(ServerPlayer player, ResourceLocation dimensionId, int chunkX, int chunkZ) {
         FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
         buf.writeResourceLocation(dimensionId);
-        buf.writeVarInt(chunkX);
-        buf.writeVarInt(chunkZ);
-        NetworkManager.sendToPlayer(player, blockDamageChunkInitPacket, buf);
-    }
-
-    private static boolean isChunkRelevantToPlayer(ServerLevel level, ServerPlayer player, int chunkX, int chunkZ) {
-        return collectTrackedPlayers(level, chunkX, chunkZ).contains(player);
-    }
-
-    private static List<ServerPlayer> collectTrackedPlayers(ServerLevel level, int chunkX, int chunkZ) {
-        Object chunkSource = level.getChunkSource();
-        if (chunkSource instanceof KrakkServerChunkCacheAccess access) {
-            List<ServerPlayer> trackedPlayers = access.krakk$getTrackingPlayers(chunkX, chunkZ, false);
-            if (!trackedPlayers.isEmpty()) {
-                return new ArrayList<>(trackedPlayers);
-            }
-            return List.of();
+        buf.writeInt(chunkX);
+        buf.writeInt(chunkZ);
+        NetworkManager.sendToPlayer(player, this.chunkInitPacketId, buf);
+        if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+            LOGGER.debug(
+                    "Krakk net send damage_chunk_init: dim={} chunk=({}, {}) recipient={}",
+                    dimensionId,
+                    chunkX,
+                    chunkZ,
+                    player.getGameProfile().getName()
+            );
         }
-
-        int viewDistance = level.getServer().getPlayerList().getViewDistance() + 1;
-        ArrayList<ServerPlayer> fallback = new ArrayList<>();
-        for (ServerPlayer player : level.players()) {
-            if (player.level() != level) {
-                continue;
-            }
-            ChunkPos playerChunk = player.chunkPosition();
-            if (Math.abs(playerChunk.x - chunkX) > viewDistance || Math.abs(playerChunk.z - chunkZ) > viewDistance) {
-                continue;
-            }
-            fallback.add(player);
-        }
-        return fallback;
-    }
-
-    private void ensureClientTrackingDimension(ResourceLocation dimensionId) {
-        if (dimensionId.equals(this.clientTrackingDimension)) {
-            return;
-        }
-        this.clientTrackingDimension = dimensionId;
-        this.clientInitializedChunks.clear();
-        this.clientResyncCooldownByChunk.clear();
-    }
-
-    private boolean isChunkInitialized(int chunkX, int chunkZ) {
-        return this.clientInitializedChunks.contains(ChunkPos.asLong(chunkX, chunkZ));
-    }
-
-    private void markChunkInitialized(int chunkX, int chunkZ) {
-        this.clientInitializedChunks.add(ChunkPos.asLong(chunkX, chunkZ));
-    }
-
-    private void clearChunkInitialized(int chunkX, int chunkZ) {
-        long chunkKey = ChunkPos.asLong(chunkX, chunkZ);
-        this.clientInitializedChunks.remove(chunkKey);
-        this.clientResyncCooldownByChunk.remove(chunkKey);
-    }
-
-    private void requestClientChunkResync(ResourceLocation dimensionId, int chunkX, int chunkZ, long gameTime) {
-        long chunkKey = ChunkPos.asLong(chunkX, chunkZ);
-        long allowedAt = this.clientResyncCooldownByChunk.get(chunkKey);
-        if (allowedAt > gameTime) {
-            return;
-        }
-        this.clientResyncCooldownByChunk.put(chunkKey, gameTime + CHUNK_RESYNC_REQUEST_COOLDOWN_TICKS);
-
-        FriendlyByteBuf request = new FriendlyByteBuf(Unpooled.buffer());
-        request.writeResourceLocation(dimensionId);
-        request.writeVarInt(chunkX);
-        request.writeVarInt(chunkZ);
-        NetworkManager.sendToServer(blockDamageChunkResyncRequestPacket, request);
     }
 
     private static int clampDamageState(int damageState) {
         return Math.max(0, Math.min(15, damageState));
     }
 
-    private static FriendlyByteBuf serializeDamageSync(ResourceLocation dimensionId, long posLong, int clampedState) {
+    private static byte[] encodeSectionPayload(ResourceLocation dimensionId, int sectionX, int sectionY, int sectionZ, Short2ByteOpenHashMap states) {
         FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
-        buf.writeResourceLocation(dimensionId);
-        buf.writeLong(posLong);
-        buf.writeByte(clampedState);
-        return buf;
-    }
-
-    private static FriendlyByteBuf serializeSectionSnapshot(ResourceLocation dimensionId,
-                                                            int sectionX,
-                                                            int sectionY,
-                                                            int sectionZ,
-                                                            Short2ByteOpenHashMap states) {
-        return serializeSection(dimensionId, sectionX, sectionY, sectionZ, states, false);
-    }
-
-    private static FriendlyByteBuf serializeSectionDelta(ResourceLocation dimensionId,
-                                                         int sectionX,
-                                                         int sectionY,
-                                                         int sectionZ,
-                                                         Short2ByteOpenHashMap states) {
-        return serializeSection(dimensionId, sectionX, sectionY, sectionZ, states, true);
-    }
-
-    private static FriendlyByteBuf serializeSection(ResourceLocation dimensionId,
-                                                    int sectionX,
-                                                    int sectionY,
-                                                    int sectionZ,
-                                                    Short2ByteOpenHashMap states,
-                                                    boolean allowZeroStates) {
-        FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
-        buf.writeResourceLocation(dimensionId);
-        buf.writeVarInt(sectionX);
-        buf.writeVarInt(sectionY);
-        buf.writeVarInt(sectionZ);
-        int entryCount = 0;
-        for (Short2ByteMap.Entry entry : states.short2ByteEntrySet()) {
-            int clampedState = clampDamageState(entry.getByteValue());
-            if (allowZeroStates || clampedState > 0) {
-                entryCount++;
-            }
-        }
-        buf.writeVarInt(entryCount);
-
-        for (Short2ByteMap.Entry entry : states.short2ByteEntrySet()) {
-            int clampedState = clampDamageState(entry.getByteValue());
-            if (!allowZeroStates && clampedState <= 0) {
-                continue;
-            }
-            buf.writeShort(entry.getShortKey() & 0x0FFF);
-            buf.writeByte(clampedState);
-        }
-        return buf;
-    }
-
-    private static Short2ByteOpenHashMap parseSectionStates(FriendlyByteBuf buf, int size, boolean allowZeroStates) {
-        Short2ByteOpenHashMap sectionStates = new Short2ByteOpenHashMap(Math.max(0, size));
-        for (int i = 0; i < size; i++) {
-            short localIndex = buf.readShort();
-            int clampedState = clampDamageState(buf.readByte());
-            if (!allowZeroStates && clampedState <= 0) {
-                continue;
-            }
-            sectionStates.put((short) (localIndex & 0x0FFF), (byte) clampedState);
-        }
-        return sectionStates;
-    }
-
-    private static void sendSharedPayload(List<ServerPlayer> players, ResourceLocation packetId, FriendlyByteBuf serialized) {
-        sendSharedPayloadBytes(players, packetId, copyPayload(serialized));
-    }
-
-    private static byte[] copyPayload(FriendlyByteBuf serialized) {
-        int startIndex = serialized.readerIndex();
-        int byteLength = serialized.readableBytes();
-        byte[] payload = new byte[byteLength];
-        serialized.getBytes(startIndex, payload);
+        writeSectionPayload(buf, dimensionId, sectionX, sectionY, sectionZ, states);
+        byte[] payload = new byte[buf.readableBytes()];
+        buf.getBytes(0, payload);
         return payload;
     }
 
-    private static void sendSharedPayloadBytes(List<ServerPlayer> players, ResourceLocation packetId, byte[] payload) {
-        for (ServerPlayer player : players) {
-            FriendlyByteBuf playerBuf = new FriendlyByteBuf(Unpooled.wrappedBuffer(payload));
-            NetworkManager.sendToPlayer(player, packetId, playerBuf);
+    private static void writeSectionPayload(FriendlyByteBuf buf,
+                                            ResourceLocation dimensionId,
+                                            int sectionX,
+                                            int sectionY,
+                                            int sectionZ,
+                                            Short2ByteOpenHashMap states) {
+        buf.writeResourceLocation(dimensionId);
+        buf.writeInt(sectionX);
+        buf.writeInt(sectionY);
+        buf.writeInt(sectionZ);
+        buf.writeVarInt(states.size());
+        for (Short2ByteMap.Entry entry : states.short2ByteEntrySet()) {
+            buf.writeShort(entry.getShortKey() & 0x0FFF);
+            buf.writeByte(clampDamageState(entry.getByteValue()));
         }
+    }
+
+    private static SectionPayload readSectionPayload(FriendlyByteBuf buf) {
+        ResourceLocation dimensionId = buf.readResourceLocation();
+        int sectionX = buf.readInt();
+        int sectionY = buf.readInt();
+        int sectionZ = buf.readInt();
+        int count = Math.max(0, buf.readVarInt());
+        Short2ByteOpenHashMap states = new Short2ByteOpenHashMap(count);
+        for (int i = 0; i < count; i++) {
+            short localIndex = (short) (buf.readShort() & 0x0FFF);
+            byte damageState = (byte) clampDamageState(buf.readByte());
+            states.put(localIndex, damageState);
+        }
+        return new SectionPayload(dimensionId, sectionX, sectionY, sectionZ, states);
+    }
+
+    private record SectionPayload(ResourceLocation dimensionId,
+                                  int sectionX,
+                                  int sectionY,
+                                  int sectionZ,
+                                  Short2ByteOpenHashMap states) {
     }
 }

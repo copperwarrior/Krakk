@@ -7,6 +7,8 @@ import it.unimi.dsi.fastutil.shorts.Short2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.shorts.Short2LongOpenHashMap;
 import net.minecraft.core.BlockPos;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.world.level.chunk.ChunkAccess;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 
 public final class KrakkBlockDamageChunkStorage {
     public static final String ROOT_TAG = "KrakkDamage";
@@ -21,9 +23,19 @@ public final class KrakkBlockDamageChunkStorage {
     private static final int NO_DAMAGE_STATE = -1;
     private static final long NO_LAST_UPDATE_TICK = -1L;
 
+    private final ChunkAccess ownerChunk;
     private final Int2ObjectOpenHashMap<SectionDamageState> sectionsByY = new Int2ObjectOpenHashMap<>();
 
+    public KrakkBlockDamageChunkStorage() {
+        this(null);
+    }
+
+    public KrakkBlockDamageChunkStorage(ChunkAccess ownerChunk) {
+        this.ownerChunk = ownerChunk;
+    }
+
     public void load(CompoundTag tag) {
+        this.clearOwnerSectionStates();
         this.sectionsByY.clear();
 
         int[] sectionYs = tag.getIntArray(SECTION_YS_TAG);
@@ -86,10 +98,12 @@ public final class KrakkBlockDamageChunkStorage {
         if (other == this) {
             return;
         }
+        this.clearOwnerSectionStates();
         this.sectionsByY.clear();
         for (Int2ObjectMap.Entry<SectionDamageState> entry : other.sectionsByY.int2ObjectEntrySet()) {
             this.sectionsByY.put(entry.getIntKey(), entry.getValue().copy());
         }
+        this.syncAllOwnerSectionStates();
     }
 
     public boolean isEmpty() {
@@ -145,6 +159,7 @@ public final class KrakkBlockDamageChunkStorage {
 
         int previousState = section.damageStates.put(localIndex, (byte) clamped);
         long previousTick = section.lastUpdateTicks.put(localIndex, lastUpdateTick);
+        this.syncOwnerSectionState(sectionY, localIndex, clamped);
         return previousState != clamped || previousTick != lastUpdateTick;
     }
 
@@ -158,6 +173,7 @@ public final class KrakkBlockDamageChunkStorage {
         short localIndex = localIndexFromPosLong(posLong);
         int previous = section.damageStates.remove(localIndex);
         section.lastUpdateTicks.remove(localIndex);
+        this.syncOwnerSectionState(sectionY, localIndex, 0);
 
         if (section.damageStates.isEmpty()) {
             this.sectionsByY.remove(sectionY);
@@ -210,6 +226,65 @@ public final class KrakkBlockDamageChunkStorage {
         }
         section.damageStates.put(localIndex, damageState);
         section.lastUpdateTicks.put(localIndex, updateTick);
+        this.syncOwnerSectionState(sectionY, localIndex, damageState);
+    }
+
+    private void clearOwnerSectionStates() {
+        if (this.ownerChunk == null) {
+            return;
+        }
+        for (LevelChunkSection section : this.ownerChunk.getSections()) {
+            if (section instanceof KrakkBlockDamageSectionAccess access) {
+                access.krakk$clearDamageStates();
+            }
+        }
+    }
+
+    private void syncAllOwnerSectionStates() {
+        if (this.ownerChunk == null) {
+            return;
+        }
+        this.clearOwnerSectionStates();
+        for (Int2ObjectMap.Entry<SectionDamageState> sectionEntry : this.sectionsByY.int2ObjectEntrySet()) {
+            int sectionY = sectionEntry.getIntKey();
+            KrakkBlockDamageSectionAccess sectionAccess = this.ownerSection(sectionY);
+            if (sectionAccess == null) {
+                continue;
+            }
+            for (Short2ByteMap.Entry stateEntry : sectionEntry.getValue().damageStates.short2ByteEntrySet()) {
+                sectionAccess.krakk$setDamageState(stateEntry.getShortKey(), stateEntry.getByteValue());
+            }
+        }
+    }
+
+    private void syncOwnerSectionState(int sectionY, short localIndex, int damageState) {
+        KrakkBlockDamageSectionAccess sectionAccess = this.ownerSection(sectionY);
+        if (sectionAccess == null) {
+            return;
+        }
+        if (damageState <= 0) {
+            sectionAccess.krakk$removeDamageState(localIndex);
+            return;
+        }
+        sectionAccess.krakk$setDamageState(localIndex, (byte) clamp(damageState, 0, MAX_DAMAGE_STATE));
+    }
+
+    private KrakkBlockDamageSectionAccess ownerSection(int sectionY) {
+        if (this.ownerChunk == null) {
+            return null;
+        }
+
+        int sectionIndex = sectionY - (this.ownerChunk.getMinBuildHeight() >> 4);
+        LevelChunkSection[] sections = this.ownerChunk.getSections();
+        if (sectionIndex < 0 || sectionIndex >= sections.length) {
+            return null;
+        }
+
+        LevelChunkSection section = sections[sectionIndex];
+        if (section instanceof KrakkBlockDamageSectionAccess access) {
+            return access;
+        }
+        return null;
     }
 
     private static int sectionYFromPosLong(long posLong) {

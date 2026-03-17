@@ -9,7 +9,8 @@ import org.spongepowered.asm.mixin.Unique;
 @Mixin(ChunkAccess.class)
 public abstract class KrakkChunkAccessMixin implements KrakkBlockDamageChunkAccess {
     @Unique
-    private final KrakkBlockDamageChunkStorage krakk$blockDamageStorage = new KrakkBlockDamageChunkStorage();
+    private final KrakkBlockDamageChunkStorage krakk$blockDamageStorage =
+            new KrakkBlockDamageChunkStorage((ChunkAccess) (Object) this);
 
     @Override
     public KrakkBlockDamageChunkStorage krakk$getBlockDamageStorage() {

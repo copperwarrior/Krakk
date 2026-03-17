@@ -64,17 +64,20 @@ final class KrakkClientShaderPackCompat {
         }
 
         try {
-            Object currentPack = irisGetCurrentPackMethod.invoke(null);
-            if (currentPack instanceof java.util.Optional<?> optional && optional.isPresent()) {
-                return true;
-            }
-
             Object irisConfig = irisGetConfigMethod.invoke(null);
             if (irisConfig == null) {
                 return false;
             }
             Object shadersEnabled = irisConfigAreShadersEnabledMethod.invoke(irisConfig);
-            return shadersEnabled instanceof Boolean bool && bool;
+            if (!(shadersEnabled instanceof Boolean bool) || !bool) {
+                return false;
+            }
+
+            Object currentPack = irisGetCurrentPackMethod.invoke(null);
+            if (currentPack instanceof java.util.Optional<?> optional && optional.isPresent()) {
+                return true;
+            }
+            return false;
         } catch (ReflectiveOperationException | RuntimeException ignored) {
             return false;
         }

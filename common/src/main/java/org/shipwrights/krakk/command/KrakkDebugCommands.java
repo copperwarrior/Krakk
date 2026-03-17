@@ -34,7 +34,12 @@ import org.shipwrights.krakk.state.chunk.KrakkBlockDamageChunkStorage;
 import org.shipwrights.krakk.runtime.explosion.KrakkExplosionRuntime;
 import org.slf4j.Logger;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 public final class KrakkDebugCommands {
     private static final Logger LOGGER = LogUtils.getLogger();
@@ -319,6 +324,23 @@ public final class KrakkDebugCommands {
                                         .executes(context -> stats(
                                                 context.getSource(),
                                                 EntityArgument.getPlayer(context, "player")))))
+                        .then(Commands.literal("validatedamage")
+                                .executes(context -> validateDamageSections(context.getSource(), null, 8))
+                                .then(Commands.argument("top", IntegerArgumentType.integer(1, 64))
+                                        .executes(context -> validateDamageSections(
+                                                context.getSource(),
+                                                null,
+                                                IntegerArgumentType.getInteger(context, "top"))))
+                                .then(Commands.argument("player", EntityArgument.player())
+                                        .executes(context -> validateDamageSections(
+                                                context.getSource(),
+                                                EntityArgument.getPlayer(context, "player"),
+                                                8))
+                                        .then(Commands.argument("top", IntegerArgumentType.integer(1, 64))
+                                                .executes(context -> validateDamageSections(
+                                                        context.getSource(),
+                                                        EntityArgument.getPlayer(context, "player"),
+                                                        IntegerArgumentType.getInteger(context, "top"))))))
                         .then(Commands.literal("overlay")
                                 .then(Commands.literal("refresh")
                                         .executes(context -> overlayRefresh(context.getSource(), null))
@@ -1628,6 +1650,134 @@ public final class KrakkDebugCommands {
         return finalDamagedBlocks;
     }
 
+    private static int validateDamageSections(CommandSourceStack source, ServerPlayer explicitTarget, int topChunks) {
+        ServerPlayer target = resolveTargetPlayer(source, explicitTarget);
+        if (target == null) {
+            return 0;
+        }
+
+        final int[] chunksWithDamage = {0};
+        final int[] damagedSections = {0};
+        final int[] damagedBlocks = {0};
+        final long[] worldYMod4Counts = new long[4];
+        final long[] chunkXMod4WithDamage = new long[4];
+        Map<Integer, Long> sectionEntriesByY = new HashMap<>();
+        Map<Integer, Integer> sectionCountsByY = new HashMap<>();
+        Map<Integer, Long> entriesByChunkX = new HashMap<>();
+        List<ChunkDamageSummary> chunkSummaries = new ArrayList<>();
+
+        ChunkLoop loop = iterateLoadedChunksForPlayer(target, (chunk, chunkX, chunkZ) -> {
+            if (!(chunk instanceof KrakkBlockDamageChunkAccess access)) {
+                return;
+            }
+
+            KrakkBlockDamageChunkStorage storage = access.krakk$getBlockDamageStorage();
+            final int[] chunkEntryCount = {0};
+            final int[] chunkSectionCount = {0};
+            storage.forEachSection((sectionY, states) -> {
+                if (states.isEmpty()) {
+                    return;
+                }
+
+                int sectionEntries = states.size();
+                chunkEntryCount[0] += sectionEntries;
+                chunkSectionCount[0]++;
+                sectionEntriesByY.merge(sectionY, (long) sectionEntries, Long::sum);
+                sectionCountsByY.merge(sectionY, 1, Integer::sum);
+                for (Short2ByteMap.Entry entry : states.short2ByteEntrySet()) {
+                    int localIndex = entry.getShortKey() & 0x0FFF;
+                    int localY = (localIndex >> 8) & 15;
+                    int worldY = (sectionY << 4) | localY;
+                    worldYMod4Counts[worldY & 3]++;
+                }
+            });
+
+            if (chunkEntryCount[0] <= 0) {
+                return;
+            }
+
+            chunksWithDamage[0]++;
+            damagedSections[0] += chunkSectionCount[0];
+            damagedBlocks[0] += chunkEntryCount[0];
+            chunkXMod4WithDamage[Math.floorMod(chunkX, 4)]++;
+            entriesByChunkX.merge(chunkX, (long) chunkEntryCount[0], Long::sum);
+            chunkSummaries.add(new ChunkDamageSummary(chunkX, chunkZ, chunkSectionCount[0], chunkEntryCount[0]));
+        });
+
+        source.sendSuccess(() -> Component.literal(String.format(
+                "Krakk validate damage for %s: loadedChunks=%d chunksWithDamage=%d damagedSections=%d damagedBlocks=%d",
+                target.getGameProfile().getName(),
+                loop.loadedChunks(),
+                chunksWithDamage[0],
+                damagedSections[0],
+                damagedBlocks[0]
+        )), false);
+
+        if (damagedBlocks[0] <= 0) {
+            source.sendSuccess(() -> Component.literal("No loaded chunk damage states found for this player view."), false);
+            return 0;
+        }
+
+        source.sendSuccess(() -> Component.literal(String.format(
+                "chunkX%%4 with damage chunks: [0]=%d [1]=%d [2]=%d [3]=%d",
+                chunkXMod4WithDamage[0],
+                chunkXMod4WithDamage[1],
+                chunkXMod4WithDamage[2],
+                chunkXMod4WithDamage[3]
+        )), false);
+        source.sendSuccess(() -> Component.literal(String.format(
+                "worldY%%4 with damage blocks: [0]=%d [1]=%d [2]=%d [3]=%d",
+                worldYMod4Counts[0],
+                worldYMod4Counts[1],
+                worldYMod4Counts[2],
+                worldYMod4Counts[3]
+        )), false);
+
+        List<Integer> sortedSectionY = new ArrayList<>(sectionEntriesByY.keySet());
+        sortedSectionY.sort(Integer::compareTo);
+        for (int sectionY : sortedSectionY) {
+            long entries = sectionEntriesByY.getOrDefault(sectionY, 0L);
+            int sections = sectionCountsByY.getOrDefault(sectionY, 0);
+            source.sendSuccess(() -> Component.literal(String.format(
+                    "sectionY=%d entries=%d sections=%d",
+                    sectionY,
+                    entries,
+                    sections
+            )), false);
+        }
+
+        List<Map.Entry<Integer, Long>> sortedChunkXColumns = new ArrayList<>(entriesByChunkX.entrySet());
+        sortedChunkXColumns.sort((left, right) -> Long.compare(right.getValue(), left.getValue()));
+        int topColumns = Math.min(8, sortedChunkXColumns.size());
+        for (int i = 0; i < topColumns; i++) {
+            Map.Entry<Integer, Long> column = sortedChunkXColumns.get(i);
+            int rank = i + 1;
+            source.sendSuccess(() -> Component.literal(String.format(
+                    "topChunkX[%d] x=%d entries=%d",
+                    rank,
+                    column.getKey(),
+                    column.getValue()
+            )), false);
+        }
+
+        chunkSummaries.sort(Comparator.comparingInt(ChunkDamageSummary::entries).reversed());
+        int topChunkCount = Math.min(Math.max(1, topChunks), chunkSummaries.size());
+        for (int i = 0; i < topChunkCount; i++) {
+            ChunkDamageSummary summary = chunkSummaries.get(i);
+            int rank = i + 1;
+            source.sendSuccess(() -> Component.literal(String.format(
+                    "topChunk[%d] chunk=(%d, %d) entries=%d sections=%d",
+                    rank,
+                    summary.chunkX(),
+                    summary.chunkZ(),
+                    summary.entries(),
+                    summary.sections()
+            )), false);
+        }
+
+        return damagedBlocks[0];
+    }
+
     private static int overlayRefresh(CommandSourceStack source, ServerPlayer explicitTarget) {
         return syncLoadedChunks(source, explicitTarget);
     }
@@ -1690,6 +1840,9 @@ public final class KrakkDebugCommands {
     }
 
     private record ChunkLoop(int loadedChunks) {
+    }
+
+    private record ChunkDamageSummary(int chunkX, int chunkZ, int sections, int entries) {
     }
 
     private record Bounds(int minX, int minY, int minZ, int maxX, int maxY, int maxZ) {

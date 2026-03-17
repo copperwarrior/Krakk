@@ -1,5 +1,6 @@
 package org.shipwrights.krakk.runtime.client;
 
+import com.mojang.logging.LogUtils;
 import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
@@ -11,8 +12,12 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.resources.ResourceLocation;
 import org.shipwrights.krakk.api.client.KrakkClientOverlayApi;
+import org.shipwrights.krakk.runtime.damage.KrakkDamageRuntime;
+import org.slf4j.Logger;
 
 public final class KrakkClientOverlayRuntime implements KrakkClientOverlayApi {
+    private static final Logger LOGGER = LogUtils.getLogger();
+
     private final Object lock = new Object();
     private final Long2ByteOpenHashMap damageStates = new Long2ByteOpenHashMap();
     private final Long2ObjectOpenHashMap<LongOpenHashSet> damagePositionsByChunk = new Long2ObjectOpenHashMap<>();
@@ -33,6 +38,13 @@ public final class KrakkClientOverlayRuntime implements KrakkClientOverlayApi {
     public void applyDamage(ResourceLocation dimensionId, long posLong, int damageState) {
         synchronized (this.lock) {
             if (!dimensionId.equals(this.activeDimensionId)) {
+                if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                    LOGGER.debug(
+                            "Krakk overlay dimension swap on applyDamage: previousDim={} nextDim={}",
+                            this.activeDimensionId,
+                            dimensionId
+                    );
+                }
                 this.clearAll();
                 this.activeDimensionId = dimensionId;
             }
@@ -40,10 +52,30 @@ public final class KrakkClientOverlayRuntime implements KrakkClientOverlayApi {
             int clampedState = Math.max(0, Math.min(15, damageState));
             if (clampedState <= 0) {
                 this.removeDamageState(posLong);
+                if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                    LOGGER.debug(
+                            "Krakk overlay applyDamage remove: dim={} pos=({}, {}, {})",
+                            dimensionId,
+                            BlockPos.getX(posLong),
+                            BlockPos.getY(posLong),
+                            BlockPos.getZ(posLong)
+                    );
+                }
                 return;
             }
 
             this.putDamageState(posLong, (byte) clampedState);
+            if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                LOGGER.debug(
+                        "Krakk overlay applyDamage set: dim={} pos=({}, {}, {}) state={} trackedBlocks={}",
+                        dimensionId,
+                        BlockPos.getX(posLong),
+                        BlockPos.getY(posLong),
+                        BlockPos.getZ(posLong),
+                        clampedState,
+                        this.damageStates.size()
+                );
+            }
         }
     }
 
@@ -51,6 +83,13 @@ public final class KrakkClientOverlayRuntime implements KrakkClientOverlayApi {
     public void applySection(ResourceLocation dimensionId, int sectionX, int sectionY, int sectionZ, Short2ByteOpenHashMap sectionStates) {
         synchronized (this.lock) {
             if (!dimensionId.equals(this.activeDimensionId)) {
+                if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                    LOGGER.debug(
+                            "Krakk overlay dimension swap on applySection: previousDim={} nextDim={}",
+                            this.activeDimensionId,
+                            dimensionId
+                    );
+                }
                 this.clearAll();
                 this.activeDimensionId = dimensionId;
             }
@@ -77,6 +116,18 @@ public final class KrakkClientOverlayRuntime implements KrakkClientOverlayApi {
             }
 
             this.dirtySections.add(sectionKey);
+            if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                LOGGER.debug(
+                        "Krakk overlay applySection: dim={} section=({}, {}, {}) entries={} trackedBlocks={} dirtySections={}",
+                        dimensionId,
+                        sectionX,
+                        sectionY,
+                        sectionZ,
+                        sectionStates.size(),
+                        this.damageStates.size(),
+                        this.dirtySections.size()
+                );
+            }
         }
     }
 
@@ -84,6 +135,13 @@ public final class KrakkClientOverlayRuntime implements KrakkClientOverlayApi {
     public void applySectionDelta(ResourceLocation dimensionId, int sectionX, int sectionY, int sectionZ, Short2ByteOpenHashMap sectionStates) {
         synchronized (this.lock) {
             if (!dimensionId.equals(this.activeDimensionId)) {
+                if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                    LOGGER.debug(
+                            "Krakk overlay dimension swap on applySectionDelta: previousDim={} nextDim={}",
+                            this.activeDimensionId,
+                            dimensionId
+                    );
+                }
                 this.clearAll();
                 this.activeDimensionId = dimensionId;
             }
@@ -106,6 +164,18 @@ public final class KrakkClientOverlayRuntime implements KrakkClientOverlayApi {
                     this.putDamageState(posLong, (byte) clampedState);
                 }
             }
+            if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                LOGGER.debug(
+                        "Krakk overlay applySectionDelta: dim={} section=({}, {}, {}) entries={} trackedBlocks={} dirtySections={}",
+                        dimensionId,
+                        sectionX,
+                        sectionY,
+                        sectionZ,
+                        sectionStates.size(),
+                        this.damageStates.size(),
+                        this.dirtySections.size()
+                );
+            }
         }
     }
 
@@ -125,6 +195,16 @@ public final class KrakkClientOverlayRuntime implements KrakkClientOverlayApi {
             long[] posLongs = positions.toLongArray();
             for (long posLong : posLongs) {
                 this.removeDamageState(posLong);
+            }
+            if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                LOGGER.debug(
+                        "Krakk overlay clearChunk: dim={} chunk=({}, {}) removed={} trackedBlocks={}",
+                        dimensionId,
+                        chunkX,
+                        chunkZ,
+                        posLongs.length,
+                        this.damageStates.size()
+                );
             }
         }
     }
@@ -213,11 +293,14 @@ public final class KrakkClientOverlayRuntime implements KrakkClientOverlayApi {
 
     private void putDamageState(long posLong, byte damageState) {
         byte previous = this.damageStates.put(posLong, damageState);
+        long sectionKey = toSectionKeyFromPos(posLong);
         if (previous == damageState) {
+            // Re-emitted identical states are used as a render invalidation signal
+            // (for neighbor/blockstate changes that alter visuals without changing damage value).
+            this.dirtySections.add(sectionKey);
             return;
         }
 
-        long sectionKey = toSectionKeyFromPos(posLong);
         this.dirtySections.add(sectionKey);
         if (previous > 0) {
             return;

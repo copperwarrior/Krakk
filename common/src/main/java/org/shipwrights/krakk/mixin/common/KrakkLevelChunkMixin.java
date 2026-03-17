@@ -9,6 +9,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.ProtoChunk;
 import org.shipwrights.krakk.api.KrakkApi;
+import org.shipwrights.krakk.runtime.damage.KrakkDamageRuntime;
 import org.shipwrights.krakk.state.chunk.KrakkBlockDamageChunkAccess;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -58,6 +59,9 @@ public abstract class KrakkLevelChunkMixin {
         if (oldState == null) {
             return;
         }
+        if (!oldState.equals(newState)) {
+            this.krakk$refreshAdjacentDamageStates(serverLevel, blockPos);
+        }
         if (oldState.getBlock() == newState.getBlock()) {
             return;
         }
@@ -81,5 +85,12 @@ public abstract class KrakkLevelChunkMixin {
         }
 
         KrakkApi.damage().clearDamage(serverLevel, blockPos);
+    }
+
+    @Unique
+    private void krakk$refreshAdjacentDamageStates(ServerLevel level, BlockPos origin) {
+        if (KrakkApi.damage() instanceof KrakkDamageRuntime runtime) {
+            runtime.refreshAdjacentDamageStates(level, origin);
+        }
     }
 }

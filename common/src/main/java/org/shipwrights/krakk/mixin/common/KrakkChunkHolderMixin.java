@@ -1,22 +1,23 @@
 package org.shipwrights.krakk.mixin.common;
 
-import it.unimi.dsi.fastutil.shorts.Short2ByteMap;
+import com.mojang.logging.LogUtils;
 import it.unimi.dsi.fastutil.shorts.Short2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.shorts.ShortIterator;
 import it.unimi.dsi.fastutil.shorts.ShortOpenHashSet;
 import it.unimi.dsi.fastutil.shorts.ShortSet;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
-import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ChunkHolder;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LevelHeightAccessor;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 import org.jetbrains.annotations.Nullable;
 import org.shipwrights.krakk.api.KrakkApi;
-import org.shipwrights.krakk.state.chunk.KrakkBlockDamageChunkAccess;
-import org.shipwrights.krakk.state.chunk.KrakkBlockDamageChunkStorage;
+import org.shipwrights.krakk.runtime.damage.KrakkDamageRuntime;
+import org.shipwrights.krakk.state.chunk.KrakkBlockDamageSectionAccess;
 import org.shipwrights.krakk.state.network.KrakkChunkHolderAccess;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -25,21 +26,25 @@ import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.slf4j.Logger;
 
 import java.util.List;
 
 @Mixin(ChunkHolder.class)
 public abstract class KrakkChunkHolderMixin implements KrakkChunkHolderAccess {
+    @Unique
+    private static final Logger KRAKK_LOGGER = LogUtils.getLogger();
+
     @Shadow
     public abstract @Nullable LevelChunk getTickingChunk();
 
     @Shadow
     @Final
-    private LevelHeightAccessor levelHeightAccessor;
+    private ChunkHolder.PlayerProvider playerProvider;
 
     @Shadow
     @Final
-    private ChunkHolder.PlayerProvider playerProvider;
+    private LevelHeightAccessor levelHeightAccessor;
 
     @Shadow
     private boolean hasChangedSections;
@@ -47,26 +52,66 @@ public abstract class KrakkChunkHolderMixin implements KrakkChunkHolderAccess {
     @Unique
     private ShortSet[] krakk$changedDamagePerSection;
 
+    @Inject(method = "<init>", at = @At("RETURN"), require = 0)
+    private void krakk$initDamageChangeTracking(ChunkPos chunkPos,
+                                                int i,
+                                                LevelHeightAccessor levelHeightAccessor,
+                                                net.minecraft.world.level.lighting.LevelLightEngine levelLightEngine,
+                                                ChunkHolder.LevelChangeListener levelChangeListener,
+                                                ChunkHolder.PlayerProvider playerProvider,
+                                                CallbackInfo ci) {
+        this.krakk$changedDamagePerSection = new ShortSet[levelHeightAccessor.getSectionsCount()];
+    }
+
     @Override
     public boolean krakk$damageStateChanged(BlockPos blockPos) {
-        LevelChunk levelChunk = this.getTickingChunk();
-        if (levelChunk == null) {
+        LevelChunk tickingChunk = this.getTickingChunk();
+        if (tickingChunk == null) {
+            if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                KRAKK_LOGGER.debug(
+                        "Krakk chunk-holder notify dropped: no ticking chunk for pos=({}, {}, {})",
+                        blockPos.getX(),
+                        blockPos.getY(),
+                        blockPos.getZ()
+                );
+            }
             return false;
         }
 
-        this.krakk$ensureChangedSectionStorage();
         int sectionIndex = this.levelHeightAccessor.getSectionIndex(blockPos.getY());
         if (sectionIndex < 0 || sectionIndex >= this.krakk$changedDamagePerSection.length) {
+            if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                KRAKK_LOGGER.debug(
+                        "Krakk chunk-holder notify dropped: section index out of range sectionIndex={} pos=({}, {}, {})",
+                        sectionIndex,
+                        blockPos.getX(),
+                        blockPos.getY(),
+                        blockPos.getZ()
+                );
+            }
             return false;
         }
 
-        ShortSet changedDamage = this.krakk$changedDamagePerSection[sectionIndex];
-        if (changedDamage == null) {
-            changedDamage = new ShortOpenHashSet();
-            this.krakk$changedDamagePerSection[sectionIndex] = changedDamage;
+        ShortSet changed = this.krakk$changedDamagePerSection[sectionIndex];
+        if (changed == null) {
+            this.hasChangedSections = true;
+            changed = new ShortOpenHashSet();
+            this.krakk$changedDamagePerSection[sectionIndex] = changed;
         }
-        this.hasChangedSections = true;
-        changedDamage.add(SectionPos.sectionRelativePos(blockPos));
+
+        changed.add(SectionPos.sectionRelativePos(blockPos));
+        if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+            KRAKK_LOGGER.debug(
+                    "Krakk chunk-holder notify queued: chunk=({}, {}) sectionIndex={} dirtyCount={} pos=({}, {}, {})",
+                    tickingChunk.getPos().x,
+                    tickingChunk.getPos().z,
+                    sectionIndex,
+                    changed.size(),
+                    blockPos.getX(),
+                    blockPos.getY(),
+                    blockPos.getZ()
+            );
+        }
         return true;
     }
 
@@ -75,80 +120,117 @@ public abstract class KrakkChunkHolderMixin implements KrakkChunkHolderAccess {
         return this.playerProvider.getPlayers(chunkPos, onlyOnWatchDistanceEdge);
     }
 
-    @Inject(method = "broadcastChanges", at = @At("TAIL"))
-    private void krakk$broadcastDamageStateChanges(LevelChunk levelChunk, CallbackInfo ci) {
+    @Inject(method = "broadcastChanges", at = @At("TAIL"), require = 0)
+    private void krakk$broadcastDamageChanges(LevelChunk levelChunk, CallbackInfo ci) {
+        if (levelChunk == null) {
+            return;
+        }
         if (this.krakk$changedDamagePerSection == null) {
             return;
         }
 
-        if (!(levelChunk instanceof KrakkBlockDamageChunkAccess access)) {
-            this.krakk$clearTrackedDamageChanges();
-            return;
-        }
-
+        Level level = levelChunk.getLevel();
         List<ServerPlayer> players = this.playerProvider.getPlayers(levelChunk.getPos(), false);
-        if (players.isEmpty()) {
-            this.krakk$clearTrackedDamageChanges();
-            return;
-        }
-
-        ResourceLocation dimensionId = levelChunk.getLevel().dimension().location();
-        KrakkBlockDamageChunkStorage storage = access.krakk$getBlockDamageStorage();
-        ChunkPos chunkPos = levelChunk.getPos();
-
         for (int sectionIndex = 0; sectionIndex < this.krakk$changedDamagePerSection.length; sectionIndex++) {
-            ShortSet changedDamage = this.krakk$changedDamagePerSection[sectionIndex];
-            if (changedDamage == null || changedDamage.isEmpty()) {
+            ShortSet changedStates = this.krakk$changedDamagePerSection[sectionIndex];
+            if (changedStates == null || changedStates.isEmpty()) {
                 continue;
             }
+
             this.krakk$changedDamagePerSection[sectionIndex] = null;
+            if (players.isEmpty()) {
+                if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                    KRAKK_LOGGER.debug(
+                            "Krakk chunk-holder broadcast skipped: no players for chunk=({}, {}) sectionIndex={} changed={}",
+                            levelChunk.getPos().x,
+                            levelChunk.getPos().z,
+                            sectionIndex,
+                            changedStates.size()
+                    );
+                }
+                continue;
+            }
 
             int sectionY = this.levelHeightAccessor.getSectionYFromSectionIndex(sectionIndex);
-            Short2ByteOpenHashMap sectionStates = storage.sectionView(sectionY);
-            Short2ByteOpenHashMap changedStates = new Short2ByteOpenHashMap(changedDamage.size());
-            ShortIterator iterator = changedDamage.iterator();
-            while (iterator.hasNext()) {
-                short localIndex = (short) (iterator.nextShort() & 0x0FFF);
-                int damageState = sectionStates == null ? 0 : Math.max(0, Math.min(15, sectionStates.get(localIndex)));
-                changedStates.put(localIndex, (byte) damageState);
-            }
-
-            if (changedStates.isEmpty()) {
+            SectionPos sectionPos = SectionPos.of(levelChunk.getPos(), sectionY);
+            LevelChunkSection levelChunkSection = levelChunk.getSection(sectionIndex);
+            if (!(levelChunkSection instanceof KrakkBlockDamageSectionAccess access)) {
+                if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                    KRAKK_LOGGER.debug(
+                            "Krakk chunk-holder broadcast skipped: no damage section access chunk=({}, {}) sectionY={} changed={}",
+                            levelChunk.getPos().x,
+                            levelChunk.getPos().z,
+                            sectionY,
+                            changedStates.size()
+                    );
+                }
                 continue;
             }
 
+            Short2ByteOpenHashMap sectionDamageStates = access.krakk$getDamageStates();
             if (changedStates.size() == 1) {
-                Short2ByteMap.Entry single = changedStates.short2ByteEntrySet().iterator().next();
-                long posLong = krakk$toBlockPosLong(chunkPos, sectionY, single.getShortKey());
-                KrakkApi.network().sendDamageSyncBatch(players, dimensionId, posLong, single.getByteValue());
-            } else {
-                KrakkApi.network().sendSectionDeltaBatch(players, dimensionId, chunkPos.x, sectionY, chunkPos.z, changedStates);
+                short packedLocalPos = changedStates.iterator().nextShort();
+                BlockPos blockPos = sectionPos.relativeToBlockPos(packedLocalPos);
+                short localIndex = krakk$storageLocalIndexFromSectionRelativePos(packedLocalPos);
+                int damageState = Math.max(0, Math.min(15, sectionDamageStates.get(localIndex)));
+                if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                    KRAKK_LOGGER.debug(
+                            "Krakk chunk-holder broadcast single: dim={} chunk=({}, {}) sectionY={} players={} pos=({}, {}, {}) localIndex={} state={}",
+                            level.dimension().location(),
+                            levelChunk.getPos().x,
+                            levelChunk.getPos().z,
+                            sectionY,
+                            players.size(),
+                            blockPos.getX(),
+                            blockPos.getY(),
+                            blockPos.getZ(),
+                            localIndex & 0x0FFF,
+                            damageState
+                    );
+                }
+                KrakkApi.network().sendDamageSyncBatch(players, level.dimension().location(), blockPos.asLong(), damageState);
+                continue;
             }
+
+            Short2ByteOpenHashMap changedDamageStates = new Short2ByteOpenHashMap(changedStates.size());
+            ShortIterator iterator = changedStates.iterator();
+            while (iterator.hasNext()) {
+                short packedLocalPos = iterator.nextShort();
+                short localIndex = krakk$storageLocalIndexFromSectionRelativePos(packedLocalPos);
+                byte damageState = (byte) Math.max(0, Math.min(15, sectionDamageStates.get(localIndex)));
+                changedDamageStates.put(localIndex, damageState);
+            }
+            if (KrakkDamageRuntime.isSyncDebugLoggingEnabled()) {
+                KRAKK_LOGGER.debug(
+                        "Krakk chunk-holder broadcast delta: dim={} chunk=({}, {}) section=({}, {}, {}) players={} changed={} sampleStateCount={}",
+                        level.dimension().location(),
+                        levelChunk.getPos().x,
+                        levelChunk.getPos().z,
+                        sectionPos.getX(),
+                        sectionPos.getY(),
+                        sectionPos.getZ(),
+                        players.size(),
+                        changedStates.size(),
+                        changedDamageStates.size()
+                );
+            }
+            KrakkApi.network().sendSectionDeltaBatch(
+                    players,
+                    level.dimension().location(),
+                    sectionPos.getX(),
+                    sectionPos.getY(),
+                    sectionPos.getZ(),
+                    changedDamageStates
+            );
         }
     }
 
     @Unique
-    private void krakk$ensureChangedSectionStorage() {
-        if (this.krakk$changedDamagePerSection == null || this.krakk$changedDamagePerSection.length != this.levelHeightAccessor.getSectionsCount()) {
-            this.krakk$changedDamagePerSection = new ShortSet[this.levelHeightAccessor.getSectionsCount()];
-        }
+    private static short krakk$storageLocalIndexFromSectionRelativePos(short packedLocalPos) {
+        int localX = SectionPos.sectionRelativeX(packedLocalPos);
+        int localY = SectionPos.sectionRelativeY(packedLocalPos);
+        int localZ = SectionPos.sectionRelativeZ(packedLocalPos);
+        return (short) (((localY & 15) << 8) | ((localZ & 15) << 4) | (localX & 15));
     }
 
-    @Unique
-    private void krakk$clearTrackedDamageChanges() {
-        if (this.krakk$changedDamagePerSection == null) {
-            return;
-        }
-        for (int i = 0; i < this.krakk$changedDamagePerSection.length; i++) {
-            this.krakk$changedDamagePerSection[i] = null;
-        }
-    }
-
-    @Unique
-    private static long krakk$toBlockPosLong(ChunkPos chunkPos, int sectionY, short localIndex) {
-        int x = (chunkPos.x << 4) | (localIndex & 15);
-        int y = (sectionY << 4) | ((localIndex >> 8) & 15);
-        int z = (chunkPos.z << 4) | ((localIndex >> 4) & 15);
-        return BlockPos.asLong(x, y, z);
-    }
 }

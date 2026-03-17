@@ -4,6 +4,7 @@
   "compatibilityLevel": "JAVA_17",
   "minVersion": "0.8",
   "client": [
+    "client.KrakkClientPacketListenerMixin",
     "client.KrakkLevelRendererMixin",
     "client.KrakkMinecraftMixin",
     "client.KrakkMultiPlayerGameModeMixin"
@@ -11,10 +12,10 @@
   "mixins": [
     "common.KrakkChunkAccessMixin",
     "common.KrakkChunkHolderMixin",
-    "common.KrakkChunkMapMixin",
     "common.KrakkChunkSerializerMixin",
     "common.KrakkFallingBlockEntityMixin",
     "common.KrakkLevelChunkMixin",
+    "common.KrakkLevelChunkSectionMixin",
     "common.KrakkLevelMixin",
     "common.KrakkPistonMovingBlockEntityMixin",
     "common.KrakkServerChunkCacheMixin",

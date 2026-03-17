@@ -6,6 +6,7 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import org.shipwrights.krakk.api.KrakkApi;
+import org.shipwrights.krakk.state.chunk.KrakkChunkSectionDamageBridge;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
@@ -64,10 +65,14 @@ public abstract class KrakkMinecraftMixin {
         }
 
         BlockHitResult blockHitResult = (BlockHitResult) this.hitResult;
+        long posLong = blockHitResult.getBlockPos().asLong();
         float baselineProgress = KrakkApi.clientOverlay().getMiningBaseline(
                 this.level.dimension().location(),
-                blockHitResult.getBlockPos().asLong()
+                posLong
         );
+        if (baselineProgress <= 0.0F) {
+            baselineProgress = KrakkChunkSectionDamageBridge.fallbackMiningBaseline(this.level, posLong);
+        }
         return baselineProgress >= 0.999F;
     }
 }

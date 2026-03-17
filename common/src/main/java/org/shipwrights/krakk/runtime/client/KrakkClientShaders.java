@@ -8,6 +8,8 @@ import net.minecraft.resources.ResourceLocation;
 import org.shipwrights.krakk.Krakk;
 import org.slf4j.Logger;
 
+import java.lang.reflect.Method;
+import java.nio.FloatBuffer;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -28,6 +30,12 @@ public final class KrakkClientShaders {
     private static volatile boolean loggedUsingFogShader = false;
     private static volatile boolean loggedMissingFogShaderInstance = false;
     private static volatile boolean loggedShaderPackForcedFallback = false;
+    private static volatile boolean loggedFogSyncMethodUnavailable = false;
+    private static volatile boolean fogMethodLookupAttempted = false;
+    private static volatile Method renderSystemGetShaderFogStartMethod;
+    private static volatile Method renderSystemGetShaderFogEndMethod;
+    private static volatile Method renderSystemGetShaderFogColorMethod;
+    private static volatile Method renderSystemGetShaderFogShapeMethod;
 
     private KrakkClientShaders() {
     }
@@ -185,6 +193,53 @@ public final class KrakkClientShaders {
         return shaderInstance != null && shaderInstance == damageOverlayFogShader;
     }
 
+    public static void syncFogUniforms(ShaderInstance shaderInstance) {
+        if (shaderInstance == null) {
+            return;
+        }
+
+        krakk$resolveFogMethods();
+        if (renderSystemGetShaderFogStartMethod == null || renderSystemGetShaderFogEndMethod == null) {
+            if (!loggedFogSyncMethodUnavailable) {
+                LOGGER.warn("Krakk damage overlay shader fog sync unavailable: RenderSystem fog getter methods were not found.");
+                loggedFogSyncMethodUnavailable = true;
+            }
+            return;
+        }
+
+        try {
+            if (shaderInstance.FOG_START != null) {
+                Object fogStart = renderSystemGetShaderFogStartMethod.invoke(null);
+                if (fogStart instanceof Number number) {
+                    shaderInstance.FOG_START.set(number.floatValue());
+                }
+            }
+            if (shaderInstance.FOG_END != null) {
+                Object fogEnd = renderSystemGetShaderFogEndMethod.invoke(null);
+                if (fogEnd instanceof Number number) {
+                    shaderInstance.FOG_END.set(number.floatValue());
+                }
+            }
+            if (shaderInstance.FOG_COLOR != null && renderSystemGetShaderFogColorMethod != null) {
+                Object fogColor = renderSystemGetShaderFogColorMethod.invoke(null);
+                float[] values = krakk$extractFogColorValues(fogColor);
+                if (values != null) {
+                    shaderInstance.FOG_COLOR.set(values[0], values[1], values[2], values[3]);
+                }
+            }
+            Uniform fogShapeUniform = shaderInstance.getUniform("FogShape");
+            if (fogShapeUniform != null && renderSystemGetShaderFogShapeMethod != null) {
+                Object fogShape = renderSystemGetShaderFogShapeMethod.invoke(null);
+                Integer fogShapeValue = krakk$extractFogShapeValue(fogShape);
+                if (fogShapeValue != null) {
+                    fogShapeUniform.set(fogShapeValue);
+                }
+            }
+
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+        }
+    }
+
     public static void markCustomShaderRenderFailure(ShaderInstance shaderInstance, RuntimeException exception) {
         if (!isRegisteredCustomShader(shaderInstance) || krakk$isFailedByRuntime(shaderInstance)) {
             return;
@@ -206,5 +261,84 @@ public final class KrakkClientShaders {
             return DAMAGE_OVERLAY_SHADER_ID.toString();
         }
         return "<unknown>";
+    }
+
+    private static void krakk$resolveFogMethods() {
+        if (fogMethodLookupAttempted) {
+            return;
+        }
+        fogMethodLookupAttempted = true;
+
+        try {
+            Class<?> renderSystemClass = Class.forName("com.mojang.blaze3d.systems.RenderSystem");
+            renderSystemGetShaderFogStartMethod = renderSystemClass.getMethod("getShaderFogStart");
+            renderSystemGetShaderFogEndMethod = renderSystemClass.getMethod("getShaderFogEnd");
+
+            try {
+                renderSystemGetShaderFogColorMethod = renderSystemClass.getMethod("getShaderFogColor");
+            } catch (NoSuchMethodException ignored) {
+                renderSystemGetShaderFogColorMethod = null;
+            }
+            try {
+                renderSystemGetShaderFogShapeMethod = renderSystemClass.getMethod("getShaderFogShape");
+            } catch (NoSuchMethodException ignored) {
+                renderSystemGetShaderFogShapeMethod = null;
+            }
+        } catch (ReflectiveOperationException | LinkageError ignored) {
+            renderSystemGetShaderFogStartMethod = null;
+            renderSystemGetShaderFogEndMethod = null;
+            renderSystemGetShaderFogColorMethod = null;
+            renderSystemGetShaderFogShapeMethod = null;
+        }
+    }
+
+    private static float[] krakk$extractFogColorValues(Object fogColor) {
+        if (fogColor instanceof float[] values && values.length >= 4) {
+            return new float[]{values[0], values[1], values[2], values[3]};
+        }
+        if (fogColor instanceof FloatBuffer buffer && buffer.remaining() >= 4) {
+            int position = buffer.position();
+            return new float[]{
+                    buffer.get(position),
+                    buffer.get(position + 1),
+                    buffer.get(position + 2),
+                    buffer.get(position + 3)
+            };
+        }
+        if (fogColor != null) {
+            try {
+                Method x = fogColor.getClass().getMethod("x");
+                Method y = fogColor.getClass().getMethod("y");
+                Method z = fogColor.getClass().getMethod("z");
+                Method w = fogColor.getClass().getMethod("w");
+                Object xValue = x.invoke(fogColor);
+                Object yValue = y.invoke(fogColor);
+                Object zValue = z.invoke(fogColor);
+                Object wValue = w.invoke(fogColor);
+                if (xValue instanceof Number xNumber
+                        && yValue instanceof Number yNumber
+                        && zValue instanceof Number zNumber
+                        && wValue instanceof Number wNumber) {
+                    return new float[]{
+                            xNumber.floatValue(),
+                            yNumber.floatValue(),
+                            zNumber.floatValue(),
+                            wNumber.floatValue()
+                    };
+                }
+            } catch (ReflectiveOperationException ignored) {
+            }
+        }
+        return null;
+    }
+
+    private static Integer krakk$extractFogShapeValue(Object fogShape) {
+        if (fogShape instanceof Number number) {
+            return number.intValue();
+        }
+        if (fogShape instanceof Enum<?> enumValue) {
+            return enumValue.ordinal();
+        }
+        return null;
     }
 }

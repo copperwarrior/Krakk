@@ -5,6 +5,7 @@ import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import org.shipwrights.krakk.api.KrakkApi;
+import org.shipwrights.krakk.state.chunk.KrakkChunkSectionDamageBridge;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -43,10 +44,7 @@ public abstract class KrakkMultiPlayerGameModeMixin {
             return;
         }
 
-        float baselineProgress = KrakkApi.clientOverlay().getMiningBaseline(
-                this.minecraft.level.dimension().location(),
-                blockPos.asLong()
-        );
+        float baselineProgress = this.krakk$resolveMiningBaseline(blockPos);
         if (baselineProgress >= 0.999F) {
             this.destroyDelay = 0;
         }
@@ -59,10 +57,7 @@ public abstract class KrakkMultiPlayerGameModeMixin {
             return;
         }
 
-        float baselineProgress = KrakkApi.clientOverlay().getMiningBaseline(
-                this.minecraft.level.dimension().location(),
-                blockPos.asLong()
-        );
+        float baselineProgress = this.krakk$resolveMiningBaseline(blockPos);
         if (baselineProgress >= 0.999F) {
             this.destroyDelay = 0;
         }
@@ -96,15 +91,27 @@ public abstract class KrakkMultiPlayerGameModeMixin {
             return;
         }
 
-        float baselineProgress = KrakkApi.clientOverlay().getMiningBaseline(
-                this.minecraft.level.dimension().location(),
-                blockPos.asLong()
-        );
+        float baselineProgress = this.krakk$resolveMiningBaseline(blockPos);
         if (baselineProgress <= this.destroyProgress) {
             return;
         }
 
         this.destroyProgress = baselineProgress;
         this.destroyTicks = Math.max(this.destroyTicks, baselineProgress * 10.0F);
+    }
+
+    private float krakk$resolveMiningBaseline(BlockPos blockPos) {
+        if (this.minecraft.level == null) {
+            return 0.0F;
+        }
+        long posLong = blockPos.asLong();
+        float baselineProgress = KrakkApi.clientOverlay().getMiningBaseline(
+                this.minecraft.level.dimension().location(),
+                posLong
+        );
+        if (baselineProgress <= 0.0F) {
+            baselineProgress = KrakkChunkSectionDamageBridge.fallbackMiningBaseline(this.minecraft.level, posLong);
+        }
+        return baselineProgress;
     }
 }

@@ -20,5 +20,17 @@ void main() {
     if (color.a < 0.1) {
         discard;
     }
-    fragColor = linear_fog(color, vertexDistance, FogStart, FogEnd, FogColor);
+
+    // Keep vanilla-style fog color blending, but also fade crack alpha by fog factor
+    // so distant overlays do not stay fully opaque under loader/shader variants.
+    float fogFactor = 0.0;
+    if (FogEnd > FogStart) {
+        fogFactor = clamp((vertexDistance - FogStart) / (FogEnd - FogStart), 0.0, 1.0);
+    }
+    color = linear_fog(color, vertexDistance, FogStart, FogEnd, FogColor);
+    color.a *= (1.0 - fogFactor);
+    if (color.a <= 0.001) {
+        discard;
+    }
+    fragColor = color;
 }

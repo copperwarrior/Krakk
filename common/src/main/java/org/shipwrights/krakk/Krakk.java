@@ -1,7 +1,6 @@
 package org.shipwrights.krakk;
 
 import dev.architectury.event.events.common.PlayerEvent;
-import dev.architectury.event.events.common.TickEvent;
 import dev.architectury.platform.Platform;
 import dev.architectury.utils.Env;
 import org.shipwrights.krakk.api.KrakkApi;
@@ -40,10 +39,6 @@ public final class Krakk {
             KrakkApi.network().initClientReceivers();
         }
         KrakkDebugCommands.register();
-        PlayerEvent.PLAYER_JOIN.register(player -> KrakkApi.damage().queuePlayerSync(player));
-        PlayerEvent.CHANGE_DIMENSION.register((player, oldLevel, newLevel) -> KrakkApi.damage().queuePlayerSync(player));
-        PlayerEvent.PLAYER_RESPAWN.register((newPlayer, conqueredEnd) -> KrakkApi.damage().queuePlayerSync(newPlayer));
         PlayerEvent.PLAYER_QUIT.register(player -> KrakkApi.damage().clearQueuedPlayerSync(player));
-        TickEvent.SERVER_POST.register(server -> KrakkApi.damage().tickQueuedSyncs(server));
     }
 }
