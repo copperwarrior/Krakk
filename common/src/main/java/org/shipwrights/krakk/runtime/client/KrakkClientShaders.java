@@ -31,6 +31,9 @@ public final class KrakkClientShaders {
     private static volatile boolean loggedMissingFogShaderInstance = false;
     private static volatile boolean loggedShaderPackForcedFallback = false;
     private static volatile boolean loggedFogSyncMethodUnavailable = false;
+    private static volatile boolean loggedFogSyncRuntimeFailure = false;
+    private static volatile boolean loggedFogColorExtractionFailure = false;
+    private static volatile boolean loggedFogSyncSnapshot = false;
     private static volatile boolean fogMethodLookupAttempted = false;
     private static volatile Method renderSystemGetShaderFogStartMethod;
     private static volatile Method renderSystemGetShaderFogEndMethod;
@@ -55,6 +58,9 @@ public final class KrakkClientShaders {
         loggedUsingFogShader = false;
         loggedMissingFogShaderInstance = false;
         loggedShaderPackForcedFallback = false;
+        loggedFogSyncRuntimeFailure = false;
+        loggedFogColorExtractionFailure = false;
+        loggedFogSyncSnapshot = false;
     }
 
     public static boolean hasDamageOverlayShaderResource() {
@@ -208,23 +214,36 @@ public final class KrakkClientShaders {
         }
 
         try {
+            float syncedFogStart = Float.NaN;
+            float syncedFogEnd = Float.NaN;
+            Integer syncedFogShape = null;
+            float[] syncedFogColor = null;
             if (shaderInstance.FOG_START != null) {
                 Object fogStart = renderSystemGetShaderFogStartMethod.invoke(null);
                 if (fogStart instanceof Number number) {
-                    shaderInstance.FOG_START.set(number.floatValue());
+                    syncedFogStart = number.floatValue();
+                    shaderInstance.FOG_START.set(syncedFogStart);
                 }
             }
             if (shaderInstance.FOG_END != null) {
                 Object fogEnd = renderSystemGetShaderFogEndMethod.invoke(null);
                 if (fogEnd instanceof Number number) {
-                    shaderInstance.FOG_END.set(number.floatValue());
+                    syncedFogEnd = number.floatValue();
+                    shaderInstance.FOG_END.set(syncedFogEnd);
                 }
             }
             if (shaderInstance.FOG_COLOR != null && renderSystemGetShaderFogColorMethod != null) {
                 Object fogColor = renderSystemGetShaderFogColorMethod.invoke(null);
                 float[] values = krakk$extractFogColorValues(fogColor);
                 if (values != null) {
+                    syncedFogColor = values;
                     shaderInstance.FOG_COLOR.set(values[0], values[1], values[2], values[3]);
+                } else if (!loggedFogColorExtractionFailure) {
+                    LOGGER.warn(
+                            "Krakk damage overlay shader fog sync could not read fog color from runtime type {}",
+                            fogColor == null ? "<null>" : fogColor.getClass().getName()
+                    );
+                    loggedFogColorExtractionFailure = true;
                 }
             }
             Uniform fogShapeUniform = shaderInstance.getUniform("FogShape");
@@ -232,11 +251,26 @@ public final class KrakkClientShaders {
                 Object fogShape = renderSystemGetShaderFogShapeMethod.invoke(null);
                 Integer fogShapeValue = krakk$extractFogShapeValue(fogShape);
                 if (fogShapeValue != null) {
+                    syncedFogShape = fogShapeValue;
                     fogShapeUniform.set(fogShapeValue);
                 }
             }
+            if (!loggedFogSyncSnapshot) {
+                LOGGER.info(
+                        "Krakk damage overlay shader fog sync initialized: start={} end={} shape={} color={}",
+                        Float.isNaN(syncedFogStart) ? "<unset>" : syncedFogStart,
+                        Float.isNaN(syncedFogEnd) ? "<unset>" : syncedFogEnd,
+                        syncedFogShape == null ? "<unset>" : syncedFogShape,
+                        syncedFogColor == null ? "<unset>" : ("[" + syncedFogColor[0] + ", " + syncedFogColor[1] + ", " + syncedFogColor[2] + ", " + syncedFogColor[3] + "]")
+                );
+                loggedFogSyncSnapshot = true;
+            }
 
-        } catch (ReflectiveOperationException | RuntimeException ignored) {
+        } catch (ReflectiveOperationException | RuntimeException exception) {
+            if (!loggedFogSyncRuntimeFailure) {
+                LOGGER.warn("Krakk damage overlay shader fog sync failed at runtime; fog uniforms may be stale.", exception);
+                loggedFogSyncRuntimeFailure = true;
+            }
         }
     }
 
@@ -293,17 +327,32 @@ public final class KrakkClientShaders {
     }
 
     private static float[] krakk$extractFogColorValues(Object fogColor) {
-        if (fogColor instanceof float[] values && values.length >= 4) {
-            return new float[]{values[0], values[1], values[2], values[3]};
+        if (fogColor instanceof float[] values) {
+            if (values.length >= 4) {
+                return new float[]{values[0], values[1], values[2], values[3]};
+            }
+            if (values.length >= 3) {
+                return new float[]{values[0], values[1], values[2], 1.0F};
+            }
         }
-        if (fogColor instanceof FloatBuffer buffer && buffer.remaining() >= 4) {
+        if (fogColor instanceof FloatBuffer buffer) {
             int position = buffer.position();
-            return new float[]{
-                    buffer.get(position),
-                    buffer.get(position + 1),
-                    buffer.get(position + 2),
-                    buffer.get(position + 3)
-            };
+            if (buffer.remaining() >= 4) {
+                return new float[]{
+                        buffer.get(position),
+                        buffer.get(position + 1),
+                        buffer.get(position + 2),
+                        buffer.get(position + 3)
+                };
+            }
+            if (buffer.remaining() >= 3) {
+                return new float[]{
+                        buffer.get(position),
+                        buffer.get(position + 1),
+                        buffer.get(position + 2),
+                        1.0F
+                };
+            }
         }
         if (fogColor != null) {
             try {

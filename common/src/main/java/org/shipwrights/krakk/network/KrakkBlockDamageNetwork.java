@@ -265,6 +265,7 @@ public final class KrakkBlockDamageNetwork implements KrakkNetworkApi {
                         chunkZ
                 );
             }
+            context.queue(() -> KrakkApi.clientOverlay().clearChunk(dimensionId, chunkX, chunkZ));
         });
     }
 

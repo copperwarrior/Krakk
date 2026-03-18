@@ -43,6 +43,14 @@ configurations {
 
 def krakkCommonProjectPath = findProject(':krakk-common') != null ? ':krakk-common' : ':krakkCommon'
 
+sourceSets {
+    main {
+        resources {
+            srcDir(project(krakkCommonProjectPath).file('src/main/resources'))
+        }
+    }
+}
+
 dependencies {
     minecraft "net.minecraft:minecraft:${minecraftVersion}"
     mappings loom.officialMojangMappings()
@@ -63,13 +71,44 @@ processResources {
     }
 }
 
+jar {
+    archiveClassifier = 'dev'
+}
+
 shadowJar {
     configurations = [project.configurations.shadowBundle]
     archiveClassifier = 'dev-shadow'
 }
 
 remapJar {
-    input.set shadowJar.archiveFile
+    dependsOn shadowJar
+    inputFile.set shadowJar.archiveFile
+    // Keep inherited Jar copy actions ahead of remap actions.
+    // This avoids manifest-only copy actions overwriting remapped outputs.
+    try {
+        def methodField = Class.forName("org.gradle.api.internal.project.taskfactory.StandardTaskAction")
+                .getDeclaredField("method")
+        methodField.setAccessible(true)
+
+        def copyActions = new ArrayList<>()
+        def otherActions = new ArrayList<>()
+        for (def action : new ArrayList<>(actions)) {
+            boolean isCopy = false
+            try {
+                def method = methodField.get(action)
+                isCopy = method?.name == "copy"
+            } catch (Throwable ignored) {
+            }
+            if (isCopy) {
+                copyActions.add(action)
+            } else {
+                otherActions.add(action)
+            }
+        }
+        setActions(copyActions + otherActions)
+    } catch (Throwable ignored) {
+        // Internal Gradle task-action implementation changed; keep default order.
+    }
 }
 
 java {

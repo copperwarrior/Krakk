@@ -11,16 +11,17 @@
   ],
   "mixins": [
     "common.KrakkChunkAccessMixin",
+    "common.KrakkChunkMapMixin",
     "common.KrakkChunkHolderMixin",
     "common.KrakkChunkSerializerMixin",
     "common.KrakkFallingBlockEntityMixin",
     "common.KrakkLevelChunkMixin",
     "common.KrakkLevelChunkSectionMixin",
-    "common.KrakkLevelMixin",
     "common.KrakkPistonMovingBlockEntityMixin",
     "common.KrakkServerChunkCacheMixin",
     "common.KrakkServerPlayerGameModeMiningMixin"
   ],
+  "refmap": "krakk-common-krakkCommon-refmap.json",
   "injectors": {
     "defaultRequire": 1
   }

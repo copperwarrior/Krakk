@@ -1,7 +1,5 @@
 #version 150
 
-#moj_import <fog.glsl>
-
 uniform sampler2D Sampler0;
 
 uniform vec4 ColorModulator;
@@ -21,16 +19,12 @@ void main() {
         discard;
     }
 
-    // Keep vanilla-style fog color blending, but also fade crack alpha by fog factor
-    // so distant overlays do not stay fully opaque under loader/shader variants.
     float fogFactor = 0.0;
     if (FogEnd > FogStart) {
         fogFactor = clamp((vertexDistance - FogStart) / (FogEnd - FogStart), 0.0, 1.0);
     }
-    color = linear_fog(color, vertexDistance, FogStart, FogEnd, FogColor);
-    color.a *= (1.0 - fogFactor);
-    if (color.a <= 0.001) {
-        discard;
-    }
+    // For this overlay path we fade crack color with fog instead of alpha,
+    // matching CRUMBLING-style behavior more closely.
+    color.rgb = mix(color.rgb, vec3(0.5), fogFactor);
     fragColor = color;
 }

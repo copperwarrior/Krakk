@@ -6,7 +6,6 @@ import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
-import it.unimi.dsi.fastutil.shorts.Short2ByteMap;
 import it.unimi.dsi.fastutil.shorts.Short2ByteOpenHashMap;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -49,11 +48,9 @@ import org.shipwrights.krakk.state.network.KrakkServerChunkCacheAccess;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinTask;
@@ -70,9 +67,6 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
     private static final float STONE_EQUIVALENT_HARDNESS = 1.5F;
     private static final float STONE_EQUIVALENT_RESISTANCE = 6.0F;
     private static final long DAMAGE_DECAY_INTERVAL_TICKS = 24_000L;
-    private static final int CONNECT_SYNC_DELAY_TICKS = 12;
-    private static final int CONNECT_SYNC_PASSES = 1;
-    private static final int CONNECT_SYNC_COLUMNS_PER_TICK = 2;
     private static final int DEFAULT_BULK_SYNC_PER_BLOCK_LIMIT = 0;
     private static final int DEFAULT_BULK_SYNC_SECTION_SNAPSHOT_LIMIT = 512;
     private static final int DEFAULT_BULK_SYNC_SNAPSHOT_PARALLELISM = Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() - 1));
@@ -92,7 +86,6 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
     private static final Set<Class<?>> CHUNK_SOURCE_NO_VISIBLE_CHUNK_METHOD = ConcurrentHashMap.newKeySet();
     private static final Map<Class<?>, Method> CHUNK_HOLDER_NOTIFY_METHODS = new ConcurrentHashMap<>();
     private static final Set<Class<?>> CHUNK_HOLDER_NO_NOTIFY_METHOD = ConcurrentHashMap.newKeySet();
-    private static final Map<UUID, PendingSync> PENDING_PLAYER_SYNCS = new HashMap<>();
     private static final ThreadLocal<SyncBatchContext> SYNC_BATCH = new ThreadLocal<>();
     private static final ThreadLocal<SyncBatchContext> BULK_SYNC = new ThreadLocal<>();
     private static final ThreadLocal<Integer> SYNC_SUPPRESSION_DEPTH = ThreadLocal.withInitial(() -> 0);
@@ -101,8 +94,6 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
     private static volatile DamageStateConversionHandler damageStateConversionHandler = DamageStateConversionHandler.NOOP;
     private static volatile boolean syncDebugLoggingEnabled =
             parseBooleanProperty("krakk.damage.sync_debug_logging", false);
-    private static volatile boolean chunkNotifyPacketMirrorEnabled =
-            parseBooleanProperty("krakk.damage.sync.chunk_notify_packet_mirror", false);
     private static final LongAdder SYNC_DEBUG_CHUNK_TRACK_SNAPSHOTS = new LongAdder();
     private static final LongAdder SYNC_DEBUG_CHUNK_NOTIFY_SUCCESS = new LongAdder();
     private static final LongAdder SYNC_DEBUG_CHUNK_NOTIFY_FAIL = new LongAdder();
@@ -740,10 +731,6 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
             progressListener.onProgress(processed, attempted, cleared, 0);
         }
         return new BulkDebugClearResult(attempted, cleared);
-    }
-
-    public void queueConnectSync(ServerPlayer player) {
-        // Initial sync now rides vanilla chunk section payloads.
     }
 
     @Override
@@ -2166,41 +2153,6 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
     }
 
     private record ChunkStorageRef(LevelChunk chunk, KrakkBlockDamageChunkStorage storage) {
-    }
-
-    private static final class PendingSync {
-        private int ticksUntilNextStep;
-        private int passesRemaining;
-        private ResourceLocation dimensionId;
-        private int minChunkX;
-        private int maxChunkX;
-        private int minChunkZ;
-        private int maxChunkZ;
-        private int cursorChunkX;
-        private int cursorChunkZ;
-
-        private PendingSync(int ticksUntilNextStep, int passesRemaining) {
-            this.ticksUntilNextStep = ticksUntilNextStep;
-            this.passesRemaining = passesRemaining;
-        }
-
-        private void initializeForPlayer(ServerPlayer player) {
-            ServerLevel level = player.serverLevel();
-            ResourceLocation currentDimensionId = level.dimension().location();
-            if (currentDimensionId.equals(this.dimensionId)) {
-                return;
-            }
-
-            ChunkPos centerChunk = player.chunkPosition();
-            int viewDistance = level.getServer().getPlayerList().getViewDistance() + 1;
-            this.minChunkX = centerChunk.x - viewDistance;
-            this.maxChunkX = centerChunk.x + viewDistance;
-            this.minChunkZ = centerChunk.z - viewDistance;
-            this.maxChunkZ = centerChunk.z + viewDistance;
-            this.cursorChunkX = this.minChunkX;
-            this.cursorChunkZ = this.minChunkZ;
-            this.dimensionId = currentDimensionId;
-        }
     }
 
 }
