@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:jungle_wood",
+  "target": "minecraft:stripped_jungle_wood",
+  "damage_fraction": 0.60
+}

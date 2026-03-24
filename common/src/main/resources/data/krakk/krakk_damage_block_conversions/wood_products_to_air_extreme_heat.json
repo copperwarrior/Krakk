@@ -1,0 +1,6 @@
+{
+  "source_tag": "krakk:incinerable_wood_products",
+  "target": "minecraft:air",
+  "damage_state": 0,
+  "heat_celsius_min": 1700.0
+}

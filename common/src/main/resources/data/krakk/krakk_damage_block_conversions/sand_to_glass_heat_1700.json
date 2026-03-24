@@ -1,0 +1,6 @@
+{
+  "source": "minecraft:sand",
+  "target": "minecraft:glass",
+  "damage_state": 0,
+  "heat_celsius": 1700.0
+}

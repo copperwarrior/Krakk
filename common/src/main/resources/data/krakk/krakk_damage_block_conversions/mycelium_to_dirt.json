@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:mycelium",
+  "target": "minecraft:dirt",
+  "damage_fraction": 0.45
+}

@@ -30,6 +30,29 @@ public interface KrakkExplosionApi {
     }
 
     /**
+     * Executes a simple Krakk explosion with explicit radius, energy, and heat.
+     */
+    default void detonate(ServerLevel level, double x, double y, double z,
+                          double radius, double energy, double impactHeatCelsius) {
+        detonate(level, x, y, z, null, null, KrakkExplosionProfile.krakk(radius, energy, impactHeatCelsius));
+    }
+
+    /**
+     * Executes a simple Krakk explosion from tonnage.
+     */
+    default void detonateTonnage(ServerLevel level, double x, double y, double z, double tonnageTons) {
+        detonate(level, x, y, z, null, null, KrakkExplosionProfile.fromTonnage(tonnageTons));
+    }
+
+    /**
+     * Executes a simple Krakk explosion from tonnage with explicit heat.
+     */
+    default void detonateTonnage(ServerLevel level, double x, double y, double z,
+                                 double tonnageTons, double impactHeatCelsius) {
+        detonate(level, x, y, z, null, null, KrakkExplosionProfile.fromTonnage(tonnageTons, impactHeatCelsius));
+    }
+
+    /**
      * Executes a simple Krakk explosion at a Vec3 using power->radius/energy conversion.
      */
     default void detonate(ServerLevel level, Vec3 pos, double power) {
@@ -41,6 +64,27 @@ public interface KrakkExplosionApi {
      */
     default void detonate(ServerLevel level, Vec3 pos, double radius, double energy) {
         detonate(level, pos.x, pos.y, pos.z, radius, energy);
+    }
+
+    /**
+     * Executes a simple Krakk explosion at a Vec3 with explicit radius, energy, and heat.
+     */
+    default void detonate(ServerLevel level, Vec3 pos, double radius, double energy, double impactHeatCelsius) {
+        detonate(level, pos.x, pos.y, pos.z, radius, energy, impactHeatCelsius);
+    }
+
+    /**
+     * Executes a simple Krakk explosion at a Vec3 from tonnage.
+     */
+    default void detonateTonnage(ServerLevel level, Vec3 pos, double tonnageTons) {
+        detonateTonnage(level, pos.x, pos.y, pos.z, tonnageTons);
+    }
+
+    /**
+     * Executes a simple Krakk explosion at a Vec3 from tonnage with explicit heat.
+     */
+    default void detonateTonnage(ServerLevel level, Vec3 pos, double tonnageTons, double impactHeatCelsius) {
+        detonateTonnage(level, pos.x, pos.y, pos.z, tonnageTons, impactHeatCelsius);
     }
 
     /**
@@ -57,5 +101,30 @@ public interface KrakkExplosionApi {
     default void detonate(ServerLevel level, double x, double y, double z, Entity source,
                           LivingEntity owner, double radius, double energy) {
         detonate(level, x, y, z, source, owner, KrakkExplosionProfile.krakk(radius, energy));
+    }
+
+    /**
+     * Executes a source-owned Krakk explosion with explicit radius, energy, and heat.
+     */
+    default void detonate(ServerLevel level, double x, double y, double z, Entity source,
+                          LivingEntity owner, double radius, double energy, double impactHeatCelsius) {
+        detonate(level, x, y, z, source, owner, KrakkExplosionProfile.krakk(radius, energy, impactHeatCelsius));
+    }
+
+    /**
+     * Executes a source-owned Krakk explosion from tonnage.
+     */
+    default void detonateTonnage(ServerLevel level, double x, double y, double z,
+                                 Entity source, LivingEntity owner, double tonnageTons) {
+        detonate(level, x, y, z, source, owner, KrakkExplosionProfile.fromTonnage(tonnageTons));
+    }
+
+    /**
+     * Executes a source-owned Krakk explosion from tonnage with explicit heat.
+     */
+    default void detonateTonnage(ServerLevel level, double x, double y, double z,
+                                 Entity source, LivingEntity owner,
+                                 double tonnageTons, double impactHeatCelsius) {
+        detonate(level, x, y, z, source, owner, KrakkExplosionProfile.fromTonnage(tonnageTons, impactHeatCelsius));
     }
 }

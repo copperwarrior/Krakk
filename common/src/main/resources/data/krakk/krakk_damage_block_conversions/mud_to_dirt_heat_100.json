@@ -1,0 +1,6 @@
+{
+  "source": "minecraft:mud",
+  "target": "minecraft:dirt",
+  "damage_state": 0,
+  "heat_celsius_min": 100.0
+}

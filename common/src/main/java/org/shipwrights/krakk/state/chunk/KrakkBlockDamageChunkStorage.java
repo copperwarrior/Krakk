@@ -12,7 +12,6 @@ import net.minecraft.world.level.chunk.LevelChunkSection;
 
 public final class KrakkBlockDamageChunkStorage {
     public static final String ROOT_TAG = "KrakkDamage";
-    public static final String LEGACY_ROOT_TAG = "CannonicalDamage";
 
     private static final String SECTION_YS_TAG = "SectionYs";
     private static final String LOCAL_INDICES_TAG = "LocalIndices";
@@ -25,10 +24,6 @@ public final class KrakkBlockDamageChunkStorage {
 
     private final ChunkAccess ownerChunk;
     private final Int2ObjectOpenHashMap<SectionDamageState> sectionsByY = new Int2ObjectOpenHashMap<>();
-
-    public KrakkBlockDamageChunkStorage() {
-        this(null);
-    }
 
     public KrakkBlockDamageChunkStorage(ChunkAccess ownerChunk) {
         this.ownerChunk = ownerChunk;
@@ -45,7 +40,7 @@ public final class KrakkBlockDamageChunkStorage {
 
         int len = Math.min(sectionYs.length, Math.min(localIndices.length, states.length));
         for (int i = 0; i < len; i++) {
-            int state = clamp(states[i], 0, MAX_DAMAGE_STATE);
+            int state = clampDamageState(states[i]);
             if (state <= 0) {
                 continue;
             }
@@ -144,7 +139,7 @@ public final class KrakkBlockDamageChunkStorage {
     }
 
     public boolean setDamageState(long posLong, int state, long lastUpdateTick) {
-        int clamped = clamp(state, 0, MAX_DAMAGE_STATE);
+        int clamped = clampDamageState(state);
         if (clamped <= 0) {
             return removeDamageState(posLong) != NO_DAMAGE_STATE;
         }
@@ -190,32 +185,6 @@ public final class KrakkBlockDamageChunkStorage {
             }
             consumer.accept(entry.getIntKey(), section.snapshotDamageStates());
         }
-    }
-
-    public void forEachSectionView(SectionViewConsumer consumer) {
-        for (Int2ObjectMap.Entry<SectionDamageState> entry : this.sectionsByY.int2ObjectEntrySet()) {
-            SectionDamageState section = entry.getValue();
-            if (section.damageStates.isEmpty()) {
-                continue;
-            }
-            consumer.accept(entry.getIntKey(), section.damageStates);
-        }
-    }
-
-    public Short2ByteOpenHashMap snapshotSection(int sectionY) {
-        SectionDamageState section = this.sectionsByY.get(sectionY);
-        if (section == null || section.damageStates.isEmpty()) {
-            return new Short2ByteOpenHashMap();
-        }
-        return section.snapshotDamageStates();
-    }
-
-    public Short2ByteOpenHashMap sectionView(int sectionY) {
-        SectionDamageState section = this.sectionsByY.get(sectionY);
-        if (section == null || section.damageStates.isEmpty()) {
-            return null;
-        }
-        return section.damageStates;
     }
 
     private void putInternal(int sectionY, short localIndex, byte damageState, long updateTick) {
@@ -266,7 +235,7 @@ public final class KrakkBlockDamageChunkStorage {
             sectionAccess.krakk$removeDamageState(localIndex);
             return;
         }
-        sectionAccess.krakk$setDamageState(localIndex, (byte) clamp(damageState, 0, MAX_DAMAGE_STATE));
+        sectionAccess.krakk$setDamageState(localIndex, (byte) clampDamageState(damageState));
     }
 
     private KrakkBlockDamageSectionAccess ownerSection(int sectionY) {
@@ -298,8 +267,8 @@ public final class KrakkBlockDamageChunkStorage {
         return (short) (((y & 15) << 8) | ((z & 15) << 4) | (x & 15));
     }
 
-    private static int clamp(int value, int min, int max) {
-        return Math.max(min, Math.min(max, value));
+    private static int clampDamageState(int value) {
+        return Math.max(0, Math.min(MAX_DAMAGE_STATE, value));
     }
 
     private static final class SectionDamageState {
@@ -328,8 +297,4 @@ public final class KrakkBlockDamageChunkStorage {
         void accept(int sectionY, Short2ByteOpenHashMap states);
     }
 
-    @FunctionalInterface
-    public interface SectionViewConsumer {
-        void accept(int sectionY, Short2ByteOpenHashMap states);
-    }
 }

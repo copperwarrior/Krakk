@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:crimson_hyphae",
+  "target": "minecraft:stripped_crimson_hyphae",
+  "damage_fraction": 0.60
+}

@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:anvil",
+  "target": "minecraft:chipped_anvil",
+  "damage_fraction": 0.34
+}

@@ -94,7 +94,8 @@ public final class KrakkApi {
     private static final class NoOpDamageApi implements KrakkDamageApi {
         @Override
         public KrakkImpactResult applyImpact(ServerLevel level, BlockPos pos, BlockState state, Entity source,
-                                             double impactPower, boolean dropOnBreak, KrakkDamageType damageType) {
+                                             double impactPower, double impactHeatCelsius,
+                                             boolean dropOnBreak, KrakkDamageType damageType) {
             return new KrakkImpactResult(false, 0);
         }
 

@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:oxidized_cut_copper_stairs",
+  "target": "minecraft:weathered_cut_copper_stairs",
+  "damage_fraction": 0.40
+}

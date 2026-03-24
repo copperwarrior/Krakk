@@ -1,0 +1,6 @@
+{
+  "source": "minecraft:cobblestone_slab",
+  "target": "minecraft:stone_slab",
+  "damage_state": 0,
+  "heat_celsius_min": 900.0
+}

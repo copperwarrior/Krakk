@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:lime_concrete",
+  "target": "minecraft:lime_concrete_powder",
+  "damage_fraction": 0.60
+}

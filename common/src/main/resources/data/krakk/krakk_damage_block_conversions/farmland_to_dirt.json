@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:farmland",
+  "target": "minecraft:dirt",
+  "damage_fraction": 0.20
+}

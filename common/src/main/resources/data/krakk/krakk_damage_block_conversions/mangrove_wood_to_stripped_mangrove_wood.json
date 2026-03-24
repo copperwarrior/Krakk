@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:mangrove_wood",
+  "target": "minecraft:stripped_mangrove_wood",
+  "damage_fraction": 0.60
+}

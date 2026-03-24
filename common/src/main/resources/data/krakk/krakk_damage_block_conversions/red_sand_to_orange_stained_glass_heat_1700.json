@@ -1,0 +1,6 @@
+{
+  "source": "minecraft:red_sand",
+  "target": "minecraft:orange_stained_glass",
+  "damage_state": 0,
+  "heat_celsius": 1700.0
+}

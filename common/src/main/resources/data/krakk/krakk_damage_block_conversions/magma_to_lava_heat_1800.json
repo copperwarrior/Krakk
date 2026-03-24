@@ -1,0 +1,6 @@
+{
+  "source": "minecraft:magma_block",
+  "target": "minecraft:lava",
+  "damage_state": 0,
+  "heat_celsius_min": 1800.0
+}

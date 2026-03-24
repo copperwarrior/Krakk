@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:acacia_wood",
+  "target": "minecraft:stripped_acacia_wood",
+  "damage_fraction": 0.60
+}

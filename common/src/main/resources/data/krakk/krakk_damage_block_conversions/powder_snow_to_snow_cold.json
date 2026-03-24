@@ -1,0 +1,6 @@
+{
+  "source": "minecraft:powder_snow",
+  "target": "minecraft:snow_block",
+  "damage_state": 0,
+  "heat_celsius_max": -30.0
+}

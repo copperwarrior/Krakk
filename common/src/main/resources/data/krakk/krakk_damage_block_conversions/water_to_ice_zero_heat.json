@@ -1,0 +1,9 @@
+{
+  "source": "minecraft:water",
+  "source_properties": {
+    "level": 0
+  },
+  "target": "minecraft:ice",
+  "damage_state": 0,
+  "heat_celsius_max": -10.0
+}

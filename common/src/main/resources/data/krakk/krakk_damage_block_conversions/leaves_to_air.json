@@ -1,0 +1,5 @@
+{
+  "source_tag": "minecraft:leaves",
+  "target": "minecraft:air",
+  "damage_state": 1
+}

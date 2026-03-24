@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:purple_concrete",
+  "target": "minecraft:purple_concrete_powder",
+  "damage_fraction": 0.60
+}

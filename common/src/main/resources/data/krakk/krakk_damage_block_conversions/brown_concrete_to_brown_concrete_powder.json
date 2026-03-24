@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:brown_concrete",
+  "target": "minecraft:brown_concrete_powder",
+  "damage_fraction": 0.60
+}

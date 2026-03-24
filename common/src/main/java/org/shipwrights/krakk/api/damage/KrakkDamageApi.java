@@ -11,6 +11,8 @@ import net.minecraft.world.level.block.state.BlockState;
  * Server-authoritative block damage and mining baseline API.
  */
 public interface KrakkDamageApi {
+    double DEFAULT_IMPACT_HEAT_CELSIUS = 22.0D;
+
     /**
      * Applies impact damage to a block and optionally breaks it.
      *
@@ -19,19 +21,40 @@ public interface KrakkDamageApi {
      * @param state state expected at {@code pos} when called
      * @param source source entity causing the impact, may be null depending on caller
      * @param impactPower impact magnitude used by damage curves
+     * @param impactHeatCelsius impact thermal magnitude in Celsius; {@link #DEFAULT_IMPACT_HEAT_CELSIUS} is neutral
      * @param dropOnBreak whether to spawn normal drops when a break occurs
      * @param damageType damage pipeline mode used for break/removal behavior
      * @return impact result containing break flag and resulting damage state
      */
     KrakkImpactResult applyImpact(ServerLevel level, BlockPos pos, BlockState state, Entity source,
-                                  double impactPower, boolean dropOnBreak, KrakkDamageType damageType);
+                                  double impactPower, double impactHeatCelsius,
+                                  boolean dropOnBreak, KrakkDamageType damageType);
+
+    /**
+     * Applies impact using explicit heat and basic damage mode.
+     */
+    default KrakkImpactResult applyImpact(ServerLevel level, BlockPos pos, BlockState state, Entity source,
+                                          double impactPower, double impactHeatCelsius, boolean dropOnBreak) {
+        return applyImpact(level, pos, state, source, impactPower, impactHeatCelsius, dropOnBreak,
+                KrakkDamageType.KRAKK_DAMAGE_BASIC);
+    }
 
     /**
      * Applies impact using basic damage mode.
      */
     default KrakkImpactResult applyImpact(ServerLevel level, BlockPos pos, BlockState state, Entity source,
                                           double impactPower, boolean dropOnBreak) {
-        return applyImpact(level, pos, state, source, impactPower, dropOnBreak, KrakkDamageType.KRAKK_DAMAGE_BASIC);
+        return applyImpact(level, pos, state, source, impactPower, DEFAULT_IMPACT_HEAT_CELSIUS,
+                dropOnBreak, KrakkDamageType.KRAKK_DAMAGE_BASIC);
+    }
+
+    /**
+     * Applies impact using explicit heat, basic damage mode, and default drop behavior.
+     */
+    default KrakkImpactResult applyImpact(ServerLevel level, BlockPos pos, BlockState state, Entity source,
+                                          double impactPower, double impactHeatCelsius) {
+        return applyImpact(level, pos, state, source, impactPower, impactHeatCelsius, true,
+                KrakkDamageType.KRAKK_DAMAGE_BASIC);
     }
 
     /**
@@ -39,7 +62,17 @@ public interface KrakkDamageApi {
      */
     default KrakkImpactResult applyImpact(ServerLevel level, BlockPos pos, BlockState state, Entity source,
                                           double impactPower) {
-        return applyImpact(level, pos, state, source, impactPower, true, KrakkDamageType.KRAKK_DAMAGE_BASIC);
+        return applyImpact(level, pos, state, source, impactPower, DEFAULT_IMPACT_HEAT_CELSIUS,
+                true, KrakkDamageType.KRAKK_DAMAGE_BASIC);
+    }
+
+    /**
+     * Applies impact with explicit damage type and default heat.
+     */
+    default KrakkImpactResult applyImpact(ServerLevel level, BlockPos pos, BlockState state, Entity source,
+                                          double impactPower, boolean dropOnBreak, KrakkDamageType damageType) {
+        return applyImpact(level, pos, state, source, impactPower, DEFAULT_IMPACT_HEAT_CELSIUS,
+                dropOnBreak, damageType);
     }
 
     /**

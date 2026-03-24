@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:green_concrete",
+  "target": "minecraft:green_concrete_powder",
+  "damage_fraction": 0.60
+}

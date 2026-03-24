@@ -5,6 +5,7 @@ import com.mojang.brigadier.arguments.BoolArgumentType;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.LongArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import dev.architectury.event.events.common.CommandRegistrationEvent;
 import it.unimi.dsi.fastutil.doubles.DoubleArrayList;
@@ -17,14 +18,17 @@ import net.minecraft.commands.arguments.coordinates.BlockPosArgument;
 import net.minecraft.commands.arguments.coordinates.Vec3Argument;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 import org.shipwrights.krakk.api.KrakkApi;
+import org.shipwrights.krakk.api.damage.KrakkDamageApi;
 import org.shipwrights.krakk.api.damage.KrakkImpactResult;
 import org.shipwrights.krakk.api.explosion.KrakkExplosionProfile;
 import org.shipwrights.krakk.engine.explosion.KrakkExplosionCurves;
@@ -94,11 +98,34 @@ public final class KrakkDebugCommands {
                                                         BlockPosArgument.getBlockPos(context, "to"))))))
                         .then(Commands.literal("explode")
                                 .then(Commands.argument("pos", Vec3Argument.vec3())
-                                        .then(Commands.argument("power", DoubleArgumentType.doubleArg(0.1D, DEFAULT_MAX_POWER))
+                                        .then(Commands.argument("magnitude", StringArgumentType.word())
                                                 .executes(context -> explode(
                                                         context.getSource(),
                                                         Vec3Argument.getVec3(context, "pos"),
-                                                        DoubleArgumentType.getDouble(context, "power"))))))
+                                                        StringArgumentType.getString(context, "magnitude"),
+                                                        0,
+                                                        KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS))
+                                                .then(Commands.argument("blastTransmittance", IntegerArgumentType.integer(0, 100))
+                                                        .executes(context -> explode(
+                                                                context.getSource(),
+                                                                Vec3Argument.getVec3(context, "pos"),
+                                                                StringArgumentType.getString(context, "magnitude"),
+                                                                IntegerArgumentType.getInteger(context, "blastTransmittance"),
+                                                                KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS))
+                                                        .then(Commands.argument("heat", DoubleArgumentType.doubleArg())
+                                                                .executes(context -> explode(
+                                                                        context.getSource(),
+                                                                        Vec3Argument.getVec3(context, "pos"),
+                                                                        StringArgumentType.getString(context, "magnitude"),
+                                                                        IntegerArgumentType.getInteger(context, "blastTransmittance"),
+                                                                        DoubleArgumentType.getDouble(context, "heat"))))))))
+                        .then(Commands.literal("phaselogging")
+                                .executes(context -> reportPhaseLogging(context.getSource()))
+                                .then(Commands.argument("enabled", BoolArgumentType.bool())
+                                        .executes(context -> setPhaseLogging(
+                                                context.getSource(),
+                                                BoolArgumentType.getBool(context, "enabled")
+                                        ))))
                         .then(Commands.literal("krakkexplode")
                                 .then(Commands.argument("pos", Vec3Argument.vec3())
                                         .then(Commands.argument("radius", DoubleArgumentType.doubleArg(0.0D))
@@ -110,11 +137,11 @@ public final class KrakkDebugCommands {
                                                                 DoubleArgumentType.getDouble(context, "energy")))))))
                         .then(Commands.literal("profexplode")
                                 .then(Commands.argument("pos", Vec3Argument.vec3())
-                                        .then(Commands.argument("power", DoubleArgumentType.doubleArg(0.1D, DEFAULT_MAX_POWER))
+                                        .then(Commands.argument("magnitude", StringArgumentType.word())
                                                 .executes(context -> profExplode(
                                                         context.getSource(),
                                                         Vec3Argument.getVec3(context, "pos"),
-                                                        DoubleArgumentType.getDouble(context, "power"),
+                                                        StringArgumentType.getString(context, "magnitude"),
                                                         DEFAULT_PROFILE_RUNS,
                                                         DEFAULT_PROFILE_WARMUP,
                                                         Long.MIN_VALUE,
@@ -123,7 +150,7 @@ public final class KrakkDebugCommands {
                                                         .executes(context -> profExplode(
                                                                 context.getSource(),
                                                                 Vec3Argument.getVec3(context, "pos"),
-                                                                DoubleArgumentType.getDouble(context, "power"),
+                                                                StringArgumentType.getString(context, "magnitude"),
                                                                 IntegerArgumentType.getInteger(context, "runs"),
                                                                 DEFAULT_PROFILE_WARMUP,
                                                                 Long.MIN_VALUE,
@@ -132,7 +159,7 @@ public final class KrakkDebugCommands {
                                                                 .executes(context -> profExplode(
                                                                         context.getSource(),
                                                                         Vec3Argument.getVec3(context, "pos"),
-                                                                        DoubleArgumentType.getDouble(context, "power"),
+                                                                        StringArgumentType.getString(context, "magnitude"),
                                                                         IntegerArgumentType.getInteger(context, "runs"),
                                                                         IntegerArgumentType.getInteger(context, "warmup"),
                                                                         Long.MIN_VALUE,
@@ -141,7 +168,7 @@ public final class KrakkDebugCommands {
                                                                         .executes(context -> profExplode(
                                                                                 context.getSource(),
                                                                                 Vec3Argument.getVec3(context, "pos"),
-                                                                                DoubleArgumentType.getDouble(context, "power"),
+                                                                                StringArgumentType.getString(context, "magnitude"),
                                                                                 IntegerArgumentType.getInteger(context, "runs"),
                                                                                 IntegerArgumentType.getInteger(context, "warmup"),
                                                                                 LongArgumentType.getLong(context, "seed"),
@@ -150,7 +177,7 @@ public final class KrakkDebugCommands {
                                                                                 .executes(context -> profExplode(
                                                                                         context.getSource(),
                                                                                         Vec3Argument.getVec3(context, "pos"),
-                                                                                        DoubleArgumentType.getDouble(context, "power"),
+                                                                                        StringArgumentType.getString(context, "magnitude"),
                                                                                         IntegerArgumentType.getInteger(context, "runs"),
                                                                                         IntegerArgumentType.getInteger(context, "warmup"),
                                                                                         LongArgumentType.getLong(context, "seed"),
@@ -281,11 +308,18 @@ public final class KrakkDebugCommands {
                                                                 IntegerArgumentType.getInteger(context, "value")))))))
                         .then(Commands.literal("damage")
                                 .then(Commands.argument("pos", BlockPosArgument.blockPos())
-                                        .then(Commands.argument("amount", IntegerArgumentType.integer(1))
+                                        .then(Commands.argument("amount", IntegerArgumentType.integer(0))
                                                 .executes(context -> damageBlock(
                                                         context.getSource(),
                                                         BlockPosArgument.getBlockPos(context, "pos"),
-                                                        IntegerArgumentType.getInteger(context, "amount"))))))
+                                                        IntegerArgumentType.getInteger(context, "amount"),
+                                                        KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS))
+                                                .then(Commands.argument("heat", DoubleArgumentType.doubleArg())
+                                                        .executes(context -> damageBlock(
+                                                                context.getSource(),
+                                                                BlockPosArgument.getBlockPos(context, "pos"),
+                                                                IntegerArgumentType.getInteger(context, "amount"),
+                                                                DoubleArgumentType.getDouble(context, "heat")))))))
                         .then(Commands.literal("areadamage")
                                 .then(Commands.argument("from", BlockPosArgument.blockPos())
                                         .then(Commands.argument("to", BlockPosArgument.blockPos())
@@ -431,52 +465,178 @@ public final class KrakkDebugCommands {
         return cleared;
     }
 
-    private static int explode(CommandSourceStack source, Vec3 pos, double power) {
+    private static DetonationMagnitude parseDetonationMagnitude(String rawInput) {
+        if (rawInput == null) {
+            throw new IllegalArgumentException("Magnitude is required.");
+        }
+        String trimmed = rawInput.trim();
+        if (trimmed.isEmpty()) {
+            throw new IllegalArgumentException("Magnitude is required.");
+        }
+        String normalized = trimmed.toLowerCase();
+
+        try {
+            if (normalized.endsWith("mt")) {
+                double value = Double.parseDouble(normalized.substring(0, normalized.length() - 2));
+                if (!Double.isFinite(value) || value <= 0.0D) {
+                    throw new IllegalArgumentException("Magnitude must be > 0.");
+                }
+                double tons = value * KrakkExplosionProfile.MEGATON_TONS;
+                return new DetonationMagnitude(trimmed, KrakkExplosionProfile.powerFromTonnage(tons), tons);
+            }
+            if (normalized.endsWith("kt")) {
+                double value = Double.parseDouble(normalized.substring(0, normalized.length() - 2));
+                if (!Double.isFinite(value) || value <= 0.0D) {
+                    throw new IllegalArgumentException("Magnitude must be > 0.");
+                }
+                double tons = value * KrakkExplosionProfile.KILOTON_TONS;
+                return new DetonationMagnitude(trimmed, KrakkExplosionProfile.powerFromTonnage(tons), tons);
+            }
+            if (normalized.endsWith("t")) {
+                double tons = Double.parseDouble(normalized.substring(0, normalized.length() - 1));
+                if (!Double.isFinite(tons) || tons <= 0.0D) {
+                    throw new IllegalArgumentException("Magnitude must be > 0.");
+                }
+                return new DetonationMagnitude(trimmed, KrakkExplosionProfile.powerFromTonnage(tons), tons);
+            }
+
+            double power = Double.parseDouble(normalized);
+            if (!Double.isFinite(power) || power <= 0.0D) {
+                throw new IllegalArgumentException("Magnitude must be > 0.");
+            }
+            double tonnage = KrakkExplosionProfile.tonnageFromPower(power);
+            return new DetonationMagnitude(trimmed, power, tonnage);
+        } catch (NumberFormatException exception) {
+            throw new IllegalArgumentException("Invalid magnitude. Use power or tonnage suffixes like 1t, 1kt, 1mt.");
+        }
+    }
+
+    private static int explode(CommandSourceStack source, Vec3 pos, String magnitudeInput, int blastTransmittanceCommand, double impactHeatCelsius) {
+        double blastTransmittance = (blastTransmittanceCommand / 100.0D) * KrakkExplosionProfile.DEFAULT_BLAST_TRANSMITTANCE;
         ServerLevel level = source.getLevel();
         Entity sourceEntity = source.getEntity();
         LivingEntity owner = sourceEntity instanceof LivingEntity living ? living : null;
+        DetonationMagnitude magnitude;
+        try {
+            magnitude = parseDetonationMagnitude(magnitudeInput);
+        } catch (IllegalArgumentException exception) {
+            source.sendFailure(Component.literal(exception.getMessage()));
+            return 0;
+        }
+        double power = magnitude.power();
+        double tonnage = magnitude.tonnageTons();
         // TNT reference point: vanilla TNT is roughly equivalent to a Krakk explosion at radius=4, power=25.
         double derivedRadius = KrakkExplosionCurves.computeBlastRadius(power);
-        KrakkApi.explosions().detonate(
-                level,
-                pos.x,
-                pos.y,
-                pos.z,
-                sourceEntity,
-                owner,
-                power
-        );
-
-        source.sendSuccess(() -> Component.literal(String.format(
-                "Triggered Krakk explosion at %.2f %.2f %.2f (power=%.2f, derivedRadius=%.2f)",
-                pos.x, pos.y, pos.z, power, derivedRadius
-        )), true);
+        try {
+            KrakkApi.explosions().detonate(
+                    level,
+                    pos.x,
+                    pos.y,
+                    pos.z,
+                    sourceEntity,
+                    owner,
+                    KrakkExplosionProfile.fromPower(power, impactHeatCelsius).withBlastTransmittance(blastTransmittance)
+            );
+        } catch (Throwable exception) {
+            LOGGER.error(
+                    "Failed to execute /krakk explode at {} {} {} (input={}, power={}, heat={}).",
+                    pos.x,
+                    pos.y,
+                    pos.z,
+                    magnitude.rawInput(),
+                    power,
+                    impactHeatCelsius,
+                    exception
+            );
+            if (exception instanceof OutOfMemoryError) {
+                System.gc();
+            }
+            source.sendFailure(Component.literal("Failed to execute Krakk explosion command. See logs for details."));
+            return 0;
+        }
+        try {
+            source.sendSuccess(() -> Component.literal(String.format(
+                    "Triggered Krakk explosion at %.2f %.2f %.2f (input=%s, power=%.2f, tonnage=%.4ft, blastTransmittance=%d%%, heat=%.2fC, derivedRadius=%.2f)",
+                    pos.x, pos.y, pos.z, magnitude.rawInput(), power, tonnage, blastTransmittanceCommand, impactHeatCelsius, derivedRadius
+            )), true);
+        } catch (RuntimeException exception) {
+            LOGGER.error(
+                    "Explosion executed but /krakk explode feedback failed at {} {} {} (input={}).",
+                    pos.x,
+                    pos.y,
+                    pos.z,
+                    magnitude.rawInput(),
+                    exception
+            );
+        }
         return 1;
     }
+
+    private static int reportPhaseLogging(CommandSourceStack source) {
+        boolean enabled = KrakkExplosionRuntime.isKrakkPhaseTimingLoggingEnabled();
+        source.sendSuccess(() -> Component.literal("Krakk phase timing logging: " + enabled), false);
+        return 1;
+    }
+
+    private static int setPhaseLogging(CommandSourceStack source, boolean enabled) {
+        KrakkExplosionRuntime.setKrakkPhaseTimingLoggingEnabled(enabled);
+        source.sendSuccess(() -> Component.literal("Set Krakk phase timing logging to: " + enabled), true);
+        return 1;
+    }
+
+    @SuppressWarnings("unused")
+    public static void tickQueuedDetonations(MinecraftServer server) {
+    }
+
 
     private static int krakkExplode(CommandSourceStack source, Vec3 pos, double radius, double energy) {
         ServerLevel level = source.getLevel();
         Entity sourceEntity = source.getEntity();
         LivingEntity owner = sourceEntity instanceof LivingEntity living ? living : null;
-        KrakkApi.explosions().detonate(
-                level,
-                pos.x,
-                pos.y,
-                pos.z,
-                sourceEntity,
-                owner,
-                radius,
-                energy
-        );
-
-        source.sendSuccess(() -> Component.literal(String.format(
-                "Triggered Krakk explosion at %.2f %.2f %.2f (radius=%.2f, energy=%.2f)",
-                pos.x, pos.y, pos.z, radius, energy
-        )), true);
+        try {
+            KrakkApi.explosions().detonate(
+                    level,
+                    pos.x,
+                    pos.y,
+                    pos.z,
+                    sourceEntity,
+                    owner,
+                    radius,
+                    energy
+            );
+        } catch (RuntimeException exception) {
+            LOGGER.error(
+                    "Failed to execute /krakk krakkexplode at {} {} {} (radius={}, energy={}).",
+                    pos.x,
+                    pos.y,
+                    pos.z,
+                    radius,
+                    energy,
+                    exception
+            );
+            source.sendFailure(Component.literal("Failed to execute Krakk explosion command. See logs for details."));
+            return 0;
+        }
+        try {
+            source.sendSuccess(() -> Component.literal(String.format(
+                    "Triggered Krakk explosion at %.2f %.2f %.2f (radius=%.2f, energy=%.2f)",
+                    pos.x, pos.y, pos.z, radius, energy
+            )), true);
+        } catch (RuntimeException exception) {
+            LOGGER.error(
+                    "Explosion executed but /krakk krakkexplode feedback failed at {} {} {} (radius={}, energy={}).",
+                    pos.x,
+                    pos.y,
+                    pos.z,
+                    radius,
+                    energy,
+                    exception
+            );
+        }
         return 1;
     }
 
-    private static int profExplode(CommandSourceStack source, Vec3 pos, double power,
+    private static int profExplode(CommandSourceStack source, Vec3 pos, String magnitudeInput,
                                    int runs, int warmup, long seed, boolean apply) {
         if (!(KrakkApi.explosions() instanceof KrakkExplosionRuntime runtime)) {
             source.sendFailure(Component.literal("Krakk explosion runtime does not support profiling."));
@@ -486,7 +646,14 @@ public final class KrakkDebugCommands {
         ServerLevel level = source.getLevel();
         Entity sourceEntity = source.getEntity();
         LivingEntity owner = sourceEntity instanceof LivingEntity living ? living : null;
-        KrakkExplosionProfile profile = KrakkExplosionProfile.krakk(power);
+        DetonationMagnitude magnitude;
+        try {
+            magnitude = parseDetonationMagnitude(magnitudeInput);
+        } catch (IllegalArgumentException exception) {
+            source.sendFailure(Component.literal(exception.getMessage()));
+            return 0;
+        }
+        KrakkExplosionProfile profile = KrakkExplosionProfile.fromPower(magnitude.power());
         long effectiveSeed = seed != Long.MIN_VALUE ? seed : (level.getGameTime() ^ BlockPos.containing(pos).asLong());
         int effectiveRuns = resolveProfileRuns(apply, runs);
         int effectiveWarmup = resolveProfileWarmup(apply, warmup);
@@ -535,10 +702,6 @@ public final class KrakkDebugCommands {
         );
     }
 
-    private static int profDamageStates(CommandSourceStack source, int runs, int warmup, long seed) {
-        return profDamageStates(source, runs, warmup, seed, false);
-    }
-
     private static int profDamageStates(CommandSourceStack source, int runs, int warmup, long seed, boolean cleanup) {
         ServerLevel level = source.getLevel();
         Vec3 center = source.getPosition();
@@ -547,14 +710,10 @@ public final class KrakkDebugCommands {
         int effectiveWarmup = 0;
         emitDamageProfileIterationNotice(source, runs, warmup, effectiveRuns, effectiveWarmup);
 
-        DamageProfileTargets targets = buildDamageProfileTargets(level, center, QPROF_DAMAGE_RADIUS, QPROF_DAMAGE_MAX_IMPACT);
+        DamageProfileTargets targets = buildDamageProfileTargets(level, center);
         if (targets.positions().isEmpty()) {
             source.sendFailure(Component.literal("No spherical impact targets were generated."));
             return 0;
-        }
-
-        for (int i = 0; i < effectiveWarmup; i++) {
-            runDamageProfilePass(level, targets, seed + i, false, cleanup, QPROF_DAMAGE_DROP_ON_BREAK);
         }
 
         long[] nanos = new long[effectiveRuns];
@@ -581,13 +740,12 @@ public final class KrakkDebugCommands {
                         targets,
                         seed + effectiveWarmup + i,
                         true,
-                        cleanup,
-                        QPROF_DAMAGE_DROP_ON_BREAK
+                        cleanup
                 );
                 nanos[i] = result.elapsedNanos();
                 sumNanos += result.elapsedNanos();
-                minNanos = Math.min(minNanos, result.elapsedNanos());
-                maxNanos = Math.max(maxNanos, result.elapsedNanos());
+                minNanos = result.elapsedNanos();
+                maxNanos = result.elapsedNanos();
                 totalAttempted += result.attempted();
                 totalBroken += result.broken();
                 totalDamaged += result.damaged();
@@ -651,11 +809,9 @@ public final class KrakkDebugCommands {
                 minMs,
                 maxMs
         )), false);
-        if (effectiveRuns < 5 || effectiveWarmup < 1) {
-            source.sendSuccess(() -> Component.literal(
-                    "profileQuality: low confidence; recommended runs>=7 warmup>=2 for parity/perf comparisons."
-            ), false);
-        }
+        source.sendSuccess(() -> Component.literal(
+                "profileQuality: low confidence; recommended runs>=7 warmup>=2 for parity/perf comparisons."
+        ), false);
         source.sendSuccess(() -> Component.literal(
                 "profileScope: avg is impactApply->visible sync; preClear/postClear are reported separately."
         ), false);
@@ -794,7 +950,8 @@ public final class KrakkDebugCommands {
         return effectiveRuns;
     }
 
-    private static DamageProfileTargets buildDamageProfileTargets(ServerLevel level, Vec3 center, double radius, double maxImpactPower) {
+    private static DamageProfileTargets buildDamageProfileTargets(ServerLevel level, Vec3 center) {
+        double radius = QPROF_DAMAGE_RADIUS;
         int minX = (int) Math.floor(center.x - radius);
         int maxX = (int) Math.ceil(center.x + radius);
         int minY = (int) Math.floor(center.y - radius);
@@ -818,7 +975,7 @@ public final class KrakkDebugCommands {
                     }
                     double dist = Math.sqrt(distSq);
                     double normalized = 1.0D - (dist / Math.max(radius, 1.0E-9D));
-                    double impactPower = normalized * maxImpactPower;
+                    double impactPower = normalized * QPROF_DAMAGE_MAX_IMPACT;
                     if (impactPower <= 0.0D) {
                         continue;
                     }
@@ -839,7 +996,7 @@ public final class KrakkDebugCommands {
     }
 
     private static DamageProfileRunResult runDamageProfilePass(ServerLevel level, DamageProfileTargets targets, long seed,
-                                                               boolean logProgress, boolean cleanup, boolean dropOnBreak) {
+                                                               boolean logProgress, boolean cleanup) {
         final long[] preClearNanos = {0L};
         final long[] applyNanos = {0L};
         final long[] postClearNanos = {0L};
@@ -859,7 +1016,7 @@ public final class KrakkDebugCommands {
         Runnable applyWork = () -> {
             LongArrayList positions = targets.positions();
             DoubleArrayList impactPowers = targets.impactPowers();
-            int startOffset = size > 0 ? (int) Math.floorMod(seed, size) : 0;
+            int startOffset = size > 0 ? Math.floorMod(seed, size) : 0;
             long applyStart = System.nanoTime();
             BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
             for (int i = 0; i < size; i++) {
@@ -879,7 +1036,7 @@ public final class KrakkDebugCommands {
                             liveState,
                             null,
                             impactPowers.getDouble(index),
-                            dropOnBreak
+                            QPROF_DAMAGE_DROP_ON_BREAK
                     );
                     if (result.broken()) {
                         broken[0]++;
@@ -1470,19 +1627,59 @@ public final class KrakkDebugCommands {
         return updated;
     }
 
-    private static int damageBlock(CommandSourceStack source, BlockPos pos, int amount) {
+    private static int damageBlock(CommandSourceStack source, BlockPos pos, int amount, double impactHeatCelsius) {
         ServerLevel level = source.getLevel();
-        int current = KrakkApi.damage().getDamageState(level, pos);
-        int next = Math.min(KrakkApi.damage().getMaxDamageState(), current + amount);
-        boolean changed = KrakkApi.damage().setDamageStateForDebug(level, pos, next);
-        if (!changed) {
-            source.sendFailure(Component.literal("Unable to damage target block."));
+        BlockState blockState = level.getBlockState(pos);
+        if (blockState.isAir()) {
+            source.sendFailure(Component.literal("Target block is air."));
             return 0;
         }
+        Entity sourceEntity = source.getEntity();
 
+        KrakkImpactResult result;
+        boolean converted = false;
+        boolean ignited = false;
+        if (KrakkApi.damage() instanceof KrakkDamageRuntime runtime) {
+            if (amount <= 0) {
+                KrakkDamageRuntime.ImpactExecutionResult executionResult = runtime.applyThermalImpactPrevalidatedWithEvents(
+                        level,
+                        pos,
+                        blockState,
+                        sourceEntity,
+                        0.0D,
+                        impactHeatCelsius,
+                        null
+                );
+                result = executionResult.impactResult();
+                converted = executionResult.converted();
+                ignited = executionResult.ignited();
+            } else {
+                KrakkDamageRuntime.ImpactExecutionResult executionResult = runtime.applyImpactPrevalidatedWithEvents(
+                        level,
+                        pos,
+                        blockState,
+                        sourceEntity,
+                        amount,
+                        impactHeatCelsius,
+                        false,
+                        null
+                );
+                result = executionResult.impactResult();
+                converted = executionResult.converted();
+                ignited = executionResult.ignited();
+            }
+        } else {
+            result = KrakkApi.damage().applyImpact(level, pos, blockState, sourceEntity, amount,
+                    impactHeatCelsius, false, null);
+        }
+
+        int finalDamageState = Math.max(0, result.damageState());
+        boolean finalConverted = converted;
+        boolean finalIgnited = ignited;
         source.sendSuccess(() -> Component.literal(String.format(
-                "Damaged block at %d %d %d by %d (from %d to %d)",
-                pos.getX(), pos.getY(), pos.getZ(), amount, current, next
+                "Damaged block at %d %d %d by %.2f heat %.2fC (broken=%s, damageState=%d, converted=%s, ignited=%s)",
+                pos.getX(), pos.getY(), pos.getZ(), (double) amount, impactHeatCelsius,
+                result.broken(), finalDamageState, finalConverted, finalIgnited
         )), true);
         return 1;
     }
@@ -1526,6 +1723,7 @@ public final class KrakkDebugCommands {
             return 0;
         }
 
+        //noinspection resource
         ServerLevel level = target.serverLevel();
         long shiftTicks = Math.max(1L, ticks);
         final int[] touched = {0};
@@ -1592,6 +1790,7 @@ public final class KrakkDebugCommands {
             return 0;
         }
 
+        //noinspection resource
         ServerLevel level = target.serverLevel();
         ChunkLoop loop = iterateLoadedChunksForPlayer(target, (chunk, chunkX, chunkZ) ->
                 KrakkApi.damage().syncChunkToPlayer(target, level, chunkX, chunkZ, false)
@@ -1788,6 +1987,7 @@ public final class KrakkDebugCommands {
             return 0;
         }
 
+        //noinspection resource
         ServerLevel level = target.serverLevel();
         ChunkLoop loop = iterateLoadedChunksForPlayer(target, (chunk, chunkX, chunkZ) ->
                 KrakkApi.network().sendChunkUnload(target, level.dimension().location(), chunkX, chunkZ)
@@ -1815,6 +2015,7 @@ public final class KrakkDebugCommands {
     }
 
     private static ChunkLoop iterateLoadedChunksForPlayer(ServerPlayer player, LoadedChunkConsumer consumer) {
+        //noinspection resource
         ServerLevel level = player.serverLevel();
         ChunkPos center = player.chunkPosition();
         int viewDistance = level.getServer().getPlayerList().getViewDistance() + 1;
@@ -1843,6 +2044,9 @@ public final class KrakkDebugCommands {
     }
 
     private record ChunkDamageSummary(int chunkX, int chunkZ, int sections, int entries) {
+    }
+
+    private record DetonationMagnitude(String rawInput, double power, double tonnageTons) {
     }
 
     private record Bounds(int minX, int minY, int minZ, int maxX, int maxY, int maxZ) {

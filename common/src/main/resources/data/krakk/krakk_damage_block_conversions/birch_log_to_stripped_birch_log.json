@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:birch_log",
+  "target": "minecraft:stripped_birch_log",
+  "damage_fraction": 0.60
+}

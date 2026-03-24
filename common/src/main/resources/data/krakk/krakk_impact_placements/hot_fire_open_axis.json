@@ -1,0 +1,11 @@
+{
+  "target": "minecraft:fire",
+  "placement_mode": "random_open_axis",
+  "priority": 100,
+  "heat_celsius_min": 200.0,
+  "chance_min": 0.01,
+  "chance_max": 0.95,
+  "chance_heat_min": 200.0,
+  "chance_heat_max": 1700.0,
+  "chance_exponent": 2.0
+}

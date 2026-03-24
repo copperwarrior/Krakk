@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:pink_concrete",
+  "target": "minecraft:pink_concrete_powder",
+  "damage_fraction": 0.60
+}

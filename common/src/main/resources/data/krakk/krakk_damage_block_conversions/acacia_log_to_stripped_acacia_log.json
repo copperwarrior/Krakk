@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:acacia_log",
+  "target": "minecraft:stripped_acacia_log",
+  "damage_fraction": 0.60
+}

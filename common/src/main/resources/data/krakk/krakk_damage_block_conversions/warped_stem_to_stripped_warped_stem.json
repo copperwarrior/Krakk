@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:warped_stem",
+  "target": "minecraft:stripped_warped_stem",
+  "damage_fraction": 0.60
+}

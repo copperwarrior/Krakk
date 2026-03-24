@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:spruce_log",
+  "target": "minecraft:stripped_spruce_log",
+  "damage_fraction": 0.60
+}

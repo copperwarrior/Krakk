@@ -1,0 +1,8 @@
+{
+  "source_tag": "minecraft:candles",
+  "damage_state": 0,
+  "heat_celsius_min": 220.0,
+  "target_properties": {
+    "lit": true
+  }
+}

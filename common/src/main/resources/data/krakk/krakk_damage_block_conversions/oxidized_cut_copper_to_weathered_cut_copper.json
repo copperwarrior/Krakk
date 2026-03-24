@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:oxidized_cut_copper",
+  "target": "minecraft:weathered_cut_copper",
+  "damage_fraction": 0.40
+}

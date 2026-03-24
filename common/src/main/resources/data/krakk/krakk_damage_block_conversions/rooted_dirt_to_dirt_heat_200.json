@@ -1,0 +1,6 @@
+{
+  "source": "minecraft:rooted_dirt",
+  "target": "minecraft:dirt",
+  "damage_state": 0,
+  "heat_celsius_min": 200.0
+}

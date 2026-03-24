@@ -1,0 +1,6 @@
+{
+  "source_prefix": "mossy_",
+  "target_prefix_strip": "mossy_",
+  "damage_state": 0,
+  "heat_celsius_min": 700.0
+}

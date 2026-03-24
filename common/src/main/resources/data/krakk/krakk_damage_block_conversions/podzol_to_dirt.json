@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:podzol",
+  "target": "minecraft:dirt",
+  "damage_fraction": 0.45
+}

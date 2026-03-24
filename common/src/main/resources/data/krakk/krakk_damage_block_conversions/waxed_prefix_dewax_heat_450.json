@@ -1,0 +1,6 @@
+{
+  "source_prefix": "waxed_",
+  "target_prefix_strip": "waxed_",
+  "damage_state": 0,
+  "heat_celsius_min": 450.0
+}

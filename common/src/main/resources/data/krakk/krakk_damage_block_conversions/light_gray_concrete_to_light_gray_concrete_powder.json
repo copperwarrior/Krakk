@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:light_gray_concrete",
+  "target": "minecraft:light_gray_concrete_powder",
+  "damage_fraction": 0.60
+}

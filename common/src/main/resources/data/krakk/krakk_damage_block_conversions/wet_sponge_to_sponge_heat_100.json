@@ -1,0 +1,6 @@
+{
+  "source": "minecraft:wet_sponge",
+  "target": "minecraft:sponge",
+  "damage_state": 0,
+  "heat_celsius_min": 100.0
+}

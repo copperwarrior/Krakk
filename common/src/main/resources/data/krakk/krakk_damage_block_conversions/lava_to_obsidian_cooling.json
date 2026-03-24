@@ -1,0 +1,6 @@
+{
+  "source": "minecraft:lava",
+  "target": "minecraft:obsidian",
+  "damage_state": 0,
+  "heat_celsius_max": -50.0
+}

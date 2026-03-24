@@ -1,0 +1,6 @@
+{
+  "source": "minecraft:stone",
+  "target": "minecraft:magma_block",
+  "damage_state": 0,
+  "heat_celsius_min": 1700.0
+}

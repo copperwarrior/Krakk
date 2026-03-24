@@ -1,0 +1,6 @@
+{
+  "source": "minecraft:raw_copper_block",
+  "target": "minecraft:copper_block",
+  "damage_state": 0,
+  "heat_celsius_min": 1085.0
+}

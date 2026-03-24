@@ -1,0 +1,6 @@
+{
+  "source": "minecraft:clay",
+  "target": "minecraft:bricks",
+  "damage_state": 0,
+  "heat_celsius_min": 900.0
+}

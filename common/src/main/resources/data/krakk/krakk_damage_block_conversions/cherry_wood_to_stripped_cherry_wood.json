@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:cherry_wood",
+  "target": "minecraft:stripped_cherry_wood",
+  "damage_fraction": 0.60
+}

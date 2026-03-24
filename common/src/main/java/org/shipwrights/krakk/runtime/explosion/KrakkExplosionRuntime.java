@@ -1,10 +1,15 @@
 package org.shipwrights.krakk.runtime.explosion;
 
+import com.mojang.logging.LogUtils;
 import it.unimi.dsi.fastutil.bytes.ByteArrayList;
 import it.unimi.dsi.fastutil.doubles.DoubleArrayList;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.Int2DoubleOpenHashMap;
+import it.unimi.dsi.fastutil.ints.Int2FloatOpenHashMap;
+import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
+import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import it.unimi.dsi.fastutil.longs.Long2ByteMap;
 import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2DoubleMap;
@@ -15,9 +20,12 @@ import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
@@ -29,11 +37,15 @@ import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.FallingBlock;
 import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.TntBlock;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.AABB;
 import org.shipwrights.krakk.api.KrakkApi;
+import org.shipwrights.krakk.api.damage.KrakkDamageApi;
 import org.shipwrights.krakk.api.damage.KrakkDamageType;
 import org.shipwrights.krakk.api.damage.KrakkImpactResult;
 import org.shipwrights.krakk.api.explosion.KrakkExplosionApi;
@@ -41,21 +53,39 @@ import org.shipwrights.krakk.api.explosion.KrakkExplosionProfile;
 import org.shipwrights.krakk.engine.damage.KrakkDamageCurves;
 import org.shipwrights.krakk.engine.explosion.KrakkExplosionCurves;
 import org.shipwrights.krakk.engine.explosion.KrakkRaySplitMath;
+import org.shipwrights.krakk.runtime.damage.KrakkDamageBlockConversions;
 import org.shipwrights.krakk.runtime.damage.KrakkDamageRuntime;
+import org.slf4j.Logger;
 
+import java.io.IOException;
+import java.lang.ref.Cleaner;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Comparator;
 import java.util.List;
+import java.util.PriorityQueue;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 
 public final class KrakkExplosionRuntime implements KrakkExplosionApi {
+    private static final Logger LOGGER = LogUtils.getLogger();
+    private static final AtomicLong KRAKK_PHASE_TRACE_SEQUENCE = new AtomicLong(1L);
+    private static volatile boolean krakkPhaseTimingLoggingEnabled = true;
+
     private static final int MIN_RAY_COUNT = 640;
     private static final int MAX_RAY_COUNT = 2048;
     private static final double DEFAULT_RAY_COUNT = 960.0D;
@@ -143,11 +173,22 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final double VOLUMETRIC_DEFORM_SAMPLE_STEP = 0.5D;
     private static final double VOLUMETRIC_PRESSURE_AIR_DECAY_PER_BLOCK = 0.01D;
     private static final double VOLUMETRIC_PRESSURE_RESISTANCE_LOSS_SCALE = 0.04D;
-    private static final double VOLUMETRIC_PRESSURE_DIFFUSION = 0.24D;
+    private static final double VOLUMETRIC_PRESSURE_DIFFUSION = 0.08D;
     private static final double VOLUMETRIC_PRESSURE_RECOVERY_PER_BLOCK = 0.08D;
-    private static final int VOLUMETRIC_DIRECTION_NEIGHBOR_COUNT = 10;
+    // 20 neighbors: worst-case top-8 is ~7° from seed; 20 neighbors span ~9.4° (safe margin).
+    private static final int VOLUMETRIC_DIRECTION_NEIGHBOR_COUNT = 20;
     private static final int VOLUMETRIC_DIRECTION_BLEND_COUNT = 8;
     private static final double VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT = 1.7D;
+    // LUT for pow(x, VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT) over x in [0, 1], resolution 1024.
+    // Replaces 8 Math.pow calls per sampled block inside sampleBlendedVolumetricPressure.
+    private static final float[] DOT_WEIGHT_LUT = buildDotWeightLut();
+    private static float[] buildDotWeightLut() {
+        float[] lut = new float[1024];
+        for (int i = 0; i < 1024; i++) {
+            lut[i] = (float) Math.pow(i / 1023.0, VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT);
+        }
+        return lut;
+    }
     private static final int VOLUMETRIC_DIRECTION_LOOKUP_RESOLUTION = 64;
     private static final double VOLUMETRIC_RADIUS_SCALE_BASE = 6.0D;
     private static final double VOLUMETRIC_MAX_POWER_RADIUS_SCALE = 8.0D;
@@ -160,10 +201,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final double VOLUMETRIC_EDGE_POINT_BIAS_EXPONENT = 2.25D;
     private static final double VOLUMETRIC_OUTER_SMOOTHING_RATIO = 0.06D;
     private static final double VOLUMETRIC_OUTER_SMOOTHING_VARIANCE = 0.010D;
-    private static final double VOLUMETRIC_EDGE_SPIKE_START_FRACTION = 0.72D;
-    private static final double VOLUMETRIC_EDGE_SPIKE_MAX_REDUCTION = 0.12D;
+    private static final double VOLUMETRIC_EDGE_SPIKE_START_FRACTION = 0.82D;
+    private static final double VOLUMETRIC_EDGE_SPIKE_MAX_REDUCTION = 0.07D;
     private static final double VOLUMETRIC_EDGE_SPIKE_REDUCTION_EXPONENT = 2.6D;
-    private static final double VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION = 96.0D;
+    private static final double VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION = 72.0D;
     private static final double VOLUMETRIC_EDGE_SPIKE_MIN_STRENGTH = 0.08D;
     private static final double VOLUMETRIC_EDGE_SPIKE_RAMP_EXPONENT = 2.2D;
     private static final double VOLUMETRIC_OUTER_SMOOTHING_FULL_WEIGHT_FRACTION = 1.0D
@@ -171,16 +212,58 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final double VOLUMETRIC_RESISTANCE_FIELD_PREALLOC_SOLID_FRACTION = 0.85D;
     private static final double VOLUMETRIC_AIR_DISTRIBUTION_BLEND = 0.78D;
     private static final double VOLUMETRIC_MAX_AIR_NORMALIZATION_SCALE = 8.0D;
-    private static final double VOLUMETRIC_IMPACT_POWER_PER_ENERGY = 500.0D;
+    private static final double VOLUMETRIC_IMPACT_POWER_PER_ENERGY = 1500.0D;
+    // Per-block damaging force = resolvedRadius * this * (blockWeight / maxBlockWeight).
+    // Matches the ray system's rayEnergy = blastRadius * constant: larger blast → more force per
+    // block, independent of how many solid blocks the volume contains.
+    private static final double VOLUMETRIC_IMPACT_POWER_PER_RADIUS = 25.0D;
     private static final double STRUCTURAL_COLLAPSE_IMPACT_WEIGHT_SCALE = 0.60D;
     private static final int STRUCTURAL_COLLAPSE_MAX_VOXELS = 24_000_000;
     private static final double KRAKK_AIR_SLOWNESS = 1.0D;
     private static final double KRAKK_SOLID_SLOWNESS_SCALE = 0.040D;
+    private static final double KRAKK_BLOCK_RESISTANCE_NOISE_MAX = 8.0D;
     private static final int KRAKK_BASE_SWEEP_CYCLES = 8;
     private static final int KRAKK_MAX_SWEEP_CYCLES = 24;
+    private static final int KRAKK_MULTIRES_COARSE_MAX_SWEEP_CYCLES = 12;
+    private static final double KRAKK_DELTA_STEPPING_BUCKET_WIDTH = 0.75D;
+    private static final int KRAKK_DELTA_STEPPING_REFINE_SWEEP_CYCLES = 2;
+    private static final int KRAKK_DELTA_STEPPING_PROGRESS_LOG_INTERVAL_BUCKETS = 2048;
+    private static final int KRAKK_NB_JOBS_PER_TICK = 1;
+    private static final long KRAKK_NB_TICK_BUDGET_NANOS = 35_000_000L;
+    private static final int KRAKK_NB_POP_BUDGET = Integer.MAX_VALUE;
+    private static final long KRAKK_NB_PROGRESS_LOG_INTERVAL_NANOS = 1_000_000_000L;
+    private static final double KRAKK_NB_OVERRUN_ATTENUATION = 0.08D;
+    private static final double KRAKK_NB_NORMALIZED_OVERRUN_ATTENUATION = 0.20D;
+    private static final double KRAKK_NB_MAX_NORMALIZED_OVERRUN = 12.0D;
+    private static final double KRAKK_NB_MIN_TRANSMITTANCE = 0.30D;
+    private static final double KRAKK_NB_SHELL_IMPACT_NORMALIZATION = 24.0D;
+    private static final double KRAKK_NB_MIN_SHELL_AREA = 16.0D;
+    private static final double KRAKK_STREAMING_RADIUS_BOUNDARY_EPSILON = 1.5D;
+    private static final int KRAKK_STREAMING_JOBS_PER_TICK = 1;
+    private static final long KRAKK_STREAMING_TICK_BUDGET_NANOS = 35_000_000L;
+    private static final int KRAKK_STREAMING_SOLVE_POP_BUDGET = Integer.MAX_VALUE;
+    private static final int KRAKK_STREAMING_TARGET_SCAN_BUDGET = Integer.MAX_VALUE;
+    private static final int KRAKK_STREAMING_DIRECT_IMPACT_BUDGET = Integer.MAX_VALUE;
+    private static final int KRAKK_STREAMING_THERMAL_IMPACT_BUDGET = Integer.MAX_VALUE;
+    private static final long KRAKK_STREAMING_PROGRESS_LOG_INTERVAL_NANOS = 1_000_000_000L;
+    private static final boolean KRAKK_STREAMING_ENABLE_SHADOW_SECOND_PASS = false;
+    private static final boolean KRAKK_STREAMING_ENABLE_LOW_WEIGHT_STOCHASTIC = false;
+    private static final double KRAKK_STREAMING_STEP_DIAGONAL_2D = Math.sqrt(2.0D);
+    private static final double KRAKK_STREAMING_STEP_DIAGONAL_3D = Math.sqrt(3.0D);
+    private static final int[][] KRAKK_STREAMING_WAVE_NEIGHBOR_OFFSETS = buildKrakkStreamingWaveNeighborOffsets();
+    private static final double[] KRAKK_STREAMING_WAVE_NEIGHBOR_STEP = buildKrakkStreamingWaveNeighborStepLengths(
+            KRAKK_STREAMING_WAVE_NEIGHBOR_OFFSETS
+    );
+    private static final double KRAKK_STREAMING_SHELL_IMPACT_NORMALIZATION = 24.0D;
+    private static final double KRAKK_STREAMING_SHELL_MIN_AREA = 16.0D;
+    private static final int KRAKK_SHADOW_SOLVE_MAX_VOLUME = 180_000_000;
+    private static final int KRAKK_SOLID_POSITIONS_PREALLOC_CAP = 4_000_000;
+    private static final int KRAKK_CHUNK_SOLID_POSITIONS_PREALLOC_CAP = 1_000_000;
+    private static final int KRAKK_TARGET_MERGE_PREALLOC_CAP = 2_000_000;
     private static final double KRAKK_CONVERGENCE_EPSILON = 1.0E-3D;
     private static final double KRAKK_MAX_ARRIVAL_MULTIPLIER = 1.20D;
-    private static final double KRAKK_WEIGHT_EXPONENT = 1.35D;
+    private static final double KRAKK_WEIGHT_EXPONENT = 2.0D;         // full transmittance (blastTransmittanceScale=1)
+    private static final double KRAKK_WEIGHT_EXPONENT_SMOOTH = 0.7D; // smooth (blastTransmittanceScale=0)
     private static final double KRAKK_RESISTANCE_ATTENUATION_PER_OVERRUN = 3.0D;
     private static final double KRAKK_RESISTANCE_NORMALIZED_ATTENUATION = 3.5D;
     private static final double KRAKK_HARD_BLOCK_NORMALIZED_OVERRUN = 4.0D;
@@ -201,7 +284,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final boolean KRAKK_ENABLE_VOLUMETRIC_BASELINE_SMOOTHING = true;
     private static final double KRAKK_MIN_TRANSMITTANCE = 1.0E-3D;
     private static final double KRAKK_ENVELOPE_TRANSMITTANCE_BLEND = 0.25D;
-    private static final double KRAKK_BASELINE_SMOOTH_BLEND = 0.78D;
+
+    private static final double KRAKK_BASELINE_SMOOTH_BLEND = 0.92D;         // full transmittance (blastTransmittanceScale=1)
+    private static final double KRAKK_BASELINE_SMOOTH_BLEND_FLOOR = 0.93D;  // smooth (blastTransmittanceScale=0)
     private static final double KRAKK_VOLUMETRIC_MECHANICS_SELF_SMOOTH = 0.32D;
     private static final double KRAKK_CUTOFF_EDGE_START_NORMALIZED = 0.32D;
     private static final double KRAKK_CUTOFF_EDGE_CURVE_EXPONENT = 1.85D;
@@ -215,13 +300,31 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final int KRAKK_TARGET_SCAN_MIN_SOLIDS_FOR_PARALLEL = 131_072;
     private static final int KRAKK_TARGET_SCAN_SOLIDS_PER_TASK = 262_144;
     private static final int KRAKK_TARGET_SCAN_MAX_TASKS = 32;
+    private static final int KRAKK_UNIFIED_MULTIRES_MAX_VOLUME = 120_000_000;
     private static final int RESISTANCE_FIELD_MIN_VOXELS_FOR_PARALLEL = 262_144;
     private static final int RESISTANCE_FIELD_MIN_COLUMNS_FOR_PARALLEL = 32;
     private static final int RESISTANCE_FIELD_COLUMNS_PER_TASK = 16;
     private static final long RESISTANCE_FIELD_MIN_VOXELS_PER_TASK = 786_432L;
+    private static final long RESISTANCE_FIELD_MAX_PARALLEL_SNAPSHOT_VOXELS = 300_000_000L;
     private static final int RESISTANCE_FIELD_MAX_TASKS = 16;
-    private static final int KRAKK_SWEEP_MIN_ROWS_FOR_PARALLEL = 144;
-    private static final int KRAKK_SWEEP_ROWS_PER_TASK = 24;
+    private static final int KRAKK_OFFHEAP_SOLID_POSITIONS_CHUNK_SHIFT = 18;
+    private static final int KRAKK_OFFHEAP_SOLID_POSITIONS_CHUNK_SIZE = 1 << KRAKK_OFFHEAP_SOLID_POSITIONS_CHUNK_SHIFT;
+    private static final int KRAKK_OFFHEAP_SOLID_POSITIONS_CHUNK_MASK = KRAKK_OFFHEAP_SOLID_POSITIONS_CHUNK_SIZE - 1;
+    private static final int KRAKK_OFFHEAP_FLOAT_CHUNK_SHIFT = 20;
+    private static final int KRAKK_OFFHEAP_FLOAT_CHUNK_SIZE = 1 << KRAKK_OFFHEAP_FLOAT_CHUNK_SHIFT;
+    private static final int KRAKK_OFFHEAP_FLOAT_CHUNK_MASK = KRAKK_OFFHEAP_FLOAT_CHUNK_SIZE - 1;
+    private static final int KRAKK_OFFHEAP_FLOAT_OFFLOAD_THRESHOLD = 4_194_304;
+    private static final int KRAKK_SPARSE_SLOWNESS_OFFLOAD_THRESHOLD = 500_000_000;
+    private static final int KRAKK_PAGED_FLOAT_OFFLOAD_THRESHOLD = Integer.MAX_VALUE;
+    private static final int KRAKK_PAGED_FLOAT_PAGE_SHIFT = 16;
+    private static final int KRAKK_PAGED_FLOAT_PAGE_SIZE = 1 << KRAKK_PAGED_FLOAT_PAGE_SHIFT;
+    private static final int KRAKK_PAGED_FLOAT_PAGE_MASK = KRAKK_PAGED_FLOAT_PAGE_SIZE - 1;
+    private static final int KRAKK_PAGED_FLOAT_CACHE_PAGES = 256;
+    // Profiler (wevmKiLqWp): ForkJoinPool-5 workers spent 44% in awaitDone waiting for sweep
+    // sub-tasks. Raised MIN_ROWS from 144→256 and ROWS_PER_TASK from 24→64 to reduce task
+    // count ~2.7× and better amortize scheduling overhead against the 3 available workers.
+    private static final int KRAKK_SWEEP_MIN_ROWS_FOR_PARALLEL = 64;
+    private static final int KRAKK_SWEEP_ROWS_PER_TASK = 64;
     private static final int KRAKK_SWEEP_MAX_TASKS = 8;
     private static final int KRAKK_SOLVE_PARALLELISM = Math.max(
             1,
@@ -234,11 +337,60 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final ForkJoinPool KRAKK_SOLVE_POOL = KRAKK_SOLVE_PARALLELISM > 1
             ? new ForkJoinPool(KRAKK_SOLVE_PARALLELISM)
             : null;
+    private static final Cleaner PAGED_FLOAT_STORAGE_CLEANER = Cleaner.create();
     private static final int[] CHILD_TRAVERSAL_OFFSETS = new int[]{0, 1, 2, 4, 3, 5, 6, 7};
     private static final int[][] CHILD_ORDER_BY_RAY_OCTANT = buildChildOrderByRayOctant();
+    private static final Direction[] THERMAL_EXPAND_DIRECTIONS = new Direction[]{
+            new Direction(-1.0D, 0.0D, 0.0D),
+            new Direction(1.0D, 0.0D, 0.0D),
+            new Direction(0.0D, -1.0D, 0.0D),
+            new Direction(0.0D, 1.0D, 0.0D),
+            new Direction(0.0D, 0.0D, -1.0D),
+            new Direction(0.0D, 0.0D, 1.0D)
+    };
     private static volatile SpecialBlockHandler specialBlockHandler = SpecialBlockHandler.NOOP;
     private static volatile boolean parallelResistanceFieldSamplingEnabled = true;
     private static volatile double raySplitDistanceThreshold = DEFAULT_RAY_SPLIT_DISTANCE_THRESHOLD;
+    private static final double EXTRA_RADIUS_FRACTION       = 0.30;
+    // Outer spray must exceed stone's break threshold (durability≈3.5, need >52 for delta=15)
+    private static final double NOISE_SPRAY_MAX_IMPACT = 80.0;
+    private static final RuntimeExecutionPolicy DEFAULT_RUNTIME_EXECUTION_POLICY = new RuntimeExecutionPolicy(
+            false,
+            false,
+            Integer.MAX_VALUE,
+            KrakkArrivalSolver.SWEEP
+    );
+    private static final RuntimeExecutionPolicy UNIFIED_RUNTIME_EXECUTION_POLICY = new RuntimeExecutionPolicy(
+            true,
+            true,
+            KRAKK_UNIFIED_MULTIRES_MAX_VOLUME,
+            KrakkArrivalSolver.SWEEP
+    );
+    private static final RuntimeExecutionPolicy FAST_SWEEP_RUNTIME_EXECUTION_POLICY = new RuntimeExecutionPolicy(
+            true,
+            false,
+            KRAKK_UNIFIED_MULTIRES_MAX_VOLUME,
+            KrakkArrivalSolver.SWEEP
+    );
+    private static final RuntimeExecutionPolicy DELTA_STEPPING_RUNTIME_EXECUTION_POLICY = new RuntimeExecutionPolicy(
+            true,
+            false,
+            KRAKK_UNIFIED_MULTIRES_MAX_VOLUME,
+            KrakkArrivalSolver.DELTA_STEPPING
+    );
+    private static final RuntimeExecutionPolicy ORDERED_UPWIND_RUNTIME_EXECUTION_POLICY = new RuntimeExecutionPolicy(
+            true,
+            true,
+            KRAKK_UNIFIED_MULTIRES_MAX_VOLUME,
+            KrakkArrivalSolver.ORDERED_UPWIND
+    );
+    private static final ThreadLocal<RuntimeExecutionPolicy> ACTIVE_RUNTIME_EXECUTION_POLICY = ThreadLocal.withInitial(
+            () -> DEFAULT_RUNTIME_EXECUTION_POLICY
+    );
+    private static final ArrayDeque<NarrowBandWavefrontJob> KRAKK_NB_JOB_QUEUE = new ArrayDeque<>();
+    private static long nextNarrowBandWaveJobId = 1L;
+    private static final ArrayDeque<StreamingWavefrontJob> KRAKK_STREAMING_JOB_QUEUE = new ArrayDeque<>();
+    private static long nextStreamingWavefrontJobId = 1L;
 
     public KrakkExplosionRuntime() {
     }
@@ -252,6 +404,209 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
     public static void setSpecialBlockHandler(SpecialBlockHandler handler) {
         specialBlockHandler = handler == null ? SpecialBlockHandler.NOOP : handler;
+    }
+
+    public static boolean isKrakkPhaseTimingLoggingEnabled() {
+        return krakkPhaseTimingLoggingEnabled;
+    }
+
+    public static void setKrakkPhaseTimingLoggingEnabled(boolean enabled) {
+        krakkPhaseTimingLoggingEnabled = enabled;
+    }
+
+    public static void runWithUnifiedExecutionPolicy(Runnable runnable) {
+        runWithExecutionPolicy(UNIFIED_RUNTIME_EXECUTION_POLICY, runnable);
+    }
+
+    public static void runWithFastSweepingExecutionPolicy(Runnable runnable) {
+        runWithExecutionPolicy(FAST_SWEEP_RUNTIME_EXECUTION_POLICY, runnable);
+    }
+
+    public static void runWithDeltaSteppingExecutionPolicy(Runnable runnable) {
+        runWithExecutionPolicy(DELTA_STEPPING_RUNTIME_EXECUTION_POLICY, runnable);
+    }
+
+    public static void runWithOrderedUpwindExecutionPolicy(Runnable runnable) {
+        runWithExecutionPolicy(ORDERED_UPWIND_RUNTIME_EXECUTION_POLICY, runnable);
+    }
+
+    private static void runWithExecutionPolicy(RuntimeExecutionPolicy policy, Runnable runnable) {
+        if (runnable == null) {
+            return;
+        }
+        RuntimeExecutionPolicy previous = ACTIVE_RUNTIME_EXECUTION_POLICY.get();
+        ACTIVE_RUNTIME_EXECUTION_POLICY.set(policy == null ? DEFAULT_RUNTIME_EXECUTION_POLICY : policy);
+        try {
+            runnable.run();
+        } finally {
+            ACTIVE_RUNTIME_EXECUTION_POLICY.set(previous);
+        }
+    }
+
+    private static RuntimeExecutionPolicy activeRuntimeExecutionPolicy() {
+        RuntimeExecutionPolicy policy = ACTIVE_RUNTIME_EXECUTION_POLICY.get();
+        return policy == null ? DEFAULT_RUNTIME_EXECUTION_POLICY : policy;
+    }
+
+    public static void tickQueuedWavefrontJobs(MinecraftServer server) {
+        tickQueuedNarrowBandWavefrontJobs(server);
+    }
+
+    private static void tickQueuedNarrowBandWavefrontJobs(MinecraftServer server) {
+        if (server == null) {
+            return;
+        }
+        int processed = 0;
+        while (processed < KRAKK_NB_JOBS_PER_TICK) {
+            NarrowBandWavefrontJob job;
+            synchronized (KRAKK_NB_JOB_QUEUE) {
+                job = KRAKK_NB_JOB_QUEUE.peekFirst();
+            }
+            if (job == null) {
+                return;
+            }
+
+            ServerLevel level = server.getLevel(job.dimension());
+            if (level == null) {
+                synchronized (KRAKK_NB_JOB_QUEUE) {
+                    KRAKK_NB_JOB_QUEUE.pollFirst();
+                }
+                LOGGER.warn(
+                        "Dropping queued Krakk narrow-band wavefront job {} because dimension {} is unavailable.",
+                        job.jobId(),
+                        job.dimension().location()
+                );
+                continue;
+            }
+
+            long deadlineNanos = System.nanoTime() + KRAKK_NB_TICK_BUDGET_NANOS;
+            try {
+                KrakkDamageRuntime.runBatchedSync(
+                        level,
+                        () -> advanceNarrowBandWavefrontJob(job, level, deadlineNanos)
+                );
+            } catch (Throwable throwable) {
+                synchronized (KRAKK_NB_JOB_QUEUE) {
+                    KRAKK_NB_JOB_QUEUE.pollFirst();
+                }
+                LOGGER.error(
+                        "Queued Krakk narrow-band wavefront job {} failed (dimension={}, center=({}, {}, {}), radius={}, energy={}).",
+                        job.jobId(),
+                        job.dimension().location(),
+                        job.centerX(),
+                        job.centerY(),
+                        job.centerZ(),
+                        job.resolvedRadius(),
+                        job.totalEnergy(),
+                        throwable
+                );
+                if (throwable instanceof OutOfMemoryError) {
+                    System.gc();
+                }
+                continue;
+            }
+
+            if (job.phase() == NarrowBandWavefrontPhase.COMPLETE || job.phase() == NarrowBandWavefrontPhase.FAILED) {
+                synchronized (KRAKK_NB_JOB_QUEUE) {
+                    KRAKK_NB_JOB_QUEUE.pollFirst();
+                }
+                if (job.phase() == NarrowBandWavefrontPhase.COMPLETE) {
+                    LOGGER.info(
+                            "Queued Krakk narrow-band wavefront job {} completed (dimension={}, center=({}, {}, {}), radius={}, elapsedMs={}, reason={}).",
+                            job.jobId(),
+                            job.dimension().location(),
+                            job.centerX(),
+                            job.centerY(),
+                            job.centerZ(),
+                            job.resolvedRadius(),
+                            nanosToMillis(System.nanoTime() - job.queuedAtNanos()),
+                            job.failureMessage() == null ? "completed" : job.failureMessage()
+                    );
+                } else {
+                    LOGGER.warn(
+                            "Queued Krakk narrow-band wavefront job {} ended in failed state (dimension={}, center=({}, {}, {}), radius={}, message={}).",
+                            job.jobId(),
+                            job.dimension().location(),
+                            job.centerX(),
+                            job.centerY(),
+                            job.centerZ(),
+                            job.resolvedRadius(),
+                            job.failureMessage()
+                    );
+                }
+            }
+            maybeLogNarrowBandWavefrontProgress(job);
+            processed++;
+        }
+    }
+
+    private static void maybeLogNarrowBandWavefrontProgress(NarrowBandWavefrontJob job) {
+        if (job == null || !job.phaseLoggingEnabled()) {
+            return;
+        }
+        long now = System.nanoTime();
+        if ((now - job.lastProgressLogNanos()) < KRAKK_NB_PROGRESS_LOG_INTERVAL_NANOS) {
+            return;
+        }
+        job.lastProgressLogNanos(now);
+        LOGGER.info(
+                "Krakk phase trace #{} [nb-progress] jobId={} phase={} elapsedMs={} popped={} accepted={} queue={} sourceCount={} directApplied={} thermalApplied={} heap={}",
+                job.phaseTraceId(),
+                job.jobId(),
+                job.phase(),
+                nanosToMillis(now - job.queuedAtNanos()),
+                job.poppedNodes,
+                job.acceptedNodes,
+                job.trialQueue().size(),
+                job.sourceCount(),
+                job.directImpactApplications,
+                job.thermalImpactApplications,
+                formatKrakkHeapSnapshot()
+        );
+    }
+
+    private static void maybeLogStreamingWavefrontProgress(StreamingWavefrontJob job) {
+        if (job == null || !job.phaseLoggingEnabled()) {
+            return;
+        }
+        long now = System.nanoTime();
+        if ((now - job.lastProgressLogNanos()) < KRAKK_STREAMING_PROGRESS_LOG_INTERVAL_NANOS) {
+            return;
+        }
+        job.lastProgressLogNanos(now);
+        LOGGER.info(
+                "Krakk phase trace #{} [progress] jobId={} phase={} elapsedMs={} normal[popped={},accepted={},queue={}] shadow[popped={},accepted={},queue={}] targets[scanIndex={},count={}] impacts[directIndex={},directApplied={},thermalIndex={},thermalApplied={}] heap={}",
+                job.phaseTraceId(),
+                job.jobId(),
+                job.phase(),
+                nanosToMillis(now - job.queuedAtNanos()),
+                job.normalPoppedNodes,
+                job.normalAcceptedNodes,
+                job.normalQueue().size(),
+                job.shadowPoppedNodes,
+                job.shadowAcceptedNodes,
+                job.shadowQueue().size(),
+                job.targetScanIndex,
+                job.targetPositions().size(),
+                job.directImpactIndex,
+                job.directImpactApplications,
+                job.thermalIndex,
+                job.thermalImpactApplications,
+                formatKrakkHeapSnapshot()
+        );
+    }
+
+    private static <T> T callWithExecutionPolicy(RuntimeExecutionPolicy policy, Supplier<T> supplier) {
+        if (supplier == null) {
+            return null;
+        }
+        RuntimeExecutionPolicy previous = ACTIVE_RUNTIME_EXECUTION_POLICY.get();
+        ACTIVE_RUNTIME_EXECUTION_POLICY.set(policy == null ? DEFAULT_RUNTIME_EXECUTION_POLICY : policy);
+        try {
+            return supplier.get();
+        } finally {
+            ACTIVE_RUNTIME_EXECUTION_POLICY.set(previous);
+        }
     }
 
     public static String getProfilerTestName() {
@@ -370,6 +725,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 trace,
                 entityContext
         );
+        // (extra-radius pass is not applicable to the raycast path)
         long blockResolveStart = trace != null ? System.nanoTime() : 0L;
         BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
         Runnable resolvePass = () -> {
@@ -381,6 +737,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                         resolvedImpactPower,
                         source,
                         owner,
+                        KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS,
+                        false,
                         applyWorldChanges,
                         trace
                 );
@@ -453,9 +811,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     }
 
     private static void detonateKrakk(ServerLevel level, double x, double y, double z, Entity source, LivingEntity owner,
-                                        double blastRadius, double totalEnergy,
-                                        boolean applyWorldChanges, boolean emitEffects,
-                                        ExplosionProfileTrace trace) {
+                                      double blastRadius, double totalEnergy, double impactHeatCelsius, double blastTransmittance,
+                                      boolean applyWorldChanges, boolean emitEffects,
+                                      ExplosionProfileTrace trace) {
         if (totalEnergy <= VOLUMETRIC_MIN_ENERGY) {
             return;
         }
@@ -472,6 +830,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 z,
                 blastRadius,
                 totalEnergy,
+                impactHeatCelsius,
+                blastTransmittance,
                 source,
                 owner,
                 applyWorldChanges,
@@ -499,16 +859,50 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                               double centerZ,
                                               double blastRadius,
                                               double totalEnergy,
+                                              double impactHeatCelsius,
+                                              double blastTransmittance,
                                               Entity source,
                                               LivingEntity owner,
                                               boolean applyWorldChanges,
                                               ExplosionProfileTrace trace) {
+        boolean phaseLoggingEnabled = krakkPhaseTimingLoggingEnabled;
+        long phaseTraceId = phaseLoggingEnabled ? KRAKK_PHASE_TRACE_SEQUENCE.getAndIncrement() : -1L;
+        long phaseTotalStart = phaseLoggingEnabled ? System.nanoTime() : 0L;
+        RuntimeExecutionPolicy executionPolicy = activeRuntimeExecutionPolicy();
+        if (phaseLoggingEnabled) {
+            LOGGER.info(
+                    "Krakk phase trace #{} [start] center=({}, {}, {}) energy={} inputRadius={} heatC={} applyWorldChanges={} policy[solver={}, compactSourceTracking={}, forceDirectResistanceSampling={}, maxMultiresVolume={}] heap={}",
+                    phaseTraceId,
+                    centerX,
+                    centerY,
+                    centerZ,
+                    totalEnergy,
+                    blastRadius,
+                    impactHeatCelsius,
+                    applyWorldChanges,
+                    executionPolicy.arrivalSolver(),
+                    executionPolicy.compactSourceTracking(),
+                    executionPolicy.forceDirectResistanceSampling(),
+                    executionPolicy.maxMultiresVolume(),
+                    formatKrakkHeapSnapshot()
+            );
+        }
+
         BlockPos centerPos = BlockPos.containing(centerX, centerY, centerZ);
         if (!level.isInWorldBounds(centerPos)) {
+            if (phaseLoggingEnabled) {
+                LOGGER.info(
+                        "Krakk phase trace #{} [abort] out-of-world-bounds center={} heap={}",
+                        phaseTraceId,
+                        centerPos,
+                        formatKrakkHeapSnapshot()
+                );
+            }
             return;
         }
 
-        boolean energyLimitedRadius = blastRadius <= 1.0E-9D;
+        boolean explicitRadiusProvided = blastRadius > 1.0E-9D;
+        boolean energyLimitedRadius = executionPolicy.arrivalSolver() == KrakkArrivalSolver.DELTA_STEPPING || !explicitRadiusProvided;
         double resolvedRadius = energyLimitedRadius
                 ? resolveKrakkRadiusFromEnergyCutoff(totalEnergy)
                 : Math.max(1.0D, blastRadius);
@@ -519,10 +913,104 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int maxY = Mth.ceil(centerY + resolvedRadius);
         int minZ = Mth.floor(centerZ - resolvedRadius);
         int maxZ = Mth.ceil(centerZ + resolvedRadius);
+        int worldMinY = level.getMinBuildHeight();
+        int worldMaxY = level.getMaxBuildHeight() - 1;
+        minY = Math.max(minY, worldMinY);
+        maxY = Math.min(maxY, worldMaxY);
+        if (minY > maxY) {
+            if (phaseLoggingEnabled) {
+                LOGGER.info(
+                        "Krakk phase trace #{} [abort] y-bounds-empty worldMinY={} worldMaxY={} resolvedBoundsY=[{}, {}] heap={}",
+                        phaseTraceId,
+                        worldMinY,
+                        worldMaxY,
+                        minY,
+                        maxY,
+                        formatKrakkHeapSnapshot()
+                );
+            }
+            return;
+        }
+        long boundedVolume = Math.max(0L, (long) (maxX - minX + 1) * (long) (maxY - minY + 1) * (long) (maxZ - minZ + 1));
+        if (phaseLoggingEnabled) {
+            LOGGER.info(
+                    "Krakk phase trace #{} [bounds] resolvedRadius={} radiusSq={} bounds[x={}..{}, y={}..{}, z={}..{}] boundedVolume={} heap={}",
+                    phaseTraceId,
+                    resolvedRadius,
+                    radiusSq,
+                    minX,
+                    maxX,
+                    minY,
+                    maxY,
+                    minZ,
+                    maxZ,
+                    boundedVolume,
+                    formatKrakkHeapSnapshot()
+            );
+            if (executionPolicy.arrivalSolver() == KrakkArrivalSolver.DELTA_STEPPING && energyLimitedRadius) {
+                LOGGER.info(
+                        "Krakk phase trace #{} [bounds] delta-stepping energy-cutoff envelope active; explicitRadius={} ignored.",
+                        phaseTraceId,
+                        blastRadius
+                );
+            }
+        }
+
+        if (executionPolicy.arrivalSolver() == KrakkArrivalSolver.DELTA_STEPPING) {
+            if (applyWorldChanges && trace == null) {
+                enqueueNarrowBandWavefrontJob(
+                        level,
+                        centerX,
+                        centerY,
+                        centerZ,
+                        resolvedRadius,
+                        radiusSq,
+                        minX,
+                        maxX,
+                        minY,
+                        maxY,
+                        minZ,
+                        maxZ,
+                        totalEnergy,
+                        impactHeatCelsius,
+                        source,
+                        owner,
+                        true,
+                        null,
+                        phaseLoggingEnabled,
+                        phaseTraceId
+                );
+                return;
+            }
+            runNarrowBandWavefrontImmediate(
+                    level,
+                    centerX,
+                    centerY,
+                    centerZ,
+                    resolvedRadius,
+                    radiusSq,
+                    minX,
+                    maxX,
+                    minY,
+                    maxY,
+                    minZ,
+                    maxZ,
+                    totalEnergy,
+                    impactHeatCelsius,
+                    source,
+                    owner,
+                    applyWorldChanges,
+                    trace,
+                    phaseLoggingEnabled,
+                    phaseTraceId,
+                    phaseTotalStart
+            );
+            return;
+        }
 
         Int2DoubleOpenHashMap resistanceCostCache = new Int2DoubleOpenHashMap(256);
         resistanceCostCache.defaultReturnValue(Double.NaN);
-        long fieldStart = trace != null ? System.nanoTime() : 0L;
+        long fieldStart = (trace != null || phaseLoggingEnabled) ? System.nanoTime() : 0L;
         KrakkField krakkField = buildKrakkField(
                 level,
                 centerX,
@@ -537,18 +1025,45 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 radiusSq,
                 resistanceCostCache
         );
+        long fieldNanos = (trace != null || phaseLoggingEnabled) ? (System.nanoTime() - fieldStart) : 0L;
         if (trace != null) {
-            trace.volumetricResistanceFieldNanos += (System.nanoTime() - fieldStart);
+            trace.volumetricResistanceFieldNanos += fieldNanos;
             trace.volumetricSampledVoxels += krakkField.sampledVoxelCount();
             trace.volumetricSampledSolids += krakkField.solidPositions().size();
         }
+        if (phaseLoggingEnabled) {
+            logKrakkPhaseTiming(
+                    phaseTraceId,
+                    "field-build",
+                    fieldNanos,
+                    String.format(
+                            "sampledVoxels=%d sampledSolids=%d fieldDims=[%d,%d,%d]",
+                            krakkField.sampledVoxelCount(),
+                            krakkField.solidPositions().size(),
+                            krakkField.sizeX(),
+                            krakkField.sizeY(),
+                            krakkField.sizeZ()
+                    )
+            );
+        }
         if (krakkField.sampledVoxelCount() <= 0 || krakkField.solidPositions().isEmpty()) {
+            if (phaseLoggingEnabled) {
+                LOGGER.info(
+                        "Krakk phase trace #{} [abort] empty-field sampledVoxels={} sampledSolids={} totalMs={} heap={}",
+                        phaseTraceId,
+                        krakkField.sampledVoxelCount(),
+                        krakkField.solidPositions().size(),
+                        nanosToMillis(System.nanoTime() - phaseTotalStart),
+                        formatKrakkHeapSnapshot()
+                );
+            }
             return;
         }
 
         boolean profileSubstages = trace != null;
+        boolean requireSerializedFieldAccess = requiresSerializedFloatAccess(krakkField.slowness());
         Future<KrakkVolumetricBaselineResult> baselineFuture = null;
-        if (KRAKK_SOLVE_POOL != null) {
+        if (KRAKK_SOLVE_POOL != null && !requireSerializedFieldAccess) {
             baselineFuture = KRAKK_SOLVE_POOL.submit(
                     () -> buildKrakkVolumetricBaselineByPos(
                             centerX,
@@ -560,8 +1075,17 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     )
             );
         }
+        if (phaseLoggingEnabled) {
+            LOGGER.info(
+                    "Krakk phase trace #{} [baseline-schedule] mode={} serializedFieldAccess={} heap={}",
+                    phaseTraceId,
+                    baselineFuture == null ? "inline" : "async",
+                    requireSerializedFieldAccess,
+                    formatKrakkHeapSnapshot()
+            );
+        }
 
-        long solveStart = trace != null ? System.nanoTime() : 0L;
+        long solveStart = (trace != null || phaseLoggingEnabled) ? System.nanoTime() : 0L;
         PairedKrakkSolveResult pairedSolveResult = solvePairedKrakkArrivalTimes(
                 krakkField,
                 centerX,
@@ -573,14 +1097,34 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         );
         KrakkSolveResult solveResult = pairedSolveResult.normal();
         KrakkSolveResult shadowSolveResult = pairedSolveResult.shadow();
+        long solveNanos = (trace != null || phaseLoggingEnabled) ? (System.nanoTime() - solveStart) : 0L;
         if (trace != null) {
-            long solveNanos = System.nanoTime() - solveStart;
             trace.volumetricPressureSolveNanos += solveNanos;
             trace.krakkSolveNanos += solveNanos;
-            trace.krakkSourceCells += solveResult.sourceCells() + shadowSolveResult.sourceCells();
-            trace.krakkSweepCycles += solveResult.sweepCycles() + shadowSolveResult.sweepCycles();
+            trace.krakkSourceCells += solveResult.sourceCells();
+            trace.krakkSweepCycles += solveResult.sweepCycles();
+            if (shadowSolveResult != solveResult) {
+                trace.krakkSourceCells += shadowSolveResult.sourceCells();
+                trace.krakkSweepCycles += shadowSolveResult.sweepCycles();
+            }
+        }
+        if (phaseLoggingEnabled) {
+            logKrakkPhaseTiming(
+                    phaseTraceId,
+                    "krakk-solve",
+                    solveNanos,
+                    String.format(
+                            "normal[sourceCells=%d,sweepCycles=%d] shadow[sourceCells=%d,sweepCycles=%d]",
+                            solveResult.sourceCells(),
+                            solveResult.sweepCycles(),
+                            shadowSolveResult.sourceCells(),
+                            shadowSolveResult.sweepCycles()
+                    )
+            );
         }
 
+        long baselineResolveStart = phaseLoggingEnabled ? System.nanoTime() : 0L;
+        String baselineResolveMode = baselineFuture == null ? "inline" : "future";
         KrakkVolumetricBaselineResult baselineResult;
         if (baselineFuture != null) {
             try {
@@ -588,6 +1132,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
                 baselineFuture.cancel(true);
+                baselineResolveMode = "future_fallback_interrupted";
                 baselineResult = buildKrakkVolumetricBaselineByPos(
                         centerX,
                         centerY,
@@ -598,6 +1143,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 );
             } catch (ExecutionException exception) {
                 baselineFuture.cancel(true);
+                baselineResolveMode = "future_fallback_execution";
                 baselineResult = buildKrakkVolumetricBaselineByPos(
                         centerX,
                         centerY,
@@ -617,6 +1163,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     profileSubstages
             );
         }
+        long baselineResolveNanos = phaseLoggingEnabled ? (System.nanoTime() - baselineResolveStart) : 0L;
         if (trace != null) {
             trace.volumetricDirectionSetupNanos += baselineResult.directionSetupNanos();
             trace.volumetricPressureSolveNanos += baselineResult.pressureSolveNanos();
@@ -626,20 +1173,34 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             trace.volumetricDirectionSamples += baselineResult.directionSamples();
             trace.volumetricRadialSteps += baselineResult.radialSteps();
         }
+        if (phaseLoggingEnabled) {
+            logKrakkPhaseTiming(
+                    phaseTraceId,
+                    "baseline-resolve",
+                    baselineResolveNanos,
+                    String.format(
+                            "mode=%s directionSetupMs=%.3f pressureSolveMs=%.3f targetScanMs=%.3f targetPrecheckMs=%.3f targetBlendMs=%.3f directions=%d radialSteps=%d",
+                            baselineResolveMode,
+                            nanosToMillis(baselineResult.directionSetupNanos()),
+                            nanosToMillis(baselineResult.pressureSolveNanos()),
+                            nanosToMillis(baselineResult.targetScanNanos()),
+                            nanosToMillis(baselineResult.targetScanPrecheckNanos()),
+                            nanosToMillis(baselineResult.targetScanBlendNanos()),
+                            baselineResult.directionSamples(),
+                            baselineResult.radialSteps()
+                    )
+            );
+        }
 
-        float[] arrivalTimes = solveResult.arrivalTimes();
-        float[] shadowArrivalTimes = shadowSolveResult.arrivalTimes();
-        LongArrayList solidPositions = krakkField.solidPositions();
-        Long2FloatOpenHashMap volumetricBaselineByPos = baselineResult.baselineByPos();
-        float[] volumetricBaselineByIndex = buildKrakkBaselineByIndex(
-                solidPositions,
-                volumetricBaselineByPos
-        );
+        FloatIndexedAccess arrivalTimes = solveResult.arrivalTimes();
+        FloatIndexedAccess shadowArrivalTimes = shadowSolveResult.arrivalTimes();
+        LongIndexedAccess solidPositions = krakkField.solidPositions();
+        float[] baselineByIndex = baselineResult.baselineByIndex();
         double maxArrival = Math.max(1.0E-6D, resolvedRadius * KRAKK_MAX_ARRIVAL_MULTIPLIER);
-        long targetScanStart = trace != null ? System.nanoTime() : 0L;
+        long targetScanStart = (trace != null || phaseLoggingEnabled) ? System.nanoTime() : 0L;
         KrakkTargetScanResult targetScanResult = scanKrakkTargets(
                 solidPositions,
-                volumetricBaselineByIndex,
+                baselineByIndex,
                 arrivalTimes,
                 shadowArrivalTimes,
                 krakkField,
@@ -647,17 +1208,43 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 centerY,
                 centerZ,
                 maxArrival,
-                true,
+                blastTransmittance,
+                !requiresSerializedFloatAccess(arrivalTimes) && !requiresSerializedFloatAccess(shadowArrivalTimes),
                 profileSubstages
         );
+        long targetScanNanos = (trace != null || phaseLoggingEnabled) ? (System.nanoTime() - targetScanStart) : 0L;
         LongArrayList targetPositions = targetScanResult.targetPositions();
         FloatArrayList targetWeights = targetScanResult.targetWeights();
         double solidWeight = targetScanResult.solidWeight();
+        double maxWeight = Math.max(1.0E-12D, targetScanResult.maxWeight());
         if (trace != null) {
-            trace.volumetricTargetScanNanos += (System.nanoTime() - targetScanStart);
+            trace.volumetricTargetScanNanos += targetScanNanos;
             trace.volumetricTargetScanPrecheckNanos += targetScanResult.precheckNanos();
         }
+        if (phaseLoggingEnabled) {
+            logKrakkPhaseTiming(
+                    phaseTraceId,
+                    "target-scan",
+                    targetScanNanos,
+                    String.format(
+                            "targetCount=%d solidWeight=%s precheckMs=%.3f",
+                            targetPositions.size(),
+                            solidWeight,
+                            nanosToMillis(targetScanResult.precheckNanos())
+                    )
+            );
+        }
         if (targetPositions.isEmpty() || solidWeight <= VOLUMETRIC_MIN_ENERGY) {
+            if (phaseLoggingEnabled) {
+                LOGGER.info(
+                        "Krakk phase trace #{} [abort] no-targets targetCount={} solidWeight={} totalMs={} heap={}",
+                        phaseTraceId,
+                        targetPositions.size(),
+                        solidWeight,
+                        nanosToMillis(System.nanoTime() - phaseTotalStart),
+                        formatKrakkHeapSnapshot()
+                );
+            }
             return;
         }
         if (trace != null) {
@@ -671,14 +1258,24 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         double airNormalizationScale = computeVolumetricAirNormalizationScale(solidPositions.size(), krakkField.sampledVoxelCount());
         double normalizationWeight = solidWeight * airNormalizationScale;
         if (normalizationWeight <= VOLUMETRIC_MIN_ENERGY) {
+            if (phaseLoggingEnabled) {
+                LOGGER.info(
+                        "Krakk phase trace #{} [abort] normalization-weight-too-small normalizationWeight={} totalMs={} heap={}",
+                        phaseTraceId,
+                        normalizationWeight,
+                        nanosToMillis(System.nanoTime() - phaseTotalStart),
+                        formatKrakkHeapSnapshot()
+                );
+            }
             return;
         }
 
         Long2FloatOpenHashMap collapseWeightsByPos = new Long2FloatOpenHashMap(Math.max(16, targetPositions.size()));
         collapseWeightsByPos.defaultReturnValue(0.0F);
         BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
-        long impactApplyStart = trace != null ? System.nanoTime() : 0L;
-        long impactApplyDirectStart = trace != null ? System.nanoTime() : 0L;
+        long impactApplyStart = (trace != null || phaseLoggingEnabled) ? System.nanoTime() : 0L;
+        long impactApplyDirectStart = (trace != null || phaseLoggingEnabled) ? System.nanoTime() : 0L;
+        int directImpactApplications = 0;
         for (int i = 0; i < targetPositions.size(); i++) {
             long targetPosLong = targetPositions.getLong(i);
             double weight = targetWeights.getFloat(i);
@@ -689,7 +1286,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             if (weight > existingCollapseWeight) {
                 collapseWeightsByPos.put(targetPosLong, (float) weight);
             }
-            double impactPower = impactBudget * (weight / normalizationWeight);
+            double impactPower = resolvedRadius * VOLUMETRIC_IMPACT_POWER_PER_RADIUS * (weight / maxWeight);
             applySingleBlockImpact(
                     level,
                     mutablePos,
@@ -697,13 +1294,36 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     impactPower,
                     source,
                     owner,
+                    impactHeatCelsius,
+                    false,
                     applyWorldChanges,
                     trace
             );
+            directImpactApplications++;
         }
+        long impactApplyDirectNanos = (trace != null || phaseLoggingEnabled) ? (System.nanoTime() - impactApplyDirectStart) : 0L;
         if (trace != null) {
-            trace.volumetricImpactApplyDirectNanos += (System.nanoTime() - impactApplyDirectStart);
+            trace.volumetricImpactApplyDirectNanos += impactApplyDirectNanos;
         }
+        if (phaseLoggingEnabled) {
+            logKrakkPhaseTiming(
+                    phaseTraceId,
+                    "impact-apply-direct",
+                    impactApplyDirectNanos,
+                    String.format(
+                            "appliedBlocks=%d collapseSeedCount=%d impactBudget=%s normalizationWeight=%s",
+                            directImpactApplications,
+                            collapseWeightsByPos.size(),
+                            impactBudget,
+                            normalizationWeight
+                    )
+            );
+        }
+        applyExtraRadiusImpacts(
+                level, centerX, centerY, centerZ, resolvedRadius,
+                targetPositions, source, owner, impactHeatCelsius, blastTransmittance, applyWorldChanges, trace, mutablePos
+        );
+        long collapseApplyStart = phaseLoggingEnabled ? System.nanoTime() : 0L;
         applyStructuralCollapsePass(
                 level,
                 centerX,
@@ -725,9 +1345,2519 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 applyWorldChanges,
                 trace
         );
-        if (trace != null) {
-            trace.volumetricImpactApplyNanos += (System.nanoTime() - impactApplyStart);
+        long collapseApplyNanos = phaseLoggingEnabled ? (System.nanoTime() - collapseApplyStart) : 0L;
+        if (phaseLoggingEnabled) {
+            logKrakkPhaseTiming(
+                    phaseTraceId,
+                    "impact-collapse",
+                    collapseApplyNanos,
+                    String.format(
+                            "seedCount=%d",
+                            collapseWeightsByPos.size()
+                    )
+            );
         }
+        int thermalImpactApplications = 0;
+        long thermalApplyNanos = 0L;
+        if (hasThermalEffect(impactHeatCelsius)) {
+            long thermalApplyStart = phaseLoggingEnabled ? System.nanoTime() : 0L;
+            ThermalTargetShape thermalTargetShape = buildThermalTargetShape(targetPositions, targetWeights);
+            if (!thermalTargetShape.positions().isEmpty()) {
+                LongArrayList thermalPositions = thermalTargetShape.positions();
+                Long2FloatOpenHashMap thermalWeightsByPos = thermalTargetShape.weightsByPos();
+                long orderingSeed = mixOrderingSeed(centerX, centerY, centerZ, impactHeatCelsius, thermalPositions.size());
+                int permutationStart = computePermutationStart(orderingSeed, thermalPositions.size());
+                int permutationStep = computePermutationStep(orderingSeed, thermalPositions.size());
+                for (int i = 0; i < thermalPositions.size(); i++) {
+                    int index = Math.floorMod(permutationStart + (i * permutationStep), thermalPositions.size());
+                    long thermalPosLong = thermalPositions.getLong(index);
+                    float weight = thermalWeightsByPos.get(thermalPosLong);
+                    if (weight <= 0.0F) {
+                        continue;
+                    }
+                    double thermalHeat = computeHeatFalloff(impactHeatCelsius, weight, resolvedRadius);
+                    applySingleBlockImpact(
+                            level,
+                            mutablePos,
+                            thermalPosLong,
+                            0.0D,
+                            source,
+                            owner,
+                            thermalHeat,
+                            true,
+                            applyWorldChanges,
+                            trace
+                    );
+                    thermalImpactApplications++;
+                }
+            }
+            if (phaseLoggingEnabled) {
+                thermalApplyNanos = System.nanoTime() - thermalApplyStart;
+                logKrakkPhaseTiming(
+                        phaseTraceId,
+                        "impact-thermal",
+                        thermalApplyNanos,
+                        String.format(
+                                "thermalTargets=%d appliedBlocks=%d",
+                                thermalTargetShape.positions().size(),
+                                thermalImpactApplications
+                        )
+                );
+            }
+        }
+        long impactApplyNanos = (trace != null || phaseLoggingEnabled) ? (System.nanoTime() - impactApplyStart) : 0L;
+        if (trace != null) {
+            trace.volumetricImpactApplyNanos += impactApplyNanos;
+        }
+        if (phaseLoggingEnabled) {
+            logKrakkPhaseTiming(
+                    phaseTraceId,
+                    "impact-total",
+                    impactApplyNanos,
+                    String.format(
+                            "directApplied=%d thermalApplied=%d",
+                            directImpactApplications,
+                            thermalImpactApplications
+                    )
+            );
+            LOGGER.info(
+                    "Krakk phase trace #{} [complete] totalMs={} blocksEvaluated={} broken={} damaged={} predictedBroken={} predictedDamaged={} heap={}",
+                    phaseTraceId,
+                    nanosToMillis(System.nanoTime() - phaseTotalStart),
+                    trace == null ? -1 : trace.blocksEvaluated,
+                    trace == null ? -1 : trace.brokenBlocks,
+                    trace == null ? -1 : trace.damagedBlocks,
+                    trace == null ? -1 : trace.predictedBrokenBlocks,
+                    trace == null ? -1 : trace.predictedDamagedBlocks,
+                    formatKrakkHeapSnapshot()
+            );
+        }
+    }
+
+    private static void enqueueNarrowBandWavefrontJob(ServerLevel level,
+                                                      double centerX,
+                                                      double centerY,
+                                                      double centerZ,
+                                                      double resolvedRadius,
+                                                      double radiusSq,
+                                                      int minX,
+                                                      int maxX,
+                                                      int minY,
+                                                      int maxY,
+                                                      int minZ,
+                                                      int maxZ,
+                                                      double totalEnergy,
+                                                      double impactHeatCelsius,
+                                                      Entity source,
+                                                      LivingEntity owner,
+                                                      boolean applyWorldChanges,
+                                                      ExplosionProfileTrace trace,
+                                                      boolean phaseLoggingEnabled,
+                                                      long phaseTraceId) {
+        long jobId;
+        int queueDepth;
+        synchronized (KRAKK_NB_JOB_QUEUE) {
+            jobId = nextNarrowBandWaveJobId++;
+            KRAKK_NB_JOB_QUEUE.addLast(new NarrowBandWavefrontJob(
+                    jobId,
+                    level.dimension(),
+                    centerX,
+                    centerY,
+                    centerZ,
+                    resolvedRadius,
+                    radiusSq,
+                    minX,
+                    maxX,
+                    minY,
+                    maxY,
+                    minZ,
+                    maxZ,
+                    totalEnergy,
+                    impactHeatCelsius,
+                    source == null ? null : source.getUUID(),
+                    owner == null ? null : owner.getUUID(),
+                    applyWorldChanges,
+                    trace,
+                    phaseLoggingEnabled,
+                    phaseTraceId,
+                    System.nanoTime()
+            ));
+            queueDepth = KRAKK_NB_JOB_QUEUE.size();
+        }
+        if (phaseLoggingEnabled) {
+            LOGGER.info(
+                    "Krakk phase trace #{} [queued] narrow-band jobId={} dim={} center=({}, {}, {}) resolvedRadius={} queueDepth={} heap={}",
+                    phaseTraceId,
+                    jobId,
+                    level.dimension().location(),
+                    centerX,
+                    centerY,
+                    centerZ,
+                    resolvedRadius,
+                    queueDepth,
+                    formatKrakkHeapSnapshot()
+            );
+        }
+    }
+
+    private static void runNarrowBandWavefrontImmediate(ServerLevel level,
+                                                        double centerX,
+                                                        double centerY,
+                                                        double centerZ,
+                                                        double resolvedRadius,
+                                                        double radiusSq,
+                                                        int minX,
+                                                        int maxX,
+                                                        int minY,
+                                                        int maxY,
+                                                        int minZ,
+                                                        int maxZ,
+                                                        double totalEnergy,
+                                                        double impactHeatCelsius,
+                                                        Entity source,
+                                                        LivingEntity owner,
+                                                        boolean applyWorldChanges,
+                                                        ExplosionProfileTrace trace,
+                                                        boolean phaseLoggingEnabled,
+                                                        long phaseTraceId,
+                                                        long phaseTotalStart) {
+        NarrowBandWavefrontJob job = new NarrowBandWavefrontJob(
+                -1L,
+                level.dimension(),
+                centerX,
+                centerY,
+                centerZ,
+                resolvedRadius,
+                radiusSq,
+                minX,
+                maxX,
+                minY,
+                maxY,
+                minZ,
+                maxZ,
+                totalEnergy,
+                impactHeatCelsius,
+                source == null ? null : source.getUUID(),
+                owner == null ? null : owner.getUUID(),
+                applyWorldChanges,
+                trace,
+                phaseLoggingEnabled,
+                phaseTraceId,
+                System.nanoTime()
+        );
+
+        while (job.phase() != NarrowBandWavefrontPhase.COMPLETE
+                && job.phase() != NarrowBandWavefrontPhase.FAILED) {
+            advanceNarrowBandWavefrontJob(job, level, Long.MAX_VALUE);
+        }
+
+        if (phaseLoggingEnabled) {
+            LOGGER.info(
+                    "Krakk phase trace #{} [{}] narrow-band immediate totalMs={} blocksEvaluated={} broken={} damaged={} predictedBroken={} predictedDamaged={} heap={}",
+                    phaseTraceId,
+                    job.phase() == NarrowBandWavefrontPhase.COMPLETE ? "complete" : "abort",
+                    nanosToMillis(System.nanoTime() - phaseTotalStart),
+                    trace == null ? -1 : trace.blocksEvaluated,
+                    trace == null ? -1 : trace.brokenBlocks,
+                    trace == null ? -1 : trace.damagedBlocks,
+                    trace == null ? -1 : trace.predictedBrokenBlocks,
+                    trace == null ? -1 : trace.predictedDamagedBlocks,
+                    formatKrakkHeapSnapshot()
+            );
+        }
+    }
+
+    private static void advanceNarrowBandWavefrontJob(NarrowBandWavefrontJob job, ServerLevel level, long deadlineNanos) {
+        while (job.phase() != NarrowBandWavefrontPhase.COMPLETE
+                && job.phase() != NarrowBandWavefrontPhase.FAILED
+                && System.nanoTime() < deadlineNanos) {
+            if (job.phase() == NarrowBandWavefrontPhase.SEED) {
+                seedNarrowBandWavefrontJob(job, level);
+                continue;
+            }
+
+            if (job.phase() == NarrowBandWavefrontPhase.PROPAGATE) {
+                WavefrontSolveStats stats = stepNarrowBandWavefront(level, job, deadlineNanos);
+                job.poppedNodes += stats.poppedNodes();
+                job.acceptedNodes += stats.acceptedNodes();
+                if (job.trialQueue().isEmpty()) {
+                    long now = System.nanoTime();
+                    long solveNanos = now - job.solveStartNanos();
+                    if (job.trace() != null) {
+                        job.trace().volumetricPressureSolveNanos += solveNanos;
+                        job.trace().krakkSolveNanos += solveNanos;
+                        job.trace().krakkSourceCells += job.sourceCount();
+                        job.trace().krakkSweepCycles += job.poppedNodes;
+                        job.trace().rawImpactedBlocks += job.directImpactApplications;
+                        job.trace().postAaImpactedBlocks += job.directImpactApplications;
+                        job.trace().volumetricTargetBlocks += job.directImpactApplications;
+                        job.trace().volumetricImpactApplyDirectNanos += (now - job.impactApplyStartNanos());
+                    }
+                    if (job.phaseLoggingEnabled()) {
+                        logKrakkPhaseTiming(
+                                job.phaseTraceId(),
+                                "nb-wavefront-solve",
+                                solveNanos,
+                                String.format(
+                                        "jobId=%d source=%d accepted=%d popped=%d directApplied=%d thermalApplied=%d weight=%s",
+                                        job.jobId(),
+                                        job.sourceCount(),
+                                        job.acceptedNodes,
+                                        job.poppedNodes,
+                                        job.directImpactApplications,
+                                        job.thermalImpactApplications,
+                                        job.directWeight
+                                )
+                        );
+                    }
+                    finishNarrowBandWavefrontJob(job, null);
+                }
+            }
+        }
+    }
+
+    private static void seedNarrowBandWavefrontJob(NarrowBandWavefrontJob job, ServerLevel level) {
+        int baseX = Mth.floor(job.centerX());
+        int baseY = Mth.floor(job.centerY());
+        int baseZ = Mth.floor(job.centerZ());
+        int seedMinX = Math.max(job.minX(), baseX - 1);
+        int seedMaxX = Math.min(job.maxX(), baseX + 1);
+        int seedMinY = Math.max(job.minY(), baseY - 1);
+        int seedMaxY = Math.min(job.maxY(), baseY + 1);
+        int seedMinZ = Math.max(job.minZ(), baseZ - 1);
+        int seedMaxZ = Math.min(job.maxZ(), baseZ + 1);
+
+        int sourceCount = 0;
+        for (int x = seedMinX; x <= seedMaxX; x++) {
+            for (int y = seedMinY; y <= seedMaxY; y++) {
+                for (int z = seedMinZ; z <= seedMaxZ; z++) {
+                    double dx = (x + 0.5D) - job.centerX();
+                    double dy = (y + 0.5D) - job.centerY();
+                    double dz = (z + 0.5D) - job.centerZ();
+                    double distSq = (dx * dx) + (dy * dy) + (dz * dz);
+                    if (distSq > job.radiusSq()) {
+                        continue;
+                    }
+                    long posLong = BlockPos.asLong(x, y, z);
+                    float slowness = resolveStreamingNormalSlowness(
+                            level,
+                            x,
+                            y,
+                            z,
+                            posLong,
+                            job.mutablePos(),
+                            job.chunkStateCache(),
+                            job.resistanceCostCache(),
+                            job.slownessByPos(),
+                            null
+                    );
+                    if (slowness <= 0.0F) {
+                        continue;
+                    }
+                    double arrival = Math.sqrt(distSq) * slowness;
+                    if (enqueueStreamingSource(posLong, arrival, job.arrivalByPos(), job.trialQueue())) {
+                        sourceCount++;
+                    }
+                }
+            }
+        }
+
+        int seedX = Mth.clamp(baseX, job.minX(), job.maxX());
+        int seedY = Mth.clamp(baseY, job.minY(), job.maxY());
+        int seedZ = Mth.clamp(baseZ, job.minZ(), job.maxZ());
+        long seedPosLong = BlockPos.asLong(seedX, seedY, seedZ);
+        float seedSlowness = resolveStreamingNormalSlowness(
+                level,
+                seedX,
+                seedY,
+                seedZ,
+                seedPosLong,
+                job.mutablePos(),
+                job.chunkStateCache(),
+                job.resistanceCostCache(),
+                job.slownessByPos(),
+                null
+        );
+        if (seedSlowness > 0.0F && enqueueStreamingSource(seedPosLong, 0.0D, job.arrivalByPos(), job.trialQueue())) {
+            sourceCount++;
+        }
+
+        job.sourceCount(sourceCount);
+        if (sourceCount <= 0) {
+            finishNarrowBandWavefrontJob(job, "nb-wavefront-no-sources");
+            return;
+        }
+
+        // Narrow-band propagation is already geometrically clipped by radiusSq in neighbor expansion.
+        // Keep arrival uncapped to avoid solver-shape artifacts from material-dependent slowness.
+        job.maxArrival(Double.POSITIVE_INFINITY);
+        double powerScale = computeVolumetricRadiusScale(job.resolvedRadius(), VOLUMETRIC_MAX_POWER_RADIUS_SCALE);
+        job.impactBudget = job.totalEnergy() * VOLUMETRIC_IMPACT_POWER_PER_ENERGY * powerScale;
+        long now = System.nanoTime();
+        job.solveStartNanos(now);
+        job.impactApplyStartNanos(now);
+        job.setPhase(NarrowBandWavefrontPhase.PROPAGATE);
+    }
+
+    private static WavefrontSolveStats stepNarrowBandWavefront(ServerLevel level,
+                                                               NarrowBandWavefrontJob job,
+                                                               long deadlineNanos) {
+        int poppedNodes = 0;
+        int acceptedNodes = 0;
+        Entity source = job.resolveSource(level);
+        LivingEntity owner = job.resolveOwner(level);
+        boolean thermalEnabled = hasThermalEffect(job.impactHeatCelsius());
+
+        while (!job.trialQueue().isEmpty() && poppedNodes < KRAKK_NB_POP_BUDGET) {
+            if ((poppedNodes & 127) == 0 && System.nanoTime() >= deadlineNanos) {
+                break;
+            }
+            long posLong = job.trialQueue().pollKey();
+            double queuedArrival = job.trialQueue().pollPriority();
+            poppedNodes++;
+
+            double currentArrival = job.arrivalByPos().get(posLong);
+            if (!Double.isFinite(currentArrival) || queuedArrival > currentArrival + 1.0E-9D) {
+                continue;
+            }
+            if (currentArrival > job.maxArrival()) {
+                continue;
+            }
+            if (!job.finalized().add(posLong)) {
+                continue;
+            }
+            acceptedNodes++;
+
+            int x = BlockPos.getX(posLong);
+            int y = BlockPos.getY(posLong);
+            int z = BlockPos.getZ(posLong);
+            float currentSlowness = resolveStreamingNormalSlowness(
+                    level,
+                    x,
+                    y,
+                    z,
+                    posLong,
+                    job.mutablePos(),
+                    job.chunkStateCache(),
+                    job.resistanceCostCache(),
+                    job.slownessByPos(),
+                    null
+            );
+            if (currentSlowness <= 0.0F) {
+                continue;
+            }
+
+            if (currentSlowness > (float) (KRAKK_AIR_SLOWNESS + 1.0E-6D)) {
+                StreamingImpactSample impactSample = resolveNarrowBandImpactSample(
+                        job,
+                        currentArrival,
+                        currentSlowness,
+                        x,
+                        y,
+                        z
+                );
+                if (impactSample.impactPower() > MIN_RESOLVED_RAY_IMPACT) {
+                    applySingleBlockImpact(
+                            level,
+                            job.mutablePos(),
+                            posLong,
+                            impactSample.impactPower(),
+                            source,
+                            owner,
+                            job.impactHeatCelsius(),
+                            false,
+                            job.applyWorldChanges(),
+                            job.trace()
+                    );
+                    job.directImpactApplications++;
+                    job.directWeight += impactSample.weight();
+
+                    if (thermalEnabled) {
+                        double thermalHeat = computeHeatFalloff(
+                                job.impactHeatCelsius(),
+                                impactSample.weight(),
+                                job.resolvedRadius()
+                        );
+                        for (int axis = 0; axis < 6; axis++) {
+                            int tx = x;
+                            int ty = y;
+                            int tz = z;
+                            if (axis == 0) {
+                                tx--;
+                            } else if (axis == 1) {
+                                tx++;
+                            } else if (axis == 2) {
+                                ty--;
+                            } else if (axis == 3) {
+                                ty++;
+                            } else if (axis == 4) {
+                                tz--;
+                            } else {
+                                tz++;
+                            }
+                            applySingleBlockImpact(
+                                    level,
+                                    job.mutablePos(),
+                                    BlockPos.asLong(tx, ty, tz),
+                                    0.0D,
+                                    source,
+                                    owner,
+                                    thermalHeat,
+                                    true,
+                                    job.applyWorldChanges(),
+                                    job.trace()
+                            );
+                            job.thermalImpactApplications++;
+                        }
+                    }
+                }
+            }
+
+            for (int neighborIndex = 0; neighborIndex < KRAKK_STREAMING_WAVE_NEIGHBOR_OFFSETS.length; neighborIndex++) {
+                int[] offset = KRAKK_STREAMING_WAVE_NEIGHBOR_OFFSETS[neighborIndex];
+                int nx = x + offset[0];
+                int ny = y + offset[1];
+                int nz = z + offset[2];
+                if (nx < job.minX() || nx > job.maxX()
+                        || ny < job.minY() || ny > job.maxY()
+                        || nz < job.minZ() || nz > job.maxZ()) {
+                    continue;
+                }
+                double dx = (nx + 0.5D) - job.centerX();
+                double dy = (ny + 0.5D) - job.centerY();
+                double dz = (nz + 0.5D) - job.centerZ();
+                if (((dx * dx) + (dy * dy) + (dz * dz)) > job.radiusSq()) {
+                    continue;
+                }
+                long neighborPosLong = BlockPos.asLong(nx, ny, nz);
+                if (job.finalized().contains(neighborPosLong)) {
+                    continue;
+                }
+                double candidate = solveKrakkStreamingCellFromAccepted(
+                        level,
+                        nx,
+                        ny,
+                        nz,
+                        job.minX(),
+                        job.maxX(),
+                        job.minY(),
+                        job.maxY(),
+                        job.minZ(),
+                        job.maxZ(),
+                        false,
+                        job.arrivalByPos(),
+                        job.finalized(),
+                        job.slownessByPos(),
+                        null,
+                        job.mutablePos(),
+                        job.chunkStateCache(),
+                        job.resistanceCostCache()
+                );
+                if (!Double.isFinite(candidate) || candidate > job.maxArrival()) {
+                    continue;
+                }
+                if (candidate + 1.0E-9D < job.arrivalByPos().get(neighborPosLong)) {
+                    job.arrivalByPos().put(neighborPosLong, (float) candidate);
+                    job.trialQueue().add(neighborPosLong, candidate);
+                }
+            }
+        }
+
+        return new WavefrontSolveStats(acceptedNodes, poppedNodes);
+    }
+
+    private static StreamingImpactSample resolveNarrowBandImpactSample(NarrowBandWavefrontJob job,
+                                                                       double arrival,
+                                                                       float localSlowness,
+                                                                       int x,
+                                                                       int y,
+                                                                       int z) {
+        double airArrival = computeAnalyticKrakkAirArrival(job.centerX(), job.centerY(), job.centerZ(), x, y, z);
+        if (!Double.isFinite(airArrival) || airArrival > job.resolvedRadius()) {
+            return StreamingImpactSample.NONE;
+        }
+        double normalized = 1.0D - (airArrival / Math.max(1.0E-6D, job.resolvedRadius()));
+        if (normalized <= 0.0D) {
+            return StreamingImpactSample.NONE;
+        }
+
+        double expectedArrival = airArrival * Math.max(KRAKK_AIR_SLOWNESS, localSlowness);
+        double resistanceOverrun = Math.max(0.0D, arrival - expectedArrival);
+        double normalizedOverrun = resistanceOverrun / Math.max(1.0D, expectedArrival);
+        if (normalizedOverrun >= KRAKK_NB_MAX_NORMALIZED_OVERRUN) {
+            return StreamingImpactSample.NONE;
+        }
+        double transmittance = Math.exp(
+                -(resistanceOverrun * KRAKK_NB_OVERRUN_ATTENUATION)
+                        - (normalizedOverrun * KRAKK_NB_NORMALIZED_OVERRUN_ATTENUATION)
+        );
+        transmittance = Mth.clamp(transmittance, KRAKK_NB_MIN_TRANSMITTANCE, 1.0D);
+
+        double cutoffRetention = computeKrakkCutoffEdgeRetention(normalized);
+        double weight = Math.pow(Mth.clamp(normalized, 0.0D, 1.0D), KRAKK_WEIGHT_EXPONENT)
+                * transmittance
+                * cutoffRetention;
+        if (weight <= 1.0E-8D) {
+            return StreamingImpactSample.NONE;
+        }
+
+        double shellRadius = Math.max(1.0D, airArrival);
+        double shellArea = Math.max(
+                KRAKK_NB_MIN_SHELL_AREA,
+                4.0D * Math.PI * shellRadius * shellRadius
+        );
+        double impactPower = (job.impactBudget * weight) / (shellArea * KRAKK_NB_SHELL_IMPACT_NORMALIZATION);
+        if (!Double.isFinite(impactPower) || impactPower <= MIN_RESOLVED_RAY_IMPACT) {
+            return StreamingImpactSample.NONE;
+        }
+        return new StreamingImpactSample(impactPower, weight);
+    }
+
+    private static void finishNarrowBandWavefrontJob(NarrowBandWavefrontJob job, String abortReason) {
+        long impactApplyNanos = job.impactApplyStartNanos() > 0L
+                ? (System.nanoTime() - job.impactApplyStartNanos())
+                : 0L;
+        if (job.trace() != null) {
+            job.trace().volumetricImpactApplyNanos += impactApplyNanos;
+        }
+        if (job.phaseLoggingEnabled() && job.impactApplyStartNanos() > 0L) {
+            logKrakkPhaseTiming(
+                    job.phaseTraceId(),
+                    "nb-impact-total",
+                    impactApplyNanos,
+                    String.format(
+                            "jobId=%d directApplied=%d thermalApplied=%d",
+                            job.jobId(),
+                            job.directImpactApplications,
+                            job.thermalImpactApplications
+                    )
+            );
+        }
+        if (job.phaseLoggingEnabled()) {
+            String phase = abortReason == null ? "complete" : "abort";
+            LOGGER.info(
+                    "Krakk phase trace #{} [{}] narrow-band jobId={} reason={} totalMs={} blocksEvaluated={} broken={} damaged={} predictedBroken={} predictedDamaged={} heap={}",
+                    job.phaseTraceId(),
+                    phase,
+                    job.jobId(),
+                    abortReason == null ? "n/a" : abortReason,
+                    nanosToMillis(System.nanoTime() - job.queuedAtNanos()),
+                    job.trace() == null ? -1 : job.trace().blocksEvaluated,
+                    job.trace() == null ? -1 : job.trace().brokenBlocks,
+                    job.trace() == null ? -1 : job.trace().damagedBlocks,
+                    job.trace() == null ? -1 : job.trace().predictedBrokenBlocks,
+                    job.trace() == null ? -1 : job.trace().predictedDamagedBlocks,
+                    formatKrakkHeapSnapshot()
+            );
+        }
+        job.failureMessage(abortReason);
+        job.setPhase(abortReason == null ? NarrowBandWavefrontPhase.COMPLETE : NarrowBandWavefrontPhase.FAILED);
+    }
+
+    private static void enqueueStreamingWavefrontJob(ServerLevel level,
+                                                     double centerX,
+                                                     double centerY,
+                                                     double centerZ,
+                                                     double resolvedRadius,
+                                                     double radiusSq,
+                                                     int minX,
+                                                     int maxX,
+                                                     int minY,
+                                                     int maxY,
+                                                     int minZ,
+                                                     int maxZ,
+                                                     double totalEnergy,
+                                                     double impactHeatCelsius,
+                                                     Entity source,
+                                                     LivingEntity owner,
+                                                     boolean phaseLoggingEnabled,
+                                                     long phaseTraceId) {
+        long jobId;
+        int queueDepth;
+        synchronized (KRAKK_STREAMING_JOB_QUEUE) {
+            jobId = nextStreamingWavefrontJobId++;
+            KRAKK_STREAMING_JOB_QUEUE.addLast(new StreamingWavefrontJob(
+                    jobId,
+                    level.dimension(),
+                    centerX,
+                    centerY,
+                    centerZ,
+                    resolvedRadius,
+                    radiusSq,
+                    minX,
+                    maxX,
+                    minY,
+                    maxY,
+                    minZ,
+                    maxZ,
+                    totalEnergy,
+                    impactHeatCelsius,
+                    source == null ? null : source.getUUID(),
+                    owner == null ? null : owner.getUUID(),
+                    phaseLoggingEnabled,
+                    phaseTraceId,
+                    System.nanoTime()
+            ));
+            queueDepth = KRAKK_STREAMING_JOB_QUEUE.size();
+        }
+        if (phaseLoggingEnabled) {
+            LOGGER.info(
+                    "Krakk phase trace #{} [queued] streaming-wavefront jobId={} dim={} center=({}, {}, {}) resolvedRadius={} queueDepth={} heap={}",
+                    phaseTraceId,
+                    jobId,
+                    level.dimension().location(),
+                    centerX,
+                    centerY,
+                    centerZ,
+                    resolvedRadius,
+                    queueDepth,
+                    formatKrakkHeapSnapshot()
+            );
+        }
+    }
+
+    private static void advanceStreamingWavefrontJob(StreamingWavefrontJob job, ServerLevel level, long deadlineNanos) {
+        while (job.phase() != StreamingWavefrontPhase.COMPLETE
+                && job.phase() != StreamingWavefrontPhase.FAILED
+                && System.nanoTime() < deadlineNanos) {
+            if (job.phase() == StreamingWavefrontPhase.SEED) {
+                seedStreamingWavefrontJob(job, level);
+                continue;
+            }
+
+            if (job.phase() == StreamingWavefrontPhase.SOLVE_NORMAL) {
+                WavefrontSolveStats stats = stepKrakkStreamingWavefrontShell(level, job, deadlineNanos);
+                job.normalPoppedNodes += stats.poppedNodes();
+                job.normalAcceptedNodes += stats.acceptedNodes();
+                if (job.normalQueue().isEmpty()) {
+                    long now = System.nanoTime();
+                    long solveNanos = now - job.solveStartNanos();
+                    if (job.trace() != null) {
+                        job.trace().volumetricPressureSolveNanos += solveNanos;
+                        job.trace().krakkSolveNanos += solveNanos;
+                        job.trace().krakkSourceCells += job.normalSourceCount();
+                        job.trace().krakkSweepCycles += job.normalPoppedNodes;
+                        job.trace().rawImpactedBlocks += job.directImpactApplications;
+                        job.trace().postAaImpactedBlocks += job.directImpactApplications;
+                        job.trace().volumetricTargetBlocks += job.directImpactApplications;
+                        job.trace().volumetricImpactApplyDirectNanos += (now - job.impactDirectStartNanos());
+                    }
+                    if (job.phaseLoggingEnabled()) {
+                        logKrakkPhaseTiming(
+                                job.phaseTraceId(),
+                                "stream-wavefront-solve",
+                                solveNanos,
+                                String.format(
+                                        "jobId=%d normal[source=%d,accepted=%d,popped=%d] directApplied=%d thermalApplied=%d solidWeight=%s",
+                                        job.jobId(),
+                                        job.normalSourceCount(),
+                                        job.normalAcceptedNodes,
+                                        job.normalPoppedNodes,
+                                        job.directImpactApplications,
+                                        job.thermalImpactApplications,
+                                        job.solidWeight
+                                )
+                        );
+                    }
+                    finishStreamingWavefrontJob(job, null);
+                }
+                continue;
+            }
+
+            if (job.phase() == StreamingWavefrontPhase.SOLVE_SHADOW) {
+                WavefrontSolveStats stats = stepKrakkStreamingWavefront(
+                        level,
+                        job.centerX(),
+                        job.centerY(),
+                        job.centerZ(),
+                        job.radiusSq(),
+                        job.minX(),
+                        job.maxX(),
+                        job.minY(),
+                        job.maxY(),
+                        job.minZ(),
+                        job.maxZ(),
+                        job.maxArrival(),
+                        true,
+                        job.shadowArrivalByPos(),
+                        job.shadowAccepted(),
+                        job.shadowQueue(),
+                        job.normalSlownessByPos(),
+                        job.sampledSolidPositions(),
+                        job.mutablePos(),
+                        job.chunkStateCache(),
+                        job.resistanceCostCache(),
+                        KRAKK_STREAMING_SOLVE_POP_BUDGET,
+                        deadlineNanos
+                );
+                job.shadowPoppedNodes += stats.poppedNodes();
+                job.shadowAcceptedNodes += stats.acceptedNodes();
+                if (job.shadowQueue().isEmpty()) {
+                    long solveNanos = System.nanoTime() - job.solveStartNanos();
+                    if (job.trace() != null) {
+                        job.trace().volumetricPressureSolveNanos += solveNanos;
+                        job.trace().krakkSolveNanos += solveNanos;
+                        job.trace().krakkSourceCells += job.normalSourceCount() + job.shadowSourceCount();
+                        job.trace().krakkSweepCycles += job.normalPoppedNodes + job.shadowPoppedNodes;
+                    }
+                    if (job.phaseLoggingEnabled()) {
+                        logKrakkPhaseTiming(
+                                job.phaseTraceId(),
+                                "stream-wavefront-solve",
+                                solveNanos,
+                                String.format(
+                                        "jobId=%d normal[source=%d,accepted=%d,popped=%d] shadow[source=%d,accepted=%d,popped=%d] sampledSolids=%d",
+                                        job.jobId(),
+                                        job.normalSourceCount(),
+                                        job.normalAcceptedNodes,
+                                        job.normalPoppedNodes,
+                                        job.shadowSourceCount(),
+                                        job.shadowAcceptedNodes,
+                                        job.shadowPoppedNodes,
+                                        job.sampledSolidPositions().size()
+                                )
+                        );
+                    }
+                    LongArrayList sampledSolidList = new LongArrayList(Math.max(16, job.sampledSolidPositions().size()));
+                    for (LongIterator iterator = job.sampledSolidPositions().iterator(); iterator.hasNext(); ) {
+                        sampledSolidList.add(iterator.nextLong());
+                    }
+                    job.sampledSolidList(sampledSolidList);
+                    job.targetScanStartNanos(System.nanoTime());
+                    job.setPhase(StreamingWavefrontPhase.TARGET_SCAN);
+                }
+                continue;
+            }
+
+            if (job.phase() == StreamingWavefrontPhase.TARGET_SCAN) {
+                LongArrayList sampledSolids = job.sampledSolidList();
+                int limit = KRAKK_STREAMING_TARGET_SCAN_BUDGET;
+                while (job.targetScanIndex < sampledSolids.size() && limit-- > 0) {
+                    if ((limit & 127) == 0 && System.nanoTime() >= deadlineNanos) {
+                        break;
+                    }
+                    long posLong = sampledSolids.getLong(job.targetScanIndex++);
+                    double arrival = job.normalArrivalByPos().get(posLong);
+                    if (!Double.isFinite(arrival) || arrival > job.maxArrival()) {
+                        continue;
+                    }
+                    double shadowArrival = job.shadowArrivalByPos().get(posLong);
+                    if (!Double.isFinite(shadowArrival)) {
+                        shadowArrival = arrival;
+                    }
+                    int x = BlockPos.getX(posLong);
+                    int y = BlockPos.getY(posLong);
+                    int z = BlockPos.getZ(posLong);
+                    double airArrival = computeAnalyticKrakkAirArrival(job.centerX(), job.centerY(), job.centerZ(), x, y, z);
+                    if (!Double.isFinite(airArrival)) {
+                        continue;
+                    }
+                    if (airArrival > job.resolvedRadius()) {
+                        continue;
+                    }
+                    double normalized = 1.0D - (airArrival / Math.max(1.0E-6D, job.resolvedRadius()));
+                    if (normalized <= 0.0D) {
+                        continue;
+                    }
+                    double metricAirArrival = computeStreamingMetricKrakkAirArrival(
+                            job.centerX(),
+                            job.centerY(),
+                            job.centerZ(),
+                            x,
+                            y,
+                            z
+                    );
+                    if (!Double.isFinite(metricAirArrival)) {
+                        continue;
+                    }
+                    double resistanceOverrun = Math.max(0.0D, arrival - metricAirArrival);
+                    double effectiveOverrun = Math.max(0.0D, resistanceOverrun - KRAKK_OVERRUN_DEADZONE);
+                    double normalizedOverrun = effectiveOverrun / Math.max(1.0D, metricAirArrival);
+                    if (normalizedOverrun >= KRAKK_HARD_BLOCK_NORMALIZED_OVERRUN) {
+                        continue;
+                    }
+                    double transmittance = Math.exp(
+                            -(effectiveOverrun * KRAKK_RESISTANCE_ATTENUATION_PER_OVERRUN)
+                                    - (normalizedOverrun * KRAKK_RESISTANCE_NORMALIZED_ATTENUATION)
+                    );
+                    if (transmittance <= KRAKK_MIN_TRANSMITTANCE) {
+                        continue;
+                    }
+                    double shadowOverrun = Math.max(0.0D, shadowArrival - arrival);
+                    double effectiveShadowOverrun = Math.max(0.0D, shadowOverrun - KRAKK_SHADOW_OVERRUN_DEADZONE);
+                    double normalizedShadowOverrun = effectiveShadowOverrun / Math.max(0.25D, metricAirArrival);
+                    if (normalizedShadowOverrun >= KRAKK_HARD_BLOCK_SHADOW_NORMALIZED_OVERRUN) {
+                        continue;
+                    }
+                    double shadowTransmittance = Math.exp(
+                            -(effectiveShadowOverrun * KRAKK_SHADOW_ATTENUATION_PER_OVERRUN)
+                                    - (normalizedShadowOverrun * KRAKK_SHADOW_NORMALIZED_ATTENUATION)
+                    );
+                    if (shadowTransmittance <= KRAKK_MIN_TRANSMITTANCE) {
+                        continue;
+                    }
+                    double baselineWeight = Mth.clamp(transmittance * shadowTransmittance, 0.0D, 1.0D);
+                    double eikNormalized = normalized;
+                    if (normalized < 0.5D) {
+                        double outerT = 1.0D - normalized * 2.0D;
+                        long h = ((long) x * 0x9E3779B97F4A7C15L)
+                               ^ ((long) y * 0x6C62272E07BB0142L)
+                               ^ ((long) z * 0xCB9C59B3F9F87D4DL)
+                               ^ ((long) Mth.floor(job.centerX()) * 0xBF58476D1CE4E5B9L)
+                               ^ ((long) Mth.floor(job.centerZ()) * 0x94D049BB133111EBL);
+                        h ^= (h >>> 33);
+                        h *= 0xFF51AFD7ED558CCDL;
+                        h ^= (h >>> 33);
+                        double blockNoise = (h >>> 11 & 0x1FFFFFL) / 2097151.0D;
+                        eikNormalized = Mth.clamp(normalized + outerT * (blockNoise * 2.0D - 1.0D), 0.0D, 1.0D);
+                    }
+                    double eikEnvelope = Math.pow(eikNormalized, KRAKK_WEIGHT_EXPONENT);
+                    double krakkTransFactor = Mth.lerp(
+                            KRAKK_ENVELOPE_TRANSMITTANCE_BLEND,
+                            1.0D,
+                            transmittance * shadowTransmittance
+                    );
+                    double smoothingFactor = Mth.lerp(
+                            KRAKK_BASELINE_SMOOTH_BLEND,
+                            1.0D,
+                            eikEnvelope * krakkTransFactor
+                    );
+                    double cutoffRetention = computeKrakkCutoffEdgeRetention(eikNormalized);
+                    double weight = baselineWeight * smoothingFactor * cutoffRetention;
+                    if (weight <= KRAKK_TARGET_MIN_WEIGHT) {
+                        continue;
+                    }
+                    double sampledWeight = weight;
+                    job.targetPositions().add(posLong);
+                    job.targetWeights().add((float) sampledWeight);
+                    job.solidWeight += sampledWeight;
+                }
+
+                if (job.targetScanIndex >= sampledSolids.size()) {
+                    long targetScanNanos = System.nanoTime() - job.targetScanStartNanos();
+                    if (job.trace() != null) {
+                        job.trace().volumetricTargetScanNanos += targetScanNanos;
+                    }
+                    if (job.phaseLoggingEnabled()) {
+                        logKrakkPhaseTiming(
+                                job.phaseTraceId(),
+                                "stream-target-scan",
+                                targetScanNanos,
+                                String.format(
+                                        "jobId=%d targetCount=%d solidWeight=%s",
+                                        job.jobId(),
+                                        job.targetPositions().size(),
+                                        job.solidWeight
+                                )
+                        );
+                    }
+                    if (job.targetPositions().isEmpty() || job.solidWeight <= VOLUMETRIC_MIN_ENERGY) {
+                        finishStreamingWavefrontJob(job, "stream-no-targets");
+                        continue;
+                    }
+
+                    if (job.trace() != null) {
+                        job.trace().rawImpactedBlocks += job.targetPositions().size();
+                        job.trace().postAaImpactedBlocks += job.targetPositions().size();
+                        job.trace().volumetricTargetBlocks += job.targetPositions().size();
+                    }
+
+                    double powerScale = computeVolumetricRadiusScale(job.resolvedRadius(), VOLUMETRIC_MAX_POWER_RADIUS_SCALE);
+                    job.impactBudget = job.totalEnergy() * VOLUMETRIC_IMPACT_POWER_PER_ENERGY * powerScale;
+                    double airNormalizationScale = computeVolumetricAirNormalizationScale(
+                            job.sampledSolidPositions().size(),
+                            Math.max(1, job.normalAccepted().size())
+                    );
+                    job.normalizationWeight = job.solidWeight * airNormalizationScale;
+                    if (job.normalizationWeight <= VOLUMETRIC_MIN_ENERGY) {
+                        finishStreamingWavefrontJob(job, "stream-normalization-too-small");
+                        continue;
+                    }
+                    job.impactApplyStartNanos(System.nanoTime());
+                    job.impactDirectStartNanos(System.nanoTime());
+                    job.setPhase(StreamingWavefrontPhase.IMPACT_DIRECT);
+                }
+                continue;
+            }
+
+            if (job.phase() == StreamingWavefrontPhase.IMPACT_DIRECT) {
+                Entity source = job.resolveSource(level);
+                LivingEntity owner = job.resolveOwner(level);
+                int limit = KRAKK_STREAMING_DIRECT_IMPACT_BUDGET;
+                while (job.directImpactIndex < job.targetPositions().size() && limit-- > 0) {
+                    if ((limit & 127) == 0 && System.nanoTime() >= deadlineNanos) {
+                        break;
+                    }
+                    long targetPosLong = job.targetPositions().getLong(job.directImpactIndex);
+                    double weight = job.targetWeights().getFloat(job.directImpactIndex);
+                    job.directImpactIndex++;
+                    if (weight <= KRAKK_TARGET_MIN_WEIGHT) {
+                        continue;
+                    }
+                    float existingCollapseWeight = job.collapseWeightsByPos().get(targetPosLong);
+                    if (weight > existingCollapseWeight) {
+                        job.collapseWeightsByPos().put(targetPosLong, (float) weight);
+                    }
+                    double impactPower = job.impactBudget * (weight / job.normalizationWeight);
+                    applySingleBlockImpact(
+                            level,
+                            job.mutablePos(),
+                            targetPosLong,
+                            impactPower,
+                            source,
+                            owner,
+                            job.impactHeatCelsius(),
+                            false,
+                            true,
+                            job.trace()
+                    );
+                    job.directImpactApplications++;
+                }
+                if (job.directImpactIndex >= job.targetPositions().size()) {
+                    long directNanos = System.nanoTime() - job.impactDirectStartNanos();
+                    if (job.trace() != null) {
+                        job.trace().volumetricImpactApplyDirectNanos += directNanos;
+                    }
+                    if (job.phaseLoggingEnabled()) {
+                        logKrakkPhaseTiming(
+                                job.phaseTraceId(),
+                                "stream-impact-direct",
+                                directNanos,
+                                String.format(
+                                        "jobId=%d appliedBlocks=%d collapseSeedCount=%d impactBudget=%s normalizationWeight=%s",
+                                        job.jobId(),
+                                        job.directImpactApplications,
+                                        job.collapseWeightsByPos().size(),
+                                        job.impactBudget,
+                                        job.normalizationWeight
+                                )
+                        );
+                    }
+
+                    applyStructuralCollapseSparse(
+                            level,
+                            job.centerX(),
+                            job.centerY(),
+                            job.centerZ(),
+                            job.radiusSq(),
+                            job.targetPositions(),
+                            job.collapseWeightsByPos(),
+                            job.impactBudget,
+                            job.normalizationWeight,
+                            source,
+                            owner,
+                            true,
+                            job.trace()
+                    );
+
+                    if (hasThermalEffect(job.impactHeatCelsius())) {
+                        job.thermalTargetShape(buildThermalTargetShape(job.targetPositions(), job.targetWeights()));
+                        if (job.thermalTargetShape().positions().isEmpty()) {
+                            finishStreamingWavefrontJob(job, null);
+                            continue;
+                        }
+                        long orderingSeed = mixOrderingSeed(
+                                job.centerX(),
+                                job.centerY(),
+                                job.centerZ(),
+                                job.impactHeatCelsius(),
+                                job.thermalTargetShape().positions().size()
+                        );
+                        job.thermalPermutationStart = computePermutationStart(orderingSeed, job.thermalTargetShape().positions().size());
+                        job.thermalPermutationStep = computePermutationStep(orderingSeed, job.thermalTargetShape().positions().size());
+                        job.thermalApplyStartNanos(System.nanoTime());
+                        job.setPhase(StreamingWavefrontPhase.IMPACT_THERMAL);
+                    } else {
+                        finishStreamingWavefrontJob(job, null);
+                    }
+                }
+                continue;
+            }
+
+            if (job.phase() == StreamingWavefrontPhase.IMPACT_THERMAL) {
+                Entity source = job.resolveSource(level);
+                LivingEntity owner = job.resolveOwner(level);
+                LongArrayList thermalPositions = job.thermalTargetShape().positions();
+                Long2FloatOpenHashMap thermalWeightsByPos = job.thermalTargetShape().weightsByPos();
+                int limit = KRAKK_STREAMING_THERMAL_IMPACT_BUDGET;
+                while (job.thermalIndex < thermalPositions.size() && limit-- > 0) {
+                    if ((limit & 127) == 0 && System.nanoTime() >= deadlineNanos) {
+                        break;
+                    }
+                    int index = (job.thermalPermutationStart + (job.thermalIndex * job.thermalPermutationStep)) % thermalPositions.size();
+                    job.thermalIndex++;
+                    long thermalPosLong = thermalPositions.getLong(index);
+                    float weight = thermalWeightsByPos.get(thermalPosLong);
+                    if (weight <= 0.0F) {
+                        continue;
+                    }
+                    double thermalHeat = computeHeatFalloff(job.impactHeatCelsius(), weight, job.resolvedRadius());
+                    applySingleBlockImpact(
+                            level,
+                            job.mutablePos(),
+                            thermalPosLong,
+                            0.0D,
+                            source,
+                            owner,
+                            thermalHeat,
+                            true,
+                            true,
+                            job.trace()
+                    );
+                    job.thermalImpactApplications++;
+                }
+                if (job.thermalIndex >= thermalPositions.size()) {
+                    if (job.phaseLoggingEnabled()) {
+                        long thermalNanos = System.nanoTime() - job.thermalApplyStartNanos();
+                        logKrakkPhaseTiming(
+                                job.phaseTraceId(),
+                                "stream-impact-thermal",
+                                thermalNanos,
+                                String.format(
+                                        "jobId=%d thermalTargets=%d appliedBlocks=%d",
+                                        job.jobId(),
+                                        thermalPositions.size(),
+                                        job.thermalImpactApplications
+                                )
+                        );
+                    }
+                    finishStreamingWavefrontJob(job, null);
+                }
+            }
+        }
+    }
+
+    private static void seedStreamingWavefrontJob(StreamingWavefrontJob job, ServerLevel level) {
+        int baseX = Mth.floor(job.centerX());
+        int baseY = Mth.floor(job.centerY());
+        int baseZ = Mth.floor(job.centerZ());
+        int seedMinX = Math.max(job.minX(), baseX - 1);
+        int seedMaxX = Math.min(job.maxX(), baseX + 1);
+        int seedMinY = Math.max(job.minY(), baseY - 1);
+        int seedMaxY = Math.min(job.maxY(), baseY + 1);
+        int seedMinZ = Math.max(job.minZ(), baseZ - 1);
+        int seedMaxZ = Math.min(job.maxZ(), baseZ + 1);
+
+        int normalSources = 0;
+        int shadowSources = 0;
+        for (int x = seedMinX; x <= seedMaxX; x++) {
+            for (int y = seedMinY; y <= seedMaxY; y++) {
+                for (int z = seedMinZ; z <= seedMaxZ; z++) {
+                    double dx = (x + 0.5D) - job.centerX();
+                    double dy = (y + 0.5D) - job.centerY();
+                    double dz = (z + 0.5D) - job.centerZ();
+                    double distSq = (dx * dx) + (dy * dy) + (dz * dz);
+                    if (distSq > job.radiusSq()) {
+                        continue;
+                    }
+                    long posLong = BlockPos.asLong(x, y, z);
+                    float normalSlowness = resolveStreamingNormalSlowness(
+                            level,
+                            x,
+                            y,
+                            z,
+                            posLong,
+                            job.mutablePos(),
+                            job.chunkStateCache(),
+                            job.resistanceCostCache(),
+                            job.normalSlownessByPos(),
+                            null
+                    );
+                    if (normalSlowness <= 0.0F) {
+                        continue;
+                    }
+                    double dist = Math.sqrt(distSq);
+                    if (enqueueStreamingSource(posLong, dist * normalSlowness, job.normalArrivalByPos(), job.normalQueue())) {
+                        normalSources++;
+                    }
+                    if (KRAKK_STREAMING_ENABLE_SHADOW_SECOND_PASS
+                            && enqueueStreamingSource(
+                            posLong,
+                            dist * resolveStreamingShadowSlowness(normalSlowness),
+                            job.shadowArrivalByPos(),
+                            job.shadowQueue()
+                    )) {
+                        shadowSources++;
+                    }
+                }
+            }
+        }
+
+        int seedX = Mth.clamp(baseX, job.minX(), job.maxX());
+        int seedY = Mth.clamp(baseY, job.minY(), job.maxY());
+        int seedZ = Mth.clamp(baseZ, job.minZ(), job.maxZ());
+        long seedPosLong = BlockPos.asLong(seedX, seedY, seedZ);
+        float seedSlowness = resolveStreamingNormalSlowness(
+                level,
+                seedX,
+                seedY,
+                seedZ,
+                seedPosLong,
+                job.mutablePos(),
+                job.chunkStateCache(),
+                job.resistanceCostCache(),
+                job.normalSlownessByPos(),
+                null
+        );
+        if (seedSlowness > 0.0F) {
+            if (normalSources <= 0 && enqueueStreamingSource(seedPosLong, 0.0D, job.normalArrivalByPos(), job.normalQueue())) {
+                normalSources++;
+            }
+            if (KRAKK_STREAMING_ENABLE_SHADOW_SECOND_PASS
+                    && shadowSources <= 0
+                    && enqueueStreamingSource(seedPosLong, 0.0D, job.shadowArrivalByPos(), job.shadowQueue())) {
+                shadowSources++;
+            }
+        }
+
+        job.normalSourceCount(normalSources);
+        job.shadowSourceCount(shadowSources);
+        if (normalSources <= 0 || (KRAKK_STREAMING_ENABLE_SHADOW_SECOND_PASS && shadowSources <= 0)) {
+            finishStreamingWavefrontJob(job, "streaming-wavefront-no-sources");
+            return;
+        }
+
+        job.maxArrival(Math.max(1.0E-6D, job.resolvedRadius() * KRAKK_MAX_ARRIVAL_MULTIPLIER));
+        double powerScale = computeVolumetricRadiusScale(job.resolvedRadius(), VOLUMETRIC_MAX_POWER_RADIUS_SCALE);
+        job.impactBudget = job.totalEnergy() * VOLUMETRIC_IMPACT_POWER_PER_ENERGY * powerScale;
+        long now = System.nanoTime();
+        job.solveStartNanos(now);
+        job.impactApplyStartNanos(now);
+        job.impactDirectStartNanos(now);
+        job.setPhase(StreamingWavefrontPhase.SOLVE_NORMAL);
+    }
+
+    private static void finishStreamingWavefrontJob(StreamingWavefrontJob job, String abortReason) {
+        long impactApplyNanos = job.impactApplyStartNanos() > 0L
+                ? (System.nanoTime() - job.impactApplyStartNanos())
+                : 0L;
+        if (job.trace() != null) {
+            job.trace().volumetricImpactApplyNanos += impactApplyNanos;
+        }
+        if (job.phaseLoggingEnabled() && job.impactApplyStartNanos() > 0L) {
+            logKrakkPhaseTiming(
+                    job.phaseTraceId(),
+                    "stream-impact-total",
+                    impactApplyNanos,
+                    String.format(
+                            "jobId=%d directApplied=%d thermalApplied=%d",
+                            job.jobId(),
+                            job.directImpactApplications,
+                            job.thermalImpactApplications
+                    )
+            );
+        }
+        if (job.phaseLoggingEnabled()) {
+            String phase = abortReason == null ? "complete" : "abort";
+            LOGGER.info(
+                    "Krakk phase trace #{} [{}] jobId={} reason={} totalMs={} blocksEvaluated={} broken={} damaged={} predictedBroken={} predictedDamaged={} heap={}",
+                    job.phaseTraceId(),
+                    phase,
+                    job.jobId(),
+                    abortReason == null ? "n/a" : abortReason,
+                    nanosToMillis(System.nanoTime() - job.queuedAtNanos()),
+                    job.trace() == null ? -1 : job.trace().blocksEvaluated,
+                    job.trace() == null ? -1 : job.trace().brokenBlocks,
+                    job.trace() == null ? -1 : job.trace().damagedBlocks,
+                    job.trace() == null ? -1 : job.trace().predictedBrokenBlocks,
+                    job.trace() == null ? -1 : job.trace().predictedDamagedBlocks,
+                    formatKrakkHeapSnapshot()
+            );
+        }
+        job.failureMessage(abortReason);
+        job.setPhase(StreamingWavefrontPhase.COMPLETE);
+    }
+
+    private static void runKrakkStreamingWavefrontPropagation(ServerLevel level,
+                                                               double centerX,
+                                                               double centerY,
+                                                               double centerZ,
+                                                               double resolvedRadius,
+                                                               double radiusSq,
+                                                               int minX,
+                                                               int maxX,
+                                                               int minY,
+                                                               int maxY,
+                                                               int minZ,
+                                                               int maxZ,
+                                                               double totalEnergy,
+                                                               double impactHeatCelsius,
+                                                               Entity source,
+                                                               LivingEntity owner,
+                                                               boolean applyWorldChanges,
+                                                               ExplosionProfileTrace trace,
+                                                               boolean phaseLoggingEnabled,
+                                                               long phaseTraceId,
+                                                               long phaseTotalStart) {
+        Int2DoubleOpenHashMap resistanceCostCache = new Int2DoubleOpenHashMap(256);
+        resistanceCostCache.defaultReturnValue(Double.NaN);
+        WaveChunkStateCache chunkStateCache = new WaveChunkStateCache();
+        BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        Long2FloatOpenHashMap normalSlownessByPos = new Long2FloatOpenHashMap(2048);
+        normalSlownessByPos.defaultReturnValue(Float.NaN);
+        LongOpenHashSet sampledSolidPositions = new LongOpenHashSet(2048);
+
+        Long2FloatOpenHashMap normalArrivalByPos = new Long2FloatOpenHashMap(4096);
+        normalArrivalByPos.defaultReturnValue(Float.POSITIVE_INFINITY);
+        Long2FloatOpenHashMap shadowArrivalByPos = new Long2FloatOpenHashMap(4096);
+        shadowArrivalByPos.defaultReturnValue(Float.POSITIVE_INFINITY);
+        LongOpenHashSet normalAccepted = new LongOpenHashSet(4096);
+        LongOpenHashSet shadowAccepted = new LongOpenHashSet(4096);
+        WaveLongMinHeap normalQueue = new WaveLongMinHeap(256);
+        WaveLongMinHeap shadowQueue = new WaveLongMinHeap(256);
+
+        int baseX = Mth.floor(centerX);
+        int baseY = Mth.floor(centerY);
+        int baseZ = Mth.floor(centerZ);
+        int seedMinX = Math.max(minX, baseX - 1);
+        int seedMaxX = Math.min(maxX, baseX + 1);
+        int seedMinY = Math.max(minY, baseY - 1);
+        int seedMaxY = Math.min(maxY, baseY + 1);
+        int seedMinZ = Math.max(minZ, baseZ - 1);
+        int seedMaxZ = Math.min(maxZ, baseZ + 1);
+
+        int normalSourceCount = 0;
+        int shadowSourceCount = 0;
+        for (int x = seedMinX; x <= seedMaxX; x++) {
+            for (int y = seedMinY; y <= seedMaxY; y++) {
+                for (int z = seedMinZ; z <= seedMaxZ; z++) {
+                    double dx = (x + 0.5D) - centerX;
+                    double dy = (y + 0.5D) - centerY;
+                    double dz = (z + 0.5D) - centerZ;
+                    double distSq = (dx * dx) + (dy * dy) + (dz * dz);
+                    if (distSq > radiusSq) {
+                        continue;
+                    }
+                    long posLong = BlockPos.asLong(x, y, z);
+                    float normalSlowness = resolveStreamingNormalSlowness(
+                            level,
+                            x,
+                            y,
+                            z,
+                            posLong,
+                            mutablePos,
+                            chunkStateCache,
+                            resistanceCostCache,
+                            normalSlownessByPos,
+                            sampledSolidPositions
+                    );
+                    if (normalSlowness <= 0.0F) {
+                        continue;
+                    }
+                    double dist = Math.sqrt(distSq);
+                    if (enqueueStreamingSource(posLong, dist * normalSlowness, normalArrivalByPos, normalQueue)) {
+                        normalSourceCount++;
+                    }
+                    if (enqueueStreamingSource(posLong, dist * resolveStreamingShadowSlowness(normalSlowness), shadowArrivalByPos, shadowQueue)) {
+                        shadowSourceCount++;
+                    }
+                }
+            }
+        }
+
+        int seedX = Mth.clamp(baseX, minX, maxX);
+        int seedY = Mth.clamp(baseY, minY, maxY);
+        int seedZ = Mth.clamp(baseZ, minZ, maxZ);
+        long seedPosLong = BlockPos.asLong(seedX, seedY, seedZ);
+        float seedSlowness = resolveStreamingNormalSlowness(
+                level,
+                seedX,
+                seedY,
+                seedZ,
+                seedPosLong,
+                mutablePos,
+                chunkStateCache,
+                resistanceCostCache,
+                normalSlownessByPos,
+                sampledSolidPositions
+        );
+        if (seedSlowness > 0.0F) {
+            if (normalSourceCount <= 0 && enqueueStreamingSource(seedPosLong, 0.0D, normalArrivalByPos, normalQueue)) {
+                normalSourceCount++;
+            }
+            if (shadowSourceCount <= 0 && enqueueStreamingSource(seedPosLong, 0.0D, shadowArrivalByPos, shadowQueue)) {
+                shadowSourceCount++;
+            }
+        }
+
+        if (normalSourceCount <= 0 || shadowSourceCount <= 0) {
+            if (phaseLoggingEnabled) {
+                LOGGER.info(
+                        "Krakk phase trace #{} [abort] streaming-wavefront-no-sources normalSources={} shadowSources={} heap={}",
+                        phaseTraceId,
+                        normalSourceCount,
+                        shadowSourceCount,
+                        formatKrakkHeapSnapshot()
+                );
+            }
+            return;
+        }
+
+        double maxArrival = Math.max(1.0E-6D, resolvedRadius * KRAKK_MAX_ARRIVAL_MULTIPLIER);
+        long solveStart = (trace != null || phaseLoggingEnabled) ? System.nanoTime() : 0L;
+        WavefrontSolveStats normalSolveStats = solveKrakkStreamingWavefront(
+                level,
+                centerX,
+                centerY,
+                centerZ,
+                radiusSq,
+                minX,
+                maxX,
+                minY,
+                maxY,
+                minZ,
+                maxZ,
+                maxArrival,
+                false,
+                normalArrivalByPos,
+                normalAccepted,
+                normalQueue,
+                normalSlownessByPos,
+                sampledSolidPositions,
+                mutablePos,
+                chunkStateCache,
+                resistanceCostCache
+        );
+        WavefrontSolveStats shadowSolveStats = solveKrakkStreamingWavefront(
+                level,
+                centerX,
+                centerY,
+                centerZ,
+                radiusSq,
+                minX,
+                maxX,
+                minY,
+                maxY,
+                minZ,
+                maxZ,
+                maxArrival,
+                true,
+                shadowArrivalByPos,
+                shadowAccepted,
+                shadowQueue,
+                normalSlownessByPos,
+                sampledSolidPositions,
+                mutablePos,
+                chunkStateCache,
+                resistanceCostCache
+        );
+        long solveNanos = (trace != null || phaseLoggingEnabled) ? (System.nanoTime() - solveStart) : 0L;
+        if (trace != null) {
+            trace.volumetricPressureSolveNanos += solveNanos;
+            trace.krakkSolveNanos += solveNanos;
+            trace.krakkSourceCells += normalSourceCount + shadowSourceCount;
+            trace.krakkSweepCycles += normalSolveStats.poppedNodes() + shadowSolveStats.poppedNodes();
+        }
+        if (phaseLoggingEnabled) {
+            logKrakkPhaseTiming(
+                    phaseTraceId,
+                    "stream-wavefront-solve",
+                    solveNanos,
+                    String.format(
+                            "normal[source=%d,accepted=%d,popped=%d] shadow[source=%d,accepted=%d,popped=%d] sampledSolids=%d",
+                            normalSourceCount,
+                            normalSolveStats.acceptedNodes(),
+                            normalSolveStats.poppedNodes(),
+                            shadowSourceCount,
+                            shadowSolveStats.acceptedNodes(),
+                            shadowSolveStats.poppedNodes(),
+                            sampledSolidPositions.size()
+                    )
+            );
+        }
+
+        long targetScanStart = (trace != null || phaseLoggingEnabled) ? System.nanoTime() : 0L;
+        LongArrayList targetPositions = new LongArrayList(Math.max(16, sampledSolidPositions.size() / 8));
+        FloatArrayList targetWeights = new FloatArrayList(Math.max(16, sampledSolidPositions.size() / 8));
+        double solidWeight = 0.0D;
+        for (LongIterator iterator = sampledSolidPositions.iterator(); iterator.hasNext(); ) {
+            long posLong = iterator.nextLong();
+            double arrival = normalArrivalByPos.get(posLong);
+            if (!Double.isFinite(arrival) || arrival > maxArrival) {
+                continue;
+            }
+            double shadowArrival = shadowArrivalByPos.get(posLong);
+            if (!Double.isFinite(shadowArrival)) {
+                continue;
+            }
+            int x = BlockPos.getX(posLong);
+            int y = BlockPos.getY(posLong);
+            int z = BlockPos.getZ(posLong);
+            double airArrival = computeAnalyticKrakkAirArrival(centerX, centerY, centerZ, x, y, z);
+            if (!Double.isFinite(airArrival)) {
+                continue;
+            }
+            if (airArrival > resolvedRadius) {
+                continue;
+            }
+            double normalized = 1.0D - (airArrival / Math.max(1.0E-6D, resolvedRadius));
+            if (normalized <= 0.0D) {
+                continue;
+            }
+            double metricAirArrival = computeStreamingMetricKrakkAirArrival(centerX, centerY, centerZ, x, y, z);
+            if (!Double.isFinite(metricAirArrival)) {
+                continue;
+            }
+            double resistanceOverrun = Math.max(0.0D, arrival - metricAirArrival);
+            double effectiveOverrun = Math.max(0.0D, resistanceOverrun - KRAKK_OVERRUN_DEADZONE);
+            double normalizedOverrun = effectiveOverrun / Math.max(1.0D, metricAirArrival);
+            if (normalizedOverrun >= KRAKK_HARD_BLOCK_NORMALIZED_OVERRUN) {
+                continue;
+            }
+            double transmittance = Math.exp(
+                    -(effectiveOverrun * KRAKK_RESISTANCE_ATTENUATION_PER_OVERRUN)
+                            - (normalizedOverrun * KRAKK_RESISTANCE_NORMALIZED_ATTENUATION)
+            );
+            if (transmittance <= KRAKK_MIN_TRANSMITTANCE) {
+                continue;
+            }
+            double shadowOverrun = Math.max(0.0D, shadowArrival - arrival);
+            double effectiveShadowOverrun = Math.max(0.0D, shadowOverrun - KRAKK_SHADOW_OVERRUN_DEADZONE);
+            double normalizedShadowOverrun = effectiveShadowOverrun / Math.max(0.25D, metricAirArrival);
+            if (normalizedShadowOverrun >= KRAKK_HARD_BLOCK_SHADOW_NORMALIZED_OVERRUN) {
+                continue;
+            }
+            double shadowTransmittance = Math.exp(
+                    -(effectiveShadowOverrun * KRAKK_SHADOW_ATTENUATION_PER_OVERRUN)
+                            - (normalizedShadowOverrun * KRAKK_SHADOW_NORMALIZED_ATTENUATION)
+            );
+            if (shadowTransmittance <= KRAKK_MIN_TRANSMITTANCE) {
+                continue;
+            }
+            double baselineWeight = Mth.clamp(transmittance * shadowTransmittance, 0.0D, 1.0D);
+            double eikNormalized = normalized;
+            if (normalized < 0.5D) {
+                double outerT = 1.0D - normalized * 2.0D;
+                long h = ((long) x * 0x9E3779B97F4A7C15L)
+                       ^ ((long) y * 0x6C62272E07BB0142L)
+                       ^ ((long) z * 0xCB9C59B3F9F87D4DL)
+                       ^ ((long) Mth.floor(centerX) * 0xBF58476D1CE4E5B9L)
+                       ^ ((long) Mth.floor(centerZ) * 0x94D049BB133111EBL);
+                h ^= (h >>> 33);
+                h *= 0xFF51AFD7ED558CCDL;
+                h ^= (h >>> 33);
+                double blockNoise = (h >>> 11 & 0x1FFFFFL) / 2097151.0D;
+                eikNormalized = Mth.clamp(normalized + outerT * (blockNoise * 2.0D - 1.0D), 0.0D, 1.0D);
+            }
+            double eikEnvelope = Math.pow(eikNormalized, KRAKK_WEIGHT_EXPONENT);
+            double krakkTransFactor = Mth.lerp(
+                    KRAKK_ENVELOPE_TRANSMITTANCE_BLEND,
+                    1.0D,
+                    transmittance * shadowTransmittance
+            );
+            double smoothingFactor = Mth.lerp(
+                    KRAKK_BASELINE_SMOOTH_BLEND,
+                    1.0D,
+                    eikEnvelope * krakkTransFactor
+            );
+            double cutoffRetention = computeKrakkCutoffEdgeRetention(eikNormalized);
+            double weight = baselineWeight * smoothingFactor * cutoffRetention;
+            if (weight <= KRAKK_TARGET_MIN_WEIGHT) {
+                continue;
+            }
+            double sampledWeight = weight;
+            targetPositions.add(posLong);
+            targetWeights.add((float) sampledWeight);
+            solidWeight += sampledWeight;
+        }
+        long targetScanNanos = (trace != null || phaseLoggingEnabled) ? (System.nanoTime() - targetScanStart) : 0L;
+        if (trace != null) {
+            trace.volumetricTargetScanNanos += targetScanNanos;
+        }
+        if (phaseLoggingEnabled) {
+            logKrakkPhaseTiming(
+                    phaseTraceId,
+                    "stream-target-scan",
+                    targetScanNanos,
+                    String.format(
+                            "targetCount=%d solidWeight=%s",
+                            targetPositions.size(),
+                            solidWeight
+                    )
+            );
+        }
+
+        if (targetPositions.isEmpty() || solidWeight <= VOLUMETRIC_MIN_ENERGY) {
+            if (phaseLoggingEnabled) {
+                LOGGER.info(
+                        "Krakk phase trace #{} [abort] stream-no-targets targetCount={} solidWeight={} totalMs={} heap={}",
+                        phaseTraceId,
+                        targetPositions.size(),
+                        solidWeight,
+                        nanosToMillis(System.nanoTime() - phaseTotalStart),
+                        formatKrakkHeapSnapshot()
+                );
+            }
+            return;
+        }
+        if (trace != null) {
+            trace.rawImpactedBlocks += targetPositions.size();
+            trace.postAaImpactedBlocks += targetPositions.size();
+            trace.volumetricTargetBlocks += targetPositions.size();
+        }
+
+        double powerScale = computeVolumetricRadiusScale(resolvedRadius, VOLUMETRIC_MAX_POWER_RADIUS_SCALE);
+        double impactBudget = totalEnergy * VOLUMETRIC_IMPACT_POWER_PER_ENERGY * powerScale;
+        double airNormalizationScale = computeVolumetricAirNormalizationScale(sampledSolidPositions.size(), Math.max(1, normalAccepted.size()));
+        double normalizationWeight = solidWeight * airNormalizationScale;
+        if (normalizationWeight <= VOLUMETRIC_MIN_ENERGY) {
+            if (phaseLoggingEnabled) {
+                LOGGER.info(
+                        "Krakk phase trace #{} [abort] stream-normalization-too-small normalizationWeight={} totalMs={} heap={}",
+                        phaseTraceId,
+                        normalizationWeight,
+                        nanosToMillis(System.nanoTime() - phaseTotalStart),
+                        formatKrakkHeapSnapshot()
+                );
+            }
+            return;
+        }
+
+        Long2FloatOpenHashMap collapseWeightsByPos = new Long2FloatOpenHashMap(Math.max(16, targetPositions.size()));
+        collapseWeightsByPos.defaultReturnValue(0.0F);
+        long impactApplyStart = (trace != null || phaseLoggingEnabled) ? System.nanoTime() : 0L;
+        long impactApplyDirectStart = (trace != null || phaseLoggingEnabled) ? System.nanoTime() : 0L;
+        int directImpactApplications = 0;
+        for (int i = 0; i < targetPositions.size(); i++) {
+            long targetPosLong = targetPositions.getLong(i);
+            double weight = targetWeights.getFloat(i);
+            if (weight <= KRAKK_TARGET_MIN_WEIGHT) {
+                continue;
+            }
+            float existingCollapseWeight = collapseWeightsByPos.get(targetPosLong);
+            if (weight > existingCollapseWeight) {
+                collapseWeightsByPos.put(targetPosLong, (float) weight);
+            }
+            double impactPower = impactBudget * (weight / normalizationWeight);
+            applySingleBlockImpact(
+                    level,
+                    mutablePos,
+                    targetPosLong,
+                    impactPower,
+                    source,
+                    owner,
+                    impactHeatCelsius,
+                    false,
+                    applyWorldChanges,
+                    trace
+            );
+            directImpactApplications++;
+        }
+        long impactApplyDirectNanos = (trace != null || phaseLoggingEnabled) ? (System.nanoTime() - impactApplyDirectStart) : 0L;
+        if (trace != null) {
+            trace.volumetricImpactApplyDirectNanos += impactApplyDirectNanos;
+        }
+        if (phaseLoggingEnabled) {
+            logKrakkPhaseTiming(
+                    phaseTraceId,
+                    "stream-impact-direct",
+                    impactApplyDirectNanos,
+                    String.format(
+                            "appliedBlocks=%d collapseSeedCount=%d impactBudget=%s normalizationWeight=%s",
+                            directImpactApplications,
+                            collapseWeightsByPos.size(),
+                            impactBudget,
+                            normalizationWeight
+                    )
+            );
+        }
+
+        applyStructuralCollapseSparse(
+                level,
+                centerX,
+                centerY,
+                centerZ,
+                radiusSq,
+                targetPositions,
+                collapseWeightsByPos,
+                impactBudget,
+                normalizationWeight,
+                source,
+                owner,
+                applyWorldChanges,
+                trace
+        );
+
+        int thermalImpactApplications = 0;
+        long thermalApplyNanos = 0L;
+        if (hasThermalEffect(impactHeatCelsius)) {
+            long thermalApplyStart = phaseLoggingEnabled ? System.nanoTime() : 0L;
+            ThermalTargetShape thermalTargetShape = buildThermalTargetShape(targetPositions, targetWeights);
+            if (!thermalTargetShape.positions().isEmpty()) {
+                LongArrayList thermalPositions = thermalTargetShape.positions();
+                Long2FloatOpenHashMap thermalWeightsByPos = thermalTargetShape.weightsByPos();
+                long orderingSeed = mixOrderingSeed(centerX, centerY, centerZ, impactHeatCelsius, thermalPositions.size());
+                int permutationStart = computePermutationStart(orderingSeed, thermalPositions.size());
+                int permutationStep = computePermutationStep(orderingSeed, thermalPositions.size());
+                for (int i = 0; i < thermalPositions.size(); i++) {
+                    int index = Math.floorMod(permutationStart + (i * permutationStep), thermalPositions.size());
+                    long thermalPosLong = thermalPositions.getLong(index);
+                    float weight = thermalWeightsByPos.get(thermalPosLong);
+                    if (weight <= 0.0F) {
+                        continue;
+                    }
+                    double thermalHeat = computeHeatFalloff(impactHeatCelsius, weight, resolvedRadius);
+                    applySingleBlockImpact(
+                            level,
+                            mutablePos,
+                            thermalPosLong,
+                            0.0D,
+                            source,
+                            owner,
+                            thermalHeat,
+                            true,
+                            applyWorldChanges,
+                            trace
+                    );
+                    thermalImpactApplications++;
+                }
+            }
+            if (phaseLoggingEnabled) {
+                thermalApplyNanos = System.nanoTime() - thermalApplyStart;
+                logKrakkPhaseTiming(
+                        phaseTraceId,
+                        "stream-impact-thermal",
+                        thermalApplyNanos,
+                        String.format(
+                                "thermalTargets=%d appliedBlocks=%d",
+                                thermalTargetShape.positions().size(),
+                                thermalImpactApplications
+                        )
+                );
+            }
+        }
+
+        long impactApplyNanos = (trace != null || phaseLoggingEnabled) ? (System.nanoTime() - impactApplyStart) : 0L;
+        if (trace != null) {
+            trace.volumetricImpactApplyNanos += impactApplyNanos;
+        }
+        if (phaseLoggingEnabled) {
+            logKrakkPhaseTiming(
+                    phaseTraceId,
+                    "stream-impact-total",
+                    impactApplyNanos,
+                    String.format(
+                            "directApplied=%d thermalApplied=%d",
+                            directImpactApplications,
+                            thermalImpactApplications
+                    )
+            );
+            LOGGER.info(
+                    "Krakk phase trace #{} [complete] totalMs={} blocksEvaluated={} broken={} damaged={} predictedBroken={} predictedDamaged={} heap={}",
+                    phaseTraceId,
+                    nanosToMillis(System.nanoTime() - phaseTotalStart),
+                    trace == null ? -1 : trace.blocksEvaluated,
+                    trace == null ? -1 : trace.brokenBlocks,
+                    trace == null ? -1 : trace.damagedBlocks,
+                    trace == null ? -1 : trace.predictedBrokenBlocks,
+                    trace == null ? -1 : trace.predictedDamagedBlocks,
+                    formatKrakkHeapSnapshot()
+            );
+        }
+    }
+
+    private static WavefrontSolveStats solveKrakkStreamingWavefront(ServerLevel level,
+                                                                     double centerX,
+                                                                     double centerY,
+                                                                     double centerZ,
+                                                                     double radiusSq,
+                                                                     int minX,
+                                                                     int maxX,
+                                                                     int minY,
+                                                                     int maxY,
+                                                                     int minZ,
+                                                                     int maxZ,
+                                                                     double maxArrival,
+                                                                     boolean shadowSolve,
+                                                                     Long2FloatOpenHashMap arrivalByPos,
+                                                                     LongOpenHashSet accepted,
+                                                                     WaveLongMinHeap queue,
+                                                                     Long2FloatOpenHashMap normalSlownessByPos,
+                                                                     LongOpenHashSet sampledSolidPositions,
+                                                                     BlockPos.MutableBlockPos mutablePos,
+                                                                     WaveChunkStateCache chunkStateCache,
+                                                                     Int2DoubleOpenHashMap resistanceCostCache) {
+        return stepKrakkStreamingWavefront(
+                level,
+                centerX,
+                centerY,
+                centerZ,
+                radiusSq,
+                minX,
+                maxX,
+                minY,
+                maxY,
+                minZ,
+                maxZ,
+                maxArrival,
+                shadowSolve,
+                arrivalByPos,
+                accepted,
+                queue,
+                normalSlownessByPos,
+                sampledSolidPositions,
+                mutablePos,
+                chunkStateCache,
+                resistanceCostCache,
+                Integer.MAX_VALUE,
+                Long.MAX_VALUE
+        );
+    }
+
+    private static WavefrontSolveStats stepKrakkStreamingWavefront(ServerLevel level,
+                                                                    double centerX,
+                                                                    double centerY,
+                                                                    double centerZ,
+                                                                    double radiusSq,
+                                                                    int minX,
+                                                                    int maxX,
+                                                                    int minY,
+                                                                    int maxY,
+                                                                    int minZ,
+                                                                    int maxZ,
+                                                                    double maxArrival,
+                                                                    boolean shadowSolve,
+                                                                    Long2FloatOpenHashMap arrivalByPos,
+                                                                    LongOpenHashSet accepted,
+                                                                    WaveLongMinHeap queue,
+                                                                    Long2FloatOpenHashMap normalSlownessByPos,
+                                                                    LongOpenHashSet sampledSolidPositions,
+                                                                    BlockPos.MutableBlockPos mutablePos,
+                                                                    WaveChunkStateCache chunkStateCache,
+                                                                    Int2DoubleOpenHashMap resistanceCostCache,
+                                                                    int popBudget,
+                                                                    long deadlineNanos) {
+        int poppedNodes = 0;
+        int acceptedNodes = 0;
+        while (!queue.isEmpty() && poppedNodes < popBudget) {
+            if ((poppedNodes & 127) == 0 && System.nanoTime() >= deadlineNanos) {
+                break;
+            }
+            long posLong = queue.pollKey();
+            double queuedArrival = queue.pollPriority();
+            poppedNodes++;
+
+            double currentArrival = arrivalByPos.get(posLong);
+            if (!Double.isFinite(currentArrival) || queuedArrival > currentArrival + 1.0E-9D) {
+                continue;
+            }
+            if (currentArrival > maxArrival) {
+                continue;
+            }
+            if (!accepted.add(posLong)) {
+                continue;
+            }
+            acceptedNodes++;
+
+            int x = BlockPos.getX(posLong);
+            int y = BlockPos.getY(posLong);
+            int z = BlockPos.getZ(posLong);
+            float currentNormalSlowness = resolveStreamingNormalSlowness(
+                    level,
+                    x,
+                    y,
+                    z,
+                    posLong,
+                    mutablePos,
+                    chunkStateCache,
+                    resistanceCostCache,
+                    normalSlownessByPos,
+                    sampledSolidPositions
+            );
+            if (currentNormalSlowness <= 0.0F) {
+                continue;
+            }
+            double currentSolveSlowness = resolveStreamingSolveSlowness(currentNormalSlowness, shadowSolve);
+            for (int neighborIndex = 0; neighborIndex < KRAKK_STREAMING_WAVE_NEIGHBOR_OFFSETS.length; neighborIndex++) {
+                int[] offset = KRAKK_STREAMING_WAVE_NEIGHBOR_OFFSETS[neighborIndex];
+                int nx = x + offset[0];
+                int ny = y + offset[1];
+                int nz = z + offset[2];
+                if (nx < minX || nx > maxX
+                        || ny < minY || ny > maxY
+                        || nz < minZ || nz > maxZ) {
+                    continue;
+                }
+                double dx = (nx + 0.5D) - centerX;
+                double dy = (ny + 0.5D) - centerY;
+                double dz = (nz + 0.5D) - centerZ;
+                if (((dx * dx) + (dy * dy) + (dz * dz)) > radiusSq) {
+                    continue;
+                }
+
+                long neighborPosLong = BlockPos.asLong(nx, ny, nz);
+                if (accepted.contains(neighborPosLong)) {
+                    continue;
+                }
+                float neighborNormalSlowness = resolveStreamingNormalSlowness(
+                        level,
+                        nx,
+                        ny,
+                        nz,
+                        neighborPosLong,
+                        mutablePos,
+                        chunkStateCache,
+                        resistanceCostCache,
+                        normalSlownessByPos,
+                        sampledSolidPositions
+                );
+                if (neighborNormalSlowness <= 0.0F) {
+                    continue;
+                }
+                double candidate = currentArrival + (0.5D
+                        * (currentSolveSlowness
+                        + resolveStreamingSolveSlowness(neighborNormalSlowness, shadowSolve))
+                        * KRAKK_STREAMING_WAVE_NEIGHBOR_STEP[neighborIndex]);
+                if (!Double.isFinite(candidate) || candidate > maxArrival) {
+                    continue;
+                }
+                if (candidate + 1.0E-9D < arrivalByPos.get(neighborPosLong)) {
+                    arrivalByPos.put(neighborPosLong, (float) candidate);
+                    queue.add(neighborPosLong, candidate);
+                }
+            }
+        }
+        return new WavefrontSolveStats(acceptedNodes, poppedNodes);
+    }
+
+    private static WavefrontSolveStats stepKrakkStreamingWavefrontShell(ServerLevel level,
+                                                                         StreamingWavefrontJob job,
+                                                                         long deadlineNanos) {
+        int poppedNodes = 0;
+        int acceptedNodes = 0;
+        Entity source = job.resolveSource(level);
+        LivingEntity owner = job.resolveOwner(level);
+        boolean thermalEnabled = hasThermalEffect(job.impactHeatCelsius());
+        while (!job.normalQueue().isEmpty() && poppedNodes < KRAKK_STREAMING_SOLVE_POP_BUDGET) {
+            if ((poppedNodes & 127) == 0 && System.nanoTime() >= deadlineNanos) {
+                break;
+            }
+            long posLong = job.normalQueue().pollKey();
+            double queuedArrival = job.normalQueue().pollPriority();
+            poppedNodes++;
+
+            double currentArrival = job.normalArrivalByPos().get(posLong);
+            if (!Double.isFinite(currentArrival) || queuedArrival > currentArrival + 1.0E-9D) {
+                continue;
+            }
+            if (currentArrival > job.maxArrival()) {
+                continue;
+            }
+            if (!job.normalAccepted().add(posLong)) {
+                continue;
+            }
+            acceptedNodes++;
+
+            int x = BlockPos.getX(posLong);
+            int y = BlockPos.getY(posLong);
+            int z = BlockPos.getZ(posLong);
+            float currentNormalSlowness = resolveStreamingNormalSlowness(
+                    level,
+                    x,
+                    y,
+                    z,
+                    posLong,
+                    job.mutablePos(),
+                    job.chunkStateCache(),
+                    job.resistanceCostCache(),
+                    job.normalSlownessByPos(),
+                    null
+            );
+            if (currentNormalSlowness <= 0.0F) {
+                continue;
+            }
+            double currentSolveSlowness = resolveStreamingSolveSlowness(currentNormalSlowness, false);
+
+            if (currentNormalSlowness > (float) (KRAKK_AIR_SLOWNESS + 1.0E-6D)) {
+                double shadowArrival = job.shadowArrivalByPos().get(posLong);
+                if (!Double.isFinite(shadowArrival)) {
+                    shadowArrival = currentArrival;
+                }
+                StreamingImpactSample impactSample = resolveStreamingShellImpactSample(
+                        job,
+                        currentArrival,
+                        shadowArrival,
+                        x,
+                        y,
+                        z
+                );
+                if (impactSample.impactPower() > MIN_RESOLVED_RAY_IMPACT) {
+                    applySingleBlockImpact(
+                            level,
+                            job.mutablePos(),
+                            posLong,
+                            impactSample.impactPower(),
+                            source,
+                            owner,
+                            job.impactHeatCelsius(),
+                            false,
+                            true,
+                            job.trace()
+                    );
+                    job.directImpactApplications++;
+                    job.solidWeight += impactSample.weight();
+
+                    if (thermalEnabled) {
+                        double thermalHeat = computeHeatFalloff(
+                                job.impactHeatCelsius(),
+                                impactSample.weight(),
+                                job.resolvedRadius()
+                        );
+                        for (int axis = 0; axis < 6; axis++) {
+                            int tx = x;
+                            int ty = y;
+                            int tz = z;
+                            if (axis == 0) {
+                                tx--;
+                            } else if (axis == 1) {
+                                tx++;
+                            } else if (axis == 2) {
+                                ty--;
+                            } else if (axis == 3) {
+                                ty++;
+                            } else if (axis == 4) {
+                                tz--;
+                            } else {
+                                tz++;
+                            }
+                            applySingleBlockImpact(
+                                    level,
+                                    job.mutablePos(),
+                                    BlockPos.asLong(tx, ty, tz),
+                                    0.0D,
+                                    source,
+                                    owner,
+                                    thermalHeat,
+                                    true,
+                                    true,
+                                    job.trace()
+                            );
+                            job.thermalImpactApplications++;
+                        }
+                    }
+                }
+            }
+
+            for (int neighborIndex = 0; neighborIndex < KRAKK_STREAMING_WAVE_NEIGHBOR_OFFSETS.length; neighborIndex++) {
+                int[] offset = KRAKK_STREAMING_WAVE_NEIGHBOR_OFFSETS[neighborIndex];
+                int nx = x + offset[0];
+                int ny = y + offset[1];
+                int nz = z + offset[2];
+                if (nx < job.minX() || nx > job.maxX()
+                        || ny < job.minY() || ny > job.maxY()
+                        || nz < job.minZ() || nz > job.maxZ()) {
+                    continue;
+                }
+                double dx = (nx + 0.5D) - job.centerX();
+                double dy = (ny + 0.5D) - job.centerY();
+                double dz = (nz + 0.5D) - job.centerZ();
+                if (((dx * dx) + (dy * dy) + (dz * dz)) > job.radiusSq()) {
+                    continue;
+                }
+                long neighborPosLong = BlockPos.asLong(nx, ny, nz);
+                if (job.normalAccepted().contains(neighborPosLong)) {
+                    continue;
+                }
+                float neighborNormalSlowness = resolveStreamingNormalSlowness(
+                        level,
+                        nx,
+                        ny,
+                        nz,
+                        neighborPosLong,
+                        job.mutablePos(),
+                        job.chunkStateCache(),
+                        job.resistanceCostCache(),
+                        job.normalSlownessByPos(),
+                        null
+                );
+                if (neighborNormalSlowness <= 0.0F) {
+                    continue;
+                }
+                double candidate = currentArrival + (0.5D
+                        * (currentSolveSlowness + resolveStreamingSolveSlowness(neighborNormalSlowness, false))
+                        * KRAKK_STREAMING_WAVE_NEIGHBOR_STEP[neighborIndex]);
+                if (!Double.isFinite(candidate) || candidate > job.maxArrival()) {
+                    continue;
+                }
+                if (candidate + 1.0E-9D < job.normalArrivalByPos().get(neighborPosLong)) {
+                    job.normalArrivalByPos().put(neighborPosLong, (float) candidate);
+                    job.normalQueue().add(neighborPosLong, candidate);
+                }
+            }
+        }
+        return new WavefrontSolveStats(acceptedNodes, poppedNodes);
+    }
+
+    private static double solveKrakkStreamingCellFromAccepted(ServerLevel level,
+                                                              int x,
+                                                              int y,
+                                                              int z,
+                                                              int minX,
+                                                              int maxX,
+                                                              int minY,
+                                                              int maxY,
+                                                              int minZ,
+                                                              int maxZ,
+                                                              boolean shadowSolve,
+                                                              Long2FloatOpenHashMap arrivalByPos,
+                                                              LongOpenHashSet accepted,
+                                                              Long2FloatOpenHashMap normalSlownessByPos,
+                                                              LongOpenHashSet sampledSolidPositions,
+                                                              BlockPos.MutableBlockPos mutablePos,
+                                                              WaveChunkStateCache chunkStateCache,
+                                                              Int2DoubleOpenHashMap resistanceCostCache) {
+        double a = minStreamingAcceptedAxis(
+                arrivalByPos,
+                accepted,
+                x - 1,
+                y,
+                z,
+                x + 1,
+                y,
+                z,
+                minX,
+                maxX,
+                minY,
+                maxY,
+                minZ,
+                maxZ
+        );
+        double b = minStreamingAcceptedAxis(
+                arrivalByPos,
+                accepted,
+                x,
+                y - 1,
+                z,
+                x,
+                y + 1,
+                z,
+                minX,
+                maxX,
+                minY,
+                maxY,
+                minZ,
+                maxZ
+        );
+        double c = minStreamingAcceptedAxis(
+                arrivalByPos,
+                accepted,
+                x,
+                y,
+                z - 1,
+                x,
+                y,
+                z + 1,
+                minX,
+                maxX,
+                minY,
+                maxY,
+                minZ,
+                maxZ
+        );
+        if (!Double.isFinite(a) && !Double.isFinite(b) && !Double.isFinite(c)) {
+            return Double.POSITIVE_INFINITY;
+        }
+        long posLong = BlockPos.asLong(x, y, z);
+        float normalSlowness = resolveStreamingNormalSlowness(
+                level,
+                x,
+                y,
+                z,
+                posLong,
+                mutablePos,
+                chunkStateCache,
+                resistanceCostCache,
+                normalSlownessByPos,
+                sampledSolidPositions
+        );
+        if (normalSlowness <= 0.0F) {
+            return Double.POSITIVE_INFINITY;
+        }
+        double slowness = shadowSolve
+                ? resolveStreamingShadowSlowness(normalSlowness)
+                : normalSlowness;
+        return solveKrakkDistance(a, b, c, slowness);
+    }
+
+    private static double minStreamingAcceptedAxis(Long2FloatOpenHashMap arrivalByPos,
+                                                   LongOpenHashSet accepted,
+                                                   int x1,
+                                                   int y1,
+                                                   int z1,
+                                                   int x2,
+                                                   int y2,
+                                                   int z2,
+                                                   int minX,
+                                                   int maxX,
+                                                   int minY,
+                                                   int maxY,
+                                                   int minZ,
+                                                   int maxZ) {
+        double min = Double.POSITIVE_INFINITY;
+        if (x1 >= minX && x1 <= maxX && y1 >= minY && y1 <= maxY && z1 >= minZ && z1 <= maxZ) {
+            long pos = BlockPos.asLong(x1, y1, z1);
+            if (accepted.contains(pos)) {
+                min = Math.min(min, arrivalByPos.get(pos));
+            }
+        }
+        if (x2 >= minX && x2 <= maxX && y2 >= minY && y2 <= maxY && z2 >= minZ && z2 <= maxZ) {
+            long pos = BlockPos.asLong(x2, y2, z2);
+            if (accepted.contains(pos)) {
+                min = Math.min(min, arrivalByPos.get(pos));
+            }
+        }
+        return min;
+    }
+
+    private static boolean enqueueStreamingSource(long posLong,
+                                                  double arrival,
+                                                  Long2FloatOpenHashMap arrivalByPos,
+                                                  WaveLongMinHeap queue) {
+        if (!Double.isFinite(arrival)) {
+            return false;
+        }
+        double existing = arrivalByPos.get(posLong);
+        boolean isNew = !arrivalByPos.containsKey(posLong);
+        if (arrival + 1.0E-9D < existing) {
+            arrivalByPos.put(posLong, (float) arrival);
+            queue.add(posLong, arrival);
+            return isNew;
+        }
+        return false;
+    }
+
+    private static float resolveStreamingNormalSlowness(ServerLevel level,
+                                                        int x,
+                                                        int y,
+                                                        int z,
+                                                        long posLong,
+                                                        BlockPos.MutableBlockPos mutablePos,
+                                                        WaveChunkStateCache chunkStateCache,
+                                                        Int2DoubleOpenHashMap resistanceCostCache,
+                                                        Long2FloatOpenHashMap normalSlownessByPos,
+                                                        LongOpenHashSet sampledSolidPositions) {
+        float cached = normalSlownessByPos.get(posLong);
+        if (Float.isFinite(cached)) {
+            return cached;
+        }
+        BlockState blockState = chunkStateCache.getBlockState(level, mutablePos, x, y, z);
+        float resolvedSlowness = (float) KRAKK_AIR_SLOWNESS;
+        if (!blockState.isAir()) {
+            double resistanceCost = getCachedResistanceCost(resistanceCostCache, blockState);
+            double resistanceNoise = sampleBlockResistanceNoise(x, y, z) * KRAKK_BLOCK_RESISTANCE_NOISE_MAX;
+            resolvedSlowness = (float) (KRAKK_AIR_SLOWNESS + ((resistanceCost + resistanceNoise) * KRAKK_SOLID_SLOWNESS_SCALE));
+            if (sampledSolidPositions != null) {
+                sampledSolidPositions.add(posLong);
+            }
+        }
+        normalSlownessByPos.put(posLong, resolvedSlowness);
+        return resolvedSlowness;
+    }
+
+    private static double sampleBlockResistanceNoise(int x, int y, int z) {
+        long hash = 0x6C62272E07BB0142L;
+        hash ^= ((long) x) * 0x9E3779B97F4A7C15L;
+        hash ^= ((long) y) * 0xC2B2AE3D27D4EB4FL;
+        hash ^= ((long) z) * 0x165667B19E3779F9L;
+        hash ^= (hash >>> 33);
+        hash *= 0xFF51AFD7ED558CCDL;
+        hash ^= (hash >>> 33);
+        hash *= 0xC4CEB9FE1A85EC53L;
+        hash ^= (hash >>> 33);
+        return ((hash >>> 11) & 0x1FFFFFL) / 2097151.0D;
+    }
+
+    private static float resolveStreamingShadowSlowness(float normalSlowness) {
+        float airSlowness = (float) KRAKK_AIR_SLOWNESS;
+        float overrun = Math.max(0.0F, normalSlowness - airSlowness);
+        return (float) (airSlowness + (overrun * KRAKK_SHADOW_SOLID_SLOWNESS_SCALE));
+    }
+
+    private static double resolveStreamingSolveSlowness(float normalSlowness, boolean shadowSolve) {
+        if (!shadowSolve) {
+            return normalSlowness;
+        }
+        return resolveStreamingShadowSlowness(normalSlowness);
+    }
+
+    private static void applyStructuralCollapseSparse(ServerLevel level,
+                                                      double centerX,
+                                                      double centerY,
+                                                      double centerZ,
+                                                      double radiusSq,
+                                                      LongArrayList targetPositions,
+                                                      Long2FloatOpenHashMap collapseWeightsByPos,
+                                                      double impactBudget,
+                                                      double normalizationWeight,
+                                                      Entity source,
+                                                      LivingEntity owner,
+                                                      boolean applyWorldChanges,
+                                                      ExplosionProfileTrace trace) {
+        if (!applyWorldChanges && trace == null) {
+            return;
+        }
+        if (targetPositions.isEmpty()
+                || collapseWeightsByPos == null
+                || collapseWeightsByPos.isEmpty()
+                || impactBudget <= MIN_RESOLVED_RAY_IMPACT
+                || normalizationWeight <= VOLUMETRIC_MIN_ENERGY) {
+            return;
+        }
+
+        long collapseSeedStart = trace != null ? System.nanoTime() : 0L;
+        LongOpenHashSet collapseCandidates = new LongOpenHashSet(Math.max(16, targetPositions.size() * 2));
+        for (int i = 0; i < targetPositions.size(); i++) {
+            long posLong = targetPositions.getLong(i);
+            if (collapseWeightsByPos.get(posLong) > VOLUMETRIC_MIN_ENERGY) {
+                collapseCandidates.add(posLong);
+            }
+        }
+        if (collapseCandidates.isEmpty()) {
+            return;
+        }
+
+        LongOpenHashSet supported = new LongOpenHashSet(Math.max(16, collapseCandidates.size() / 2));
+        LongArrayList bfsQueue = new LongArrayList(Math.max(16, collapseCandidates.size() / 4));
+        for (LongIterator iterator = collapseCandidates.iterator(); iterator.hasNext(); ) {
+            long posLong = iterator.nextLong();
+            if (!isSparseCollapseBoundary(posLong, collapseCandidates, centerX, centerY, centerZ, radiusSq)) {
+                continue;
+            }
+            if (supported.add(posLong)) {
+                bfsQueue.add(posLong);
+            }
+        }
+        if (trace != null) {
+            trace.volumetricImpactApplyCollapseSeedNanos += (System.nanoTime() - collapseSeedStart);
+        }
+
+        long collapseBfsStart = trace != null ? System.nanoTime() : 0L;
+        for (int head = 0; head < bfsQueue.size(); head++) {
+            long posLong = bfsQueue.getLong(head);
+            int x = BlockPos.getX(posLong);
+            int y = BlockPos.getY(posLong);
+            int z = BlockPos.getZ(posLong);
+            for (int axis = 0; axis < 6; axis++) {
+                int nx = x;
+                int ny = y;
+                int nz = z;
+                if (axis == 0) {
+                    nx = x - 1;
+                } else if (axis == 1) {
+                    nx = x + 1;
+                } else if (axis == 2) {
+                    ny = y - 1;
+                } else if (axis == 3) {
+                    ny = y + 1;
+                } else if (axis == 4) {
+                    nz = z - 1;
+                } else {
+                    nz = z + 1;
+                }
+                long neighborPosLong = BlockPos.asLong(nx, ny, nz);
+                if (!collapseCandidates.contains(neighborPosLong)) {
+                    continue;
+                }
+                if (supported.add(neighborPosLong)) {
+                    bfsQueue.add(neighborPosLong);
+                }
+            }
+        }
+        if (trace != null) {
+            trace.volumetricImpactApplyCollapseBfsNanos += (System.nanoTime() - collapseBfsStart);
+        }
+
+        if (supported.size() >= collapseCandidates.size()) {
+            return;
+        }
+
+        double collapseImpactScale = (impactBudget / normalizationWeight) * STRUCTURAL_COLLAPSE_IMPACT_WEIGHT_SCALE;
+        long collapseApplyStart = trace != null ? System.nanoTime() : 0L;
+        BlockPos.MutableBlockPos collapsePos = new BlockPos.MutableBlockPos();
+        for (LongIterator iterator = collapseCandidates.iterator(); iterator.hasNext(); ) {
+            long posLong = iterator.nextLong();
+            if (supported.contains(posLong)) {
+                continue;
+            }
+            float collapseWeight = collapseWeightsByPos.get(posLong);
+            if (collapseWeight <= VOLUMETRIC_MIN_ENERGY) {
+                continue;
+            }
+            double collapseImpactPower = collapseImpactScale * collapseWeight;
+            if (collapseImpactPower <= MIN_RESOLVED_RAY_IMPACT) {
+                continue;
+            }
+            applySingleBlockImpact(
+                    level,
+                    collapsePos,
+                    posLong,
+                    collapseImpactPower,
+                    source,
+                    owner,
+                    KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS,
+                    false,
+                    applyWorldChanges,
+                    trace
+            );
+        }
+        if (trace != null) {
+            trace.volumetricImpactApplyCollapseApplyNanos += (System.nanoTime() - collapseApplyStart);
+        }
+    }
+
+    private static boolean isSparseCollapseBoundary(long posLong,
+                                                    LongOpenHashSet candidates,
+                                                    double centerX,
+                                                    double centerY,
+                                                    double centerZ,
+                                                    double radiusSq) {
+        int x = BlockPos.getX(posLong);
+        int y = BlockPos.getY(posLong);
+        int z = BlockPos.getZ(posLong);
+        double dx = (x + 0.5D) - centerX;
+        double dy = (y + 0.5D) - centerY;
+        double dz = (z + 0.5D) - centerZ;
+        if ((dx * dx) + (dy * dy) + (dz * dz) >= Math.max(0.0D, radiusSq - KRAKK_STREAMING_RADIUS_BOUNDARY_EPSILON)) {
+            return true;
+        }
+        if (!candidates.contains(BlockPos.asLong(x + 1, y, z))) {
+            return true;
+        }
+        if (!candidates.contains(BlockPos.asLong(x - 1, y, z))) {
+            return true;
+        }
+        if (!candidates.contains(BlockPos.asLong(x, y + 1, z))) {
+            return true;
+        }
+        if (!candidates.contains(BlockPos.asLong(x, y - 1, z))) {
+            return true;
+        }
+        if (!candidates.contains(BlockPos.asLong(x, y, z + 1))) {
+            return true;
+        }
+        return !candidates.contains(BlockPos.asLong(x, y, z - 1));
+    }
+
+    private static void logKrakkPhaseTiming(long traceId, String phase, long elapsedNanos, String detail) {
+        if (!krakkPhaseTimingLoggingEnabled) {
+            return;
+        }
+        LOGGER.info(
+                "Krakk phase trace #{} [{}] dtMs={} detail={} heap={}",
+                traceId,
+                phase,
+                nanosToMillis(elapsedNanos),
+                detail,
+                formatKrakkHeapSnapshot()
+        );
+    }
+
+    private static double nanosToMillis(long nanos) {
+        return nanos / 1_000_000.0D;
+    }
+
+    private static String formatKrakkHeapSnapshot() {
+        Runtime runtime = Runtime.getRuntime();
+        long total = runtime.totalMemory();
+        long free = runtime.freeMemory();
+        long max = runtime.maxMemory();
+        long used = Math.max(0L, total - free);
+        return String.format(
+                "usedMiB=%.1f totalMiB=%.1f maxMiB=%.1f",
+                used / 1048576.0D,
+                total / 1048576.0D,
+                max / 1048576.0D
+        );
+    }
+
+    private static boolean hasThermalEffect(double impactHeatCelsius) {
+        return Math.abs(impactHeatCelsius - KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS) > 1.0E-6D;
+    }
+
+    private static ThermalTargetShape buildThermalTargetShape(LongArrayList targetPositions, FloatArrayList targetWeights) {
+        Long2FloatOpenHashMap weightsByPos = new Long2FloatOpenHashMap(Math.max(16, targetPositions.size() * 2));
+        weightsByPos.defaultReturnValue(0.0F);
+        for (int i = 0; i < targetPositions.size(); i++) {
+            long posLong = targetPositions.getLong(i);
+            float weight = targetWeights.getFloat(i);
+            if (weight <= 0.0F) {
+                continue;
+            }
+            mergeThermalTargetWeight(weightsByPos, posLong, weight);
+            for (Direction direction : THERMAL_EXPAND_DIRECTIONS) {
+                long neighborPosLong = BlockPos.asLong(
+                        BlockPos.getX(posLong) + (int) direction.x(),
+                        BlockPos.getY(posLong) + (int) direction.y(),
+                        BlockPos.getZ(posLong) + (int) direction.z()
+                );
+                mergeThermalTargetWeight(weightsByPos, neighborPosLong, weight * 0.75F);
+            }
+        }
+
+        LongArrayList positions = new LongArrayList(weightsByPos.size());
+        for (LongIterator iterator = weightsByPos.keySet().iterator(); iterator.hasNext(); ) {
+            positions.add(iterator.nextLong());
+        }
+        return new ThermalTargetShape(positions, weightsByPos);
+    }
+
+    private static double computeHeatFalloff(double impactHeatCelsius, double targetWeight, double radius) {
+        return impactHeatCelsius;
+    }
+
+    private static void mergeThermalTargetWeight(Long2FloatOpenHashMap weightsByPos, long posLong, float weight) {
+        if (weight <= 0.0F) {
+            return;
+        }
+        float existing = weightsByPos.get(posLong);
+        if (weight > existing) {
+            weightsByPos.put(posLong, weight);
+        }
+    }
+
+    private static long mixOrderingSeed(double centerX, double centerY, double centerZ, double impactHeatCelsius, int size) {
+        long seed = Double.doubleToLongBits(centerX * 31.0D);
+        seed = (seed * 31L) ^ Double.doubleToLongBits(centerY * 17.0D);
+        seed = (seed * 31L) ^ Double.doubleToLongBits(centerZ * 13.0D);
+        seed = (seed * 31L) ^ Double.doubleToLongBits(impactHeatCelsius);
+        seed = (seed * 31L) ^ size;
+        return seed;
+    }
+
+    private static int computePermutationStart(long seed, int size) {
+        if (size <= 1) {
+            return 0;
+        }
+        int start = (int) Math.floorMod(seed, size);
+        return Math.max(0, Math.min(size - 1, start));
+    }
+
+    private static int computePermutationStep(long seed, int size) {
+        if (size <= 1) {
+            return 1;
+        }
+        int step = (int) Math.floorMod(seed >>> 17, size);
+        if (step <= 0) {
+            step = 1;
+        }
+        while (greatestCommonDivisor(step, size) != 1) {
+            step++;
+            if (step >= size) {
+                step = 1;
+            }
+        }
+        return step;
+    }
+
+    private static int greatestCommonDivisor(int left, int right) {
+        int a = Math.abs(left);
+        int b = Math.abs(right);
+        while (b != 0) {
+            int temp = a % b;
+            a = b;
+            b = temp;
+        }
+        return Math.max(1, a);
     }
 
     private static KrakkField buildKrakkField(ServerLevel level,
@@ -756,27 +3886,32 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     sizeZ,
                     0,
                     new BitSet(1),
-                    new float[1],
-                    new LongArrayList(),
-                    new int[0],
-                    new int[0],
-                    new int[0],
-                    new int[0],
-                    new int[0],
-                    new int[0],
-                    new int[0],
-                    new int[0],
+                    createKrakkSlownessStorage(1),
+                    EmptyLongIndexedAccess.INSTANCE,
                     new int[0]
             );
         }
         int volume = (int) volumeLong;
-        BitSet activeMask = new BitSet(volume);
-        float[] slowness = new float[Math.max(1, volume)];
-        LongArrayList solidPositions = new LongArrayList(Math.max(64, volume / 8));
+        MutableFloatIndexedAccess slowness = createKrakkSlownessStorage(Math.max(1, volume));
+        BitSet activeMask = tracksActiveMaskInSlowness(slowness)
+                ? ((SparseAirSolidSlownessStorage) slowness).activeMask()
+                : new BitSet(volume);
+        PackedKrakkSolidPositions solidPositions = new PackedKrakkSolidPositions(
+                minX,
+                minY,
+                minZ,
+                sizeY,
+                sizeZ,
+                estimateKrakkSolidPositionsCapacity(volume)
+        );
         int rowCount = sizeX * sizeY;
         int[] activeCountByRow = new int[Math.max(1, rowCount)];
         int sampledVoxelCount;
         int resistanceTaskCount = resolveResistanceFieldTaskCount(sizeX, sizeY, sizeZ);
+        if (requiresSerializedFloatAccess(slowness)) {
+            resistanceTaskCount = 1;
+        }
+        boolean rebuildActiveMaskFromSlowness = false;
         if (resistanceTaskCount <= 1 || VOLUMETRIC_TARGET_SCAN_POOL == null) {
             KrakkResistanceFieldChunkResult chunkResult = sampleKrakkFieldChunk(
                     level,
@@ -792,13 +3927,14 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     0,
                     sizeX,
                     slowness,
+                    activeMask,
                     activeCountByRow,
                     resistanceCostCache
             );
             sampledVoxelCount = chunkResult.sampledVoxelCount();
-            LongArrayList chunkPositions = chunkResult.solidPositions();
+            IntArrayList chunkPositions = chunkResult.solidIndices();
             for (int i = 0; i < chunkPositions.size(); i++) {
-                solidPositions.add(chunkPositions.getLong(i));
+                solidPositions.addIndex(chunkPositions.getInt(i));
             }
         } else {
             ResistanceFieldSnapshot resistanceFieldSnapshot = sampleResistanceFieldSnapshot(
@@ -835,6 +3971,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                 chunkStartX,
                                 chunkEndX,
                                 slowness,
+                                null,
                                 activeCountByRow,
                                 null
                         )
@@ -847,9 +3984,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 for (Future<KrakkResistanceFieldChunkResult> future : futures) {
                     KrakkResistanceFieldChunkResult chunkResult = future.get();
                     sampledCountAccumulator += chunkResult.sampledVoxelCount();
-                    LongArrayList chunkPositions = chunkResult.solidPositions();
+                    IntArrayList chunkPositions = chunkResult.solidIndices();
                     for (int i = 0; i < chunkPositions.size(); i++) {
-                        solidPositions.add(chunkPositions.getLong(i));
+                        solidPositions.addIndex(chunkPositions.getInt(i));
                     }
                 }
             } catch (InterruptedException exception) {
@@ -862,7 +3999,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             }
 
             if (mergeFailed) {
-                Arrays.fill(slowness, 0.0F);
+                slowness.fill(0.0F);
+                activeMask.clear();
                 Arrays.fill(activeCountByRow, 0);
                 solidPositions.clear();
                 KrakkResistanceFieldChunkResult fallback = sampleKrakkFieldChunk(
@@ -875,99 +4013,39 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                         0,
                         sizeX,
                         slowness,
+                        activeMask,
                         activeCountByRow,
                         resistanceCostCache
                 );
                 sampledVoxelCount = fallback.sampledVoxelCount();
-                LongArrayList chunkPositions = fallback.solidPositions();
+                IntArrayList chunkPositions = fallback.solidIndices();
                 for (int i = 0; i < chunkPositions.size(); i++) {
-                    solidPositions.add(chunkPositions.getLong(i));
+                    solidPositions.addIndex(chunkPositions.getInt(i));
                 }
             } else {
                 sampledVoxelCount = sampledCountAccumulator;
+                rebuildActiveMaskFromSlowness = true;
             }
         }
 
-        int[] activeRowOffsets = new int[Math.max(1, rowCount)];
-        int totalActiveIndices = 0;
-        for (int rowIndex = 0; rowIndex < rowCount; rowIndex++) {
-            activeRowOffsets[rowIndex] = totalActiveIndices;
-            totalActiveIndices += activeCountByRow[rowIndex];
-        }
-        int[] activeRowIndices = new int[Math.max(1, totalActiveIndices)];
-        int[] writeCursorByRow = Arrays.copyOf(activeRowOffsets, activeRowOffsets.length);
-        int strideX = sizeY * sizeZ;
-        int strideY = sizeZ;
-        for (int xOffset = 0; xOffset < sizeX; xOffset++) {
-            int baseX = xOffset * strideX;
-            for (int yOffset = 0; yOffset < sizeY; yOffset++) {
-                int rowIndex = krakkRowIndex(xOffset, yOffset, sizeY);
-                int base = baseX + (yOffset * strideY);
-                for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
-                    int index = base + zOffset;
-                    if (slowness[index] <= 0.0F) {
-                        continue;
+        if (rebuildActiveMaskFromSlowness) {
+            int strideX = sizeY * sizeZ;
+            int strideY = sizeZ;
+            for (int xOffset = 0; xOffset < sizeX; xOffset++) {
+                int baseX = xOffset * strideX;
+                for (int yOffset = 0; yOffset < sizeY; yOffset++) {
+                    int base = baseX + (yOffset * strideY);
+                    for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
+                        int index = base + zOffset;
+                        if (slowness.getFloat(index) <= 0.0F) {
+                            continue;
+                        }
+                        activeMask.set(index);
                     }
-                    activeMask.set(index);
-                    activeRowIndices[writeCursorByRow[rowIndex]++] = index;
                 }
             }
         }
 
-        int[] neighborNegX = new int[Math.max(1, volume)];
-        int[] neighborPosX = new int[Math.max(1, volume)];
-        int[] neighborNegY = new int[Math.max(1, volume)];
-        int[] neighborPosY = new int[Math.max(1, volume)];
-        int[] neighborNegZ = new int[Math.max(1, volume)];
-        int[] neighborPosZ = new int[Math.max(1, volume)];
-        Arrays.fill(neighborNegX, -1);
-        Arrays.fill(neighborPosX, -1);
-        Arrays.fill(neighborNegY, -1);
-        Arrays.fill(neighborPosY, -1);
-        Arrays.fill(neighborNegZ, -1);
-        Arrays.fill(neighborPosZ, -1);
-        for (int index = activeMask.nextSetBit(0); index >= 0; index = activeMask.nextSetBit(index + 1)) {
-            int xOffset = index / strideX;
-            int yz = index - (xOffset * strideX);
-            int yOffset = yz / strideY;
-            int zOffset = yz - (yOffset * strideY);
-            if (xOffset > 0) {
-                int neighbor = index - strideX;
-                if (activeMask.get(neighbor)) {
-                    neighborNegX[index] = neighbor;
-                }
-            }
-            if (xOffset + 1 < sizeX) {
-                int neighbor = index + strideX;
-                if (activeMask.get(neighbor)) {
-                    neighborPosX[index] = neighbor;
-                }
-            }
-            if (yOffset > 0) {
-                int neighbor = index - strideY;
-                if (activeMask.get(neighbor)) {
-                    neighborNegY[index] = neighbor;
-                }
-            }
-            if (yOffset + 1 < sizeY) {
-                int neighbor = index + strideY;
-                if (activeMask.get(neighbor)) {
-                    neighborPosY[index] = neighbor;
-                }
-            }
-            if (zOffset > 0) {
-                int neighbor = index - 1;
-                if (activeMask.get(neighbor)) {
-                    neighborNegZ[index] = neighbor;
-                }
-            }
-            if (zOffset + 1 < sizeZ) {
-                int neighbor = index + 1;
-                if (activeMask.get(neighbor)) {
-                    neighborPosZ[index] = neighbor;
-                }
-            }
-        }
         return new KrakkField(
                 minX,
                 minY,
@@ -979,15 +4057,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 activeMask,
                 slowness,
                 solidPositions,
-                activeRowOffsets,
-                activeCountByRow,
-                activeRowIndices,
-                neighborNegX,
-                neighborPosX,
-                neighborNegY,
-                neighborPosY,
-                neighborNegZ,
-                neighborPosZ
+                activeCountByRow
         );
     }
 
@@ -997,20 +4067,18 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                                                         double resolvedRadius,
                                                                                         KrakkField krakkField,
                                                                                         boolean collectMetrics) {
-        LongArrayList solidPositions = krakkField.solidPositions();
-        Long2FloatOpenHashMap empty = new Long2FloatOpenHashMap(16);
-        empty.defaultReturnValue(Float.NaN);
-        if (solidPositions.isEmpty()) {
-            return new KrakkVolumetricBaselineResult(empty, 0L, 0L, 0L, 0L, 0L, 0, 0);
-        }
-
-        float[] fieldSlowness = krakkField.slowness();
+        LongIndexedAccess solidPositions = krakkField.solidPositions();
         int fieldMinX = krakkField.minX();
         int fieldMinY = krakkField.minY();
         int fieldMinZ = krakkField.minZ();
         int fieldSizeX = krakkField.sizeX();
         int fieldSizeY = krakkField.sizeY();
         int fieldSizeZ = krakkField.sizeZ();
+        if (solidPositions.isEmpty()) {
+            return new KrakkVolumetricBaselineResult(new float[0], 0L, 0L, 0L, 0L, 0L, 0, 0);
+        }
+
+        FloatIndexedAccess fieldSlowness = krakkField.slowness();
         float airSlowness = (float) KRAKK_AIR_SLOWNESS;
         float resistanceScaleInv = (float) (1.0D / Math.max(1.0E-6D, KRAKK_SOLID_SLOWNESS_SCALE));
 
@@ -1060,7 +4128,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                         && sampleZOffset >= 0
                         && sampleZOffset < fieldSizeZ) {
                     int sampleIndex = krakkGridIndex(sampleXOffset, sampleYOffset, sampleZOffset, fieldSizeY, fieldSizeZ);
-                    float sampleSlowness = fieldSlowness[sampleIndex];
+                    float sampleSlowness = fieldSlowness.getFloat(sampleIndex);
                     if (sampleSlowness > airSlowness) {
                         sampleResistance = (sampleSlowness - airSlowness) * resistanceScaleInv;
                     }
@@ -1131,16 +4199,23 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
         LongArrayList targetPositions = targetScanResult.targetPositions();
         FloatArrayList targetWeights = targetScanResult.targetWeights();
-        Long2FloatOpenHashMap baselineByPos = new Long2FloatOpenHashMap(Math.max(64, (int) Math.ceil(targetPositions.size() / 0.75D)));
-        baselineByPos.defaultReturnValue(Float.NaN);
+        int totalFieldSize = fieldSizeX * fieldSizeY * fieldSizeZ;
+        float[] baselineByIndex = new float[totalFieldSize];
+        Arrays.fill(baselineByIndex, Float.NaN);
         for (int i = 0; i < targetPositions.size(); i++) {
-            baselineByPos.put(targetPositions.getLong(i), targetWeights.getFloat(i));
+            long posLong = targetPositions.getLong(i);
+            int bx = BlockPos.getX(posLong);
+            int by = BlockPos.getY(posLong);
+            int bz = BlockPos.getZ(posLong);
+            baselineByIndex[krakkGridIndex(bx - fieldMinX, by - fieldMinY, bz - fieldMinZ, fieldSizeY, fieldSizeZ)] =
+                    targetWeights.getFloat(i);
         }
-        Long2FloatOpenHashMap smoothed = KRAKK_ENABLE_VOLUMETRIC_BASELINE_SMOOTHING
-                ? smoothKrakkVolumetricMechanics(baselineByPos, solidPositions)
-                : baselineByPos;
+        float[] smoothedByIndex = KRAKK_ENABLE_VOLUMETRIC_BASELINE_SMOOTHING
+                ? smoothKrakkVolumetricMechanics(baselineByIndex, fieldSizeX, fieldSizeY, fieldSizeZ,
+                                                 solidPositions, fieldMinX, fieldMinY, fieldMinZ)
+                : baselineByIndex;
         return new KrakkVolumetricBaselineResult(
-                smoothed,
+                smoothedByIndex,
                 directionSetupNanos,
                 pressureSolveNanos,
                 targetScanNanos,
@@ -1151,55 +4226,60 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         );
     }
 
-    private static Long2FloatOpenHashMap smoothKrakkVolumetricMechanics(Long2FloatOpenHashMap pressureByPos,
-                                                                          LongArrayList solidPositions) {
-        Long2FloatOpenHashMap smoothed = new Long2FloatOpenHashMap(Math.max(64, (int) Math.ceil(pressureByPos.size() / 0.75D)));
-        smoothed.defaultReturnValue(Float.NaN);
+    private static float[] smoothKrakkVolumetricMechanics(float[] baselineByIndex,
+                                                            int fieldSizeX,
+                                                            int fieldSizeY,
+                                                            int fieldSizeZ,
+                                                            LongIndexedAccess solidPositions,
+                                                            int fieldMinX,
+                                                            int fieldMinY,
+                                                            int fieldMinZ) {
+        float[] smoothed = new float[baselineByIndex.length];
+        Arrays.fill(smoothed, Float.NaN);
+        int strideX = fieldSizeY * fieldSizeZ;
+        int strideY = fieldSizeZ;
         double selfWeight = Mth.clamp(KRAKK_VOLUMETRIC_MECHANICS_SELF_SMOOTH, 0.0D, 1.0D);
         for (int i = 0; i < solidPositions.size(); i++) {
             long posLong = solidPositions.getLong(i);
-            float self = pressureByPos.get(posLong);
-            if (!Float.isFinite(self)) {
-                continue;
-            }
             int x = BlockPos.getX(posLong);
             int y = BlockPos.getY(posLong);
             int z = BlockPos.getZ(posLong);
+            int ix = x - fieldMinX;
+            int iy = y - fieldMinY;
+            int iz = z - fieldMinZ;
+            int gridIdx = krakkGridIndex(ix, iy, iz, fieldSizeY, fieldSizeZ);
+            float self = baselineByIndex[gridIdx];
+            if (!Float.isFinite(self)) {
+                continue;
+            }
             double neighborSum = 0.0D;
             int neighborCount = 0;
-            float px = pressureByPos.get(BlockPos.asLong(x + 1, y, z));
-            if (Float.isFinite(px)) {
-                neighborSum += px;
-                neighborCount++;
+            if (ix + 1 < fieldSizeX) {
+                float v = baselineByIndex[gridIdx + strideX];
+                if (Float.isFinite(v)) { neighborSum += v; neighborCount++; }
             }
-            float nx = pressureByPos.get(BlockPos.asLong(x - 1, y, z));
-            if (Float.isFinite(nx)) {
-                neighborSum += nx;
-                neighborCount++;
+            if (ix > 0) {
+                float v = baselineByIndex[gridIdx - strideX];
+                if (Float.isFinite(v)) { neighborSum += v; neighborCount++; }
             }
-            float py = pressureByPos.get(BlockPos.asLong(x, y + 1, z));
-            if (Float.isFinite(py)) {
-                neighborSum += py;
-                neighborCount++;
+            if (iy + 1 < fieldSizeY) {
+                float v = baselineByIndex[gridIdx + strideY];
+                if (Float.isFinite(v)) { neighborSum += v; neighborCount++; }
             }
-            float ny = pressureByPos.get(BlockPos.asLong(x, y - 1, z));
-            if (Float.isFinite(ny)) {
-                neighborSum += ny;
-                neighborCount++;
+            if (iy > 0) {
+                float v = baselineByIndex[gridIdx - strideY];
+                if (Float.isFinite(v)) { neighborSum += v; neighborCount++; }
             }
-            float pz = pressureByPos.get(BlockPos.asLong(x, y, z + 1));
-            if (Float.isFinite(pz)) {
-                neighborSum += pz;
-                neighborCount++;
+            if (iz + 1 < fieldSizeZ) {
+                float v = baselineByIndex[gridIdx + 1];
+                if (Float.isFinite(v)) { neighborSum += v; neighborCount++; }
             }
-            float nz = pressureByPos.get(BlockPos.asLong(x, y, z - 1));
-            if (Float.isFinite(nz)) {
-                neighborSum += nz;
-                neighborCount++;
+            if (iz > 0) {
+                float v = baselineByIndex[gridIdx - 1];
+                if (Float.isFinite(v)) { neighborSum += v; neighborCount++; }
             }
             double neighborAverage = neighborCount > 0 ? (neighborSum / neighborCount) : self;
-            double value = (self * selfWeight) + (neighborAverage * (1.0D - selfWeight));
-            smoothed.put(posLong, (float) Mth.clamp(value, 0.0D, 1.0D));
+            smoothed[gridIdx] = (float) Mth.clamp((self * selfWeight) + (neighborAverage * (1.0D - selfWeight)), 0.0D, 1.0D);
         }
         return smoothed;
     }
@@ -1226,14 +4306,98 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return Math.sqrt((dx * dx) + (dy * dy) + (dz * dz)) * KRAKK_AIR_SLOWNESS;
     }
 
-    private static float[] buildKrakkBaselineByIndex(LongArrayList solidPositions,
-                                                       Long2FloatOpenHashMap volumetricBaselineByPos) {
-        int solidCount = solidPositions.size();
-        float[] volumetricBaselineByIndex = new float[solidCount];
-        for (int i = 0; i < solidCount; i++) {
-            volumetricBaselineByIndex[i] = volumetricBaselineByPos.get(solidPositions.getLong(i));
+    private static double computeStreamingMetricKrakkAirArrival(double centerX,
+                                                                double centerY,
+                                                                double centerZ,
+                                                                int x,
+                                                                int y,
+                                                                int z) {
+        double dx = Math.abs((x + 0.5D) - centerX);
+        double dy = Math.abs((y + 0.5D) - centerY);
+        double dz = Math.abs((z + 0.5D) - centerZ);
+        double min = Math.min(dx, Math.min(dy, dz));
+        double max = Math.max(dx, Math.max(dy, dz));
+        double mid = (dx + dy + dz) - min - max;
+        double diagonal3 = min;
+        double diagonal2 = Math.max(0.0D, mid - min);
+        double axial = Math.max(0.0D, max - mid);
+        return ((diagonal3 * KRAKK_STREAMING_STEP_DIAGONAL_3D)
+                + (diagonal2 * KRAKK_STREAMING_STEP_DIAGONAL_2D)
+                + axial) * KRAKK_AIR_SLOWNESS;
+    }
+
+    private static int[][] buildKrakkStreamingWaveNeighborOffsets() {
+        int[][] offsets = new int[26][3];
+        int cursor = 0;
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    if (dx == 0 && dy == 0 && dz == 0) {
+                        continue;
+                    }
+                    offsets[cursor][0] = dx;
+                    offsets[cursor][1] = dy;
+                    offsets[cursor][2] = dz;
+                    cursor++;
+                }
+            }
         }
-        return volumetricBaselineByIndex;
+        return offsets;
+    }
+
+    private static double[] buildKrakkStreamingWaveNeighborStepLengths(int[][] offsets) {
+        double[] stepLengths = new double[offsets.length];
+        for (int i = 0; i < offsets.length; i++) {
+            int[] offset = offsets[i];
+            stepLengths[i] = Math.sqrt(
+                    (offset[0] * offset[0])
+                            + (offset[1] * offset[1])
+                            + (offset[2] * offset[2])
+            );
+        }
+        return stepLengths;
+    }
+
+    private static StreamingImpactSample resolveStreamingShellImpactSample(StreamingWavefrontJob job,
+                                                                           double arrival,
+                                                                           double shadowArrival,
+                                                                           int x,
+                                                                           int y,
+                                                                           int z) {
+        double airArrival = computeAnalyticKrakkAirArrival(job.centerX(), job.centerY(), job.centerZ(), x, y, z);
+        if (!Double.isFinite(airArrival) || airArrival > job.resolvedRadius()) {
+            return StreamingImpactSample.NONE;
+        }
+        double normalized = 1.0D - (airArrival / Math.max(1.0E-6D, job.resolvedRadius()));
+        if (normalized <= 0.0D) {
+            return StreamingImpactSample.NONE;
+        }
+
+        double resistanceOverrun = Math.max(0.0D, arrival - airArrival);
+        double effectiveOverrun = Math.max(0.0D, resistanceOverrun - KRAKK_OVERRUN_DEADZONE);
+        double transmittance = Math.exp(-(effectiveOverrun * 0.12D));
+
+        double shadowOverrun = Math.max(0.0D, shadowArrival - arrival);
+        double effectiveShadowOverrun = Math.max(0.0D, shadowOverrun - KRAKK_SHADOW_OVERRUN_DEADZONE);
+        double shadowTransmittance = Math.exp(-(effectiveShadowOverrun * 0.18D));
+
+        double transmittanceWeight = Mth.clamp(transmittance * shadowTransmittance, 0.08D, 1.0D);
+        double radialWeight = Math.pow(Mth.clamp(normalized, 0.0D, 1.0D), 0.80D);
+        double sampledWeight = transmittanceWeight * radialWeight;
+        if (sampledWeight <= 1.0E-8D) {
+            return StreamingImpactSample.NONE;
+        }
+
+        double shellRadius = Math.max(1.0D, airArrival);
+        double shellArea = Math.max(
+                KRAKK_STREAMING_SHELL_MIN_AREA,
+                4.0D * Math.PI * shellRadius * shellRadius
+        );
+        double impactPower = (job.impactBudget * sampledWeight) / (shellArea * KRAKK_STREAMING_SHELL_IMPACT_NORMALIZATION);
+        if (!Double.isFinite(impactPower) || impactPower <= MIN_RESOLVED_RAY_IMPACT) {
+            return StreamingImpactSample.NONE;
+        }
+        return new StreamingImpactSample(impactPower, sampledWeight);
     }
 
     private static KrakkSolveResult solveKrakkArrivalTimes(KrakkField field,
@@ -1242,11 +4406,11 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                                double centerZ,
                                                                float uniformSlownessOverride,
                                                                float solidSlownessScale) {
-        float[] arrivalTimes = new float[field.slowness().length];
-        Arrays.fill(arrivalTimes, Float.POSITIVE_INFINITY);
+        MutableFloatIndexedAccess arrivalTimes = createKrakkArrivalStorage(field.slowness().size());
+        arrivalTimes.fill(Float.POSITIVE_INFINITY);
         BitSet traversableMask = field.activeMask();
-        float[] resolvedSlowness = resolveKrakkSlownessField(field, uniformSlownessOverride, solidSlownessScale);
-        BitSet sourceMask = new BitSet(arrivalTimes.length);
+        FloatIndexedAccess resolvedSlowness = resolveKrakkSlownessField(field, uniformSlownessOverride, solidSlownessScale);
+        SourceIndexSet sourceMask = createSourceIndexSet(arrivalTimes.size());
         int sourceCount = initializeKrakkSources(
                 arrivalTimes,
                 sourceMask,
@@ -1274,10 +4438,22 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                                            float uniformSlownessOverride,
                                                                            float normalSolidSlownessScale,
                                                                            float shadowSolidSlownessScale) {
-        float[] normalArrivalTimes = new float[field.slowness().length];
-        float[] shadowArrivalTimes = new float[field.slowness().length];
-        Arrays.fill(normalArrivalTimes, Float.POSITIVE_INFINITY);
-        Arrays.fill(shadowArrivalTimes, Float.POSITIVE_INFINITY);
+        if (field.slowness().size() > KRAKK_SHADOW_SOLVE_MAX_VOLUME) {
+            KrakkSolveResult normalSolveResult = solveKrakkArrivalTimes(
+                    field,
+                    centerX,
+                    centerY,
+                    centerZ,
+                    uniformSlownessOverride,
+                    normalSolidSlownessScale
+            );
+            return new PairedKrakkSolveResult(normalSolveResult, normalSolveResult);
+        }
+
+        MutableFloatIndexedAccess normalArrivalTimes = createKrakkArrivalStorage(field.slowness().size());
+        MutableFloatIndexedAccess shadowArrivalTimes = createKrakkArrivalStorage(field.slowness().size());
+        normalArrivalTimes.fill(Float.POSITIVE_INFINITY);
+        shadowArrivalTimes.fill(Float.POSITIVE_INFINITY);
         BitSet traversableMask = field.activeMask();
         PairedKrakkSlownessResult slownessResult = resolvePairedKrakkSlownessField(
                 field,
@@ -1285,8 +4461,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 normalSolidSlownessScale,
                 shadowSolidSlownessScale
         );
-        BitSet normalSourceMask = new BitSet(normalArrivalTimes.length);
-        BitSet shadowSourceMask = new BitSet(shadowArrivalTimes.length);
+        SourceIndexSet normalSourceMask = createSourceIndexSet(normalArrivalTimes.size());
+        SourceIndexSet shadowSourceMask = createSourceIndexSet(shadowArrivalTimes.size());
         PairedKrakkSourceResult sourceResult = initializePairedKrakkSources(
                 normalArrivalTimes,
                 normalSourceMask,
@@ -1303,8 +4479,83 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
         KrakkSolveResult normalSolveResult;
         KrakkSolveResult shadowSolveResult;
-        if (KRAKK_SOLVE_POOL != null) {
+        RuntimeExecutionPolicy executionPolicy = activeRuntimeExecutionPolicy();
+        boolean deltaSteppingMode = executionPolicy.arrivalSolver() == KrakkArrivalSolver.DELTA_STEPPING;
+        boolean allowConcurrentPairedSolve = KRAKK_SOLVE_POOL != null
+                && !deltaSteppingMode
+                && !requiresSerializedFloatAccess(normalArrivalTimes)
+                && !requiresSerializedFloatAccess(shadowArrivalTimes)
+                && !requiresSerializedFloatAccess(slownessResult.normalSlowness())
+                && !requiresSerializedFloatAccess(slownessResult.shadowSlowness());
+        if (allowConcurrentPairedSolve) {
             Future<KrakkSolveResult> shadowFuture = KRAKK_SOLVE_POOL.submit(
+                    () -> callWithExecutionPolicy(
+                            executionPolicy,
+                            () -> solveKrakkArrivalTimesPreparedMultires(
+                                    shadowArrivalTimes,
+                                    slownessResult.shadowSlowness(),
+                                    field,
+                                    shadowSourceMask,
+                                    sourceResult.shadowSourceCount(),
+                                    true
+                            )
+                    )
+            );
+            normalSolveResult = callWithExecutionPolicy(
+                    executionPolicy,
+                    () -> solveKrakkArrivalTimesPreparedMultires(
+                            normalArrivalTimes,
+                            slownessResult.normalSlowness(),
+                            field,
+                            normalSourceMask,
+                            sourceResult.normalSourceCount(),
+                            true
+                    )
+            );
+            try {
+                shadowSolveResult = shadowFuture.get();
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                shadowFuture.cancel(true);
+                shadowSolveResult = callWithExecutionPolicy(
+                        executionPolicy,
+                        () -> solveKrakkArrivalTimesPreparedMultires(
+                                shadowArrivalTimes,
+                                slownessResult.shadowSlowness(),
+                                field,
+                                shadowSourceMask,
+                                sourceResult.shadowSourceCount(),
+                                true
+                        )
+                );
+            } catch (ExecutionException exception) {
+                shadowFuture.cancel(true);
+                shadowSolveResult = callWithExecutionPolicy(
+                        executionPolicy,
+                        () -> solveKrakkArrivalTimesPreparedMultires(
+                                shadowArrivalTimes,
+                                slownessResult.shadowSlowness(),
+                                field,
+                                shadowSourceMask,
+                                sourceResult.shadowSourceCount(),
+                                true
+                        )
+                );
+            }
+        } else {
+            normalSolveResult = callWithExecutionPolicy(
+                    executionPolicy,
+                    () -> solveKrakkArrivalTimesPreparedMultires(
+                            normalArrivalTimes,
+                            slownessResult.normalSlowness(),
+                            field,
+                            normalSourceMask,
+                            sourceResult.normalSourceCount(),
+                            true
+                    )
+            );
+            shadowSolveResult = callWithExecutionPolicy(
+                    executionPolicy,
                     () -> solveKrakkArrivalTimesPreparedMultires(
                             shadowArrivalTimes,
                             slownessResult.shadowSlowness(),
@@ -1314,63 +4565,14 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                             true
                     )
             );
-            normalSolveResult = solveKrakkArrivalTimesPreparedMultires(
-                    normalArrivalTimes,
-                    slownessResult.normalSlowness(),
-                    field,
-                    normalSourceMask,
-                    sourceResult.normalSourceCount(),
-                    true
-            );
-            try {
-                shadowSolveResult = shadowFuture.get();
-            } catch (InterruptedException exception) {
-                Thread.currentThread().interrupt();
-                shadowFuture.cancel(true);
-                shadowSolveResult = solveKrakkArrivalTimesPreparedMultires(
-                        shadowArrivalTimes,
-                        slownessResult.shadowSlowness(),
-                        field,
-                        shadowSourceMask,
-                        sourceResult.shadowSourceCount(),
-                        true
-                );
-            } catch (ExecutionException exception) {
-                shadowFuture.cancel(true);
-                shadowSolveResult = solveKrakkArrivalTimesPreparedMultires(
-                        shadowArrivalTimes,
-                        slownessResult.shadowSlowness(),
-                        field,
-                        shadowSourceMask,
-                        sourceResult.shadowSourceCount(),
-                        true
-                );
-            }
-        } else {
-            normalSolveResult = solveKrakkArrivalTimesPreparedMultires(
-                    normalArrivalTimes,
-                    slownessResult.normalSlowness(),
-                    field,
-                    normalSourceMask,
-                    sourceResult.normalSourceCount(),
-                    true
-            );
-            shadowSolveResult = solveKrakkArrivalTimesPreparedMultires(
-                    shadowArrivalTimes,
-                    slownessResult.shadowSlowness(),
-                    field,
-                    shadowSourceMask,
-                    sourceResult.shadowSourceCount(),
-                    true
-            );
         }
         return new PairedKrakkSolveResult(normalSolveResult, shadowSolveResult);
     }
 
-    private static KrakkSolveResult solveKrakkArrivalTimesPrepared(float[] arrivalTimes,
-                                                                       float[] resolvedSlowness,
+    private static KrakkSolveResult solveKrakkArrivalTimesPrepared(MutableFloatIndexedAccess arrivalTimes,
+                                                                       FloatIndexedAccess resolvedSlowness,
                                                                        KrakkField field,
-                                                                       BitSet sourceMask,
+                                                                       SourceIndexSet sourceMask,
                                                                        int sourceCount) {
         return solveKrakkArrivalTimesPrepared(
                 arrivalTimes,
@@ -1382,14 +4584,56 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         );
     }
 
-    private static KrakkSolveResult solveKrakkArrivalTimesPrepared(float[] arrivalTimes,
-                                                                       float[] resolvedSlowness,
+    private static KrakkSolveResult solveKrakkArrivalTimesPrepared(MutableFloatIndexedAccess arrivalTimes,
+                                                                       FloatIndexedAccess resolvedSlowness,
                                                                        KrakkField field,
-                                                                       BitSet sourceMask,
+                                                                       SourceIndexSet sourceMask,
                                                                        int sourceCount,
                                                                        boolean allowParallelSweep) {
         if (sourceCount <= 0) {
             return new KrakkSolveResult(arrivalTimes, 0, 0);
+        }
+        RuntimeExecutionPolicy executionPolicy = activeRuntimeExecutionPolicy();
+        if (executionPolicy.arrivalSolver() == KrakkArrivalSolver.DELTA_STEPPING) {
+            KrakkSolveResult deltaSteppingResult = solveKrakkArrivalTimesDeltaStepping(
+                    arrivalTimes,
+                    resolvedSlowness,
+                    field,
+                    sourceMask,
+                    sourceCount
+            );
+            int maxSweepCycles = Math.min(
+                    KRAKK_DELTA_STEPPING_REFINE_SWEEP_CYCLES,
+                    computeKrakkMaxSweepCycles(field)
+            );
+            int sweepCycles = refineKrakkArrivalTimes(
+                    arrivalTimes,
+                    resolvedSlowness,
+                    field,
+                    sourceMask,
+                    allowParallelSweep,
+                    maxSweepCycles
+            );
+            return new KrakkSolveResult(arrivalTimes, sourceCount, Math.max(deltaSteppingResult.sweepCycles(), sweepCycles));
+        }
+        if (executionPolicy.arrivalSolver() == KrakkArrivalSolver.ORDERED_UPWIND) {
+            KrakkSolveResult orderedUpwindResult = solveKrakkArrivalTimesOrderedUpwind(
+                    arrivalTimes,
+                    resolvedSlowness,
+                    field,
+                    sourceMask,
+                    sourceCount
+            );
+            int maxSweepCycles = computeKrakkMaxSweepCycles(field);
+            int sweepCycles = refineKrakkArrivalTimes(
+                    arrivalTimes,
+                    resolvedSlowness,
+                    field,
+                    sourceMask,
+                    allowParallelSweep,
+                    maxSweepCycles
+            );
+            return new KrakkSolveResult(arrivalTimes, sourceCount, Math.max(orderedUpwindResult.sweepCycles(), sweepCycles));
         }
         int maxSweepCycles = computeKrakkMaxSweepCycles(field);
         int sweepCycles = refineKrakkArrivalTimes(
@@ -1403,13 +4647,48 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return new KrakkSolveResult(arrivalTimes, sourceCount, sweepCycles);
     }
 
-    private static KrakkSolveResult solveKrakkArrivalTimesPreparedMultires(float[] arrivalTimes,
-                                                                                float[] resolvedSlowness,
+    private static KrakkSolveResult solveKrakkArrivalTimesPrepared(MutableFloatIndexedAccess arrivalTimes,
+                                                                       FloatIndexedAccess resolvedSlowness,
+                                                                       KrakkField field,
+                                                                       SourceIndexSet sourceMask,
+                                                                       int sourceCount,
+                                                                       boolean allowParallelSweep,
+                                                                       int maxSweepCyclesOverride) {
+        if (sourceCount <= 0) {
+            return new KrakkSolveResult(arrivalTimes, 0, 0);
+        }
+        int maxSweepCycles = Math.min(computeKrakkMaxSweepCycles(field), maxSweepCyclesOverride);
+        int sweepCycles = refineKrakkArrivalTimes(
+                arrivalTimes,
+                resolvedSlowness,
+                field,
+                sourceMask,
+                allowParallelSweep,
+                maxSweepCycles
+        );
+        return new KrakkSolveResult(arrivalTimes, sourceCount, sweepCycles);
+    }
+
+    private static KrakkSolveResult solveKrakkArrivalTimesPreparedMultires(MutableFloatIndexedAccess arrivalTimes,
+                                                                                FloatIndexedAccess resolvedSlowness,
                                                                                 KrakkField field,
-                                                                                BitSet sourceMask,
+                                                                                SourceIndexSet sourceMask,
                                                                                 int sourceCount,
                                                                                 boolean allowParallelSweep) {
-        if (!KRAKK_USE_MULTIRES_COARSE_SOLVE || sourceCount <= 0) {
+        RuntimeExecutionPolicy executionPolicy = activeRuntimeExecutionPolicy();
+        if (!KRAKK_USE_MULTIRES_COARSE_SOLVE
+                || sourceCount <= 0) {
+            return solveKrakkArrivalTimesPrepared(
+                    arrivalTimes,
+                    resolvedSlowness,
+                    field,
+                    sourceMask,
+                    sourceCount,
+                    allowParallelSweep
+            );
+        }
+        long fieldVolume = (long) field.sizeX() * (long) field.sizeY() * (long) field.sizeZ();
+        if (fieldVolume > executionPolicy.maxMultiresVolume()) {
             return solveKrakkArrivalTimesPrepared(
                     arrivalTimes,
                     resolvedSlowness,
@@ -1444,7 +4723,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 coarseContext.coarseField(),
                 coarseContext.coarseSourceMask(),
                 coarseContext.coarseSourceCount(),
-                allowParallelSweep
+                allowParallelSweep,
+                KRAKK_MULTIRES_COARSE_MAX_SWEEP_CYCLES
         );
 
         seedFineArrivalTimesFromCoarse(
@@ -1465,10 +4745,282 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return new KrakkSolveResult(arrivalTimes, sourceCount, fineSweepCycles);
     }
 
-    private static int refineKrakkArrivalTimes(float[] arrivalTimes,
-                                                 float[] resolvedSlowness,
+    private static KrakkSolveResult solveKrakkArrivalTimesOrderedUpwind(MutableFloatIndexedAccess arrivalTimes,
+                                                                            FloatIndexedAccess resolvedSlowness,
+                                                                            KrakkField field,
+                                                                            SourceIndexSet sourceMask,
+                                                                            int sourceCount) {
+        if (sourceCount <= 0) {
+            return new KrakkSolveResult(arrivalTimes, 0, 0);
+        }
+
+        BitSet activeMask = field.activeMask();
+        int sizeX = field.sizeX();
+        int sizeY = field.sizeY();
+        int sizeZ = field.sizeZ();
+        int strideX = sizeY * sizeZ;
+        int strideY = sizeZ;
+        BitSet accepted = new BitSet(Math.max(1, arrivalTimes.size()));
+        KrakkMinHeap heap = new KrakkMinHeap(Math.max(32, sourceCount * 4));
+
+        sourceMask.forEach(index -> {
+            if (index < 0 || index >= arrivalTimes.size()) {
+                return;
+            }
+            if (!activeMask.get(index) || resolvedSlowness.getFloat(index) <= 0.0F) {
+                return;
+            }
+            double seedArrival = arrivalTimes.getFloat(index);
+            if (Double.isFinite(seedArrival)) {
+                heap.add(index, seedArrival);
+            }
+        });
+        if (heap.isEmpty()) {
+            return new KrakkSolveResult(arrivalTimes, sourceCount, 0);
+        }
+
+        int acceptedCount = 0;
+        while (!heap.isEmpty()) {
+            int index = heap.pollIndex();
+            double queuedArrival = heap.pollPriority();
+            double currentArrival = arrivalTimes.getFloat(index);
+            if (!Double.isFinite(currentArrival) || queuedArrival > currentArrival + 1.0E-9D) {
+                continue;
+            }
+            if (accepted.get(index)) {
+                continue;
+            }
+            accepted.set(index);
+            acceptedCount++;
+
+            int x = index / strideX;
+            int yz = index - (x * strideX);
+            int y = yz / strideY;
+            int z = yz - (y * strideY);
+
+            if (x > 0) {
+                updateKrakkNeighborFromAccepted(
+                        arrivalTimes,
+                        resolvedSlowness,
+                        accepted,
+                        heap,
+                        index - strideX,
+                        field
+                );
+            }
+            if (x + 1 < sizeX) {
+                updateKrakkNeighborFromAccepted(
+                        arrivalTimes,
+                        resolvedSlowness,
+                        accepted,
+                        heap,
+                        index + strideX,
+                        field
+                );
+            }
+            if (y > 0) {
+                updateKrakkNeighborFromAccepted(
+                        arrivalTimes,
+                        resolvedSlowness,
+                        accepted,
+                        heap,
+                        index - strideY,
+                        field
+                );
+            }
+            if (y + 1 < sizeY) {
+                updateKrakkNeighborFromAccepted(
+                        arrivalTimes,
+                        resolvedSlowness,
+                        accepted,
+                        heap,
+                        index + strideY,
+                        field
+                );
+            }
+            if (z > 0) {
+                updateKrakkNeighborFromAccepted(
+                        arrivalTimes,
+                        resolvedSlowness,
+                        accepted,
+                        heap,
+                        index - 1,
+                        field
+                );
+            }
+            if (z + 1 < sizeZ) {
+                updateKrakkNeighborFromAccepted(
+                        arrivalTimes,
+                        resolvedSlowness,
+                        accepted,
+                        heap,
+                        index + 1,
+                        field
+                );
+            }
+        }
+
+        return new KrakkSolveResult(arrivalTimes, sourceCount, acceptedCount > 0 ? 1 : 0);
+    }
+
+    private static KrakkSolveResult solveKrakkArrivalTimesDeltaStepping(MutableFloatIndexedAccess arrivalTimes,
+                                                                            FloatIndexedAccess resolvedSlowness,
+                                                                            KrakkField field,
+                                                                            SourceIndexSet sourceMask,
+                                                                            int sourceCount) {
+        if (sourceCount <= 0) {
+            return new KrakkSolveResult(arrivalTimes, 0, 0);
+        }
+        BitSet activeMask = field.activeMask();
+        int sizeX = field.sizeX();
+        int sizeY = field.sizeY();
+        int sizeZ = field.sizeZ();
+        int strideX = sizeY * sizeZ;
+        int strideY = sizeZ;
+        double bucketWidth = Math.max(1.0E-4D, KRAKK_DELTA_STEPPING_BUCKET_WIDTH);
+        KrakkDeltaBucketQueue bucketQueue = new KrakkDeltaBucketQueue(bucketWidth, arrivalTimes.size());
+        BitSet accepted = new BitSet(Math.max(1, arrivalTimes.size()));
+
+        sourceMask.forEach(index -> {
+            if (index < 0 || index >= arrivalTimes.size()) {
+                return;
+            }
+            if (!activeMask.get(index) || resolvedSlowness.getFloat(index) <= 0.0F) {
+                return;
+            }
+            double seedArrival = arrivalTimes.getFloat(index);
+            if (Double.isFinite(seedArrival)) {
+                bucketQueue.add(index, seedArrival);
+            }
+        });
+
+        if (bucketQueue.isEmpty()) {
+            return new KrakkSolveResult(arrivalTimes, sourceCount, 0);
+        }
+
+        int bucketPasses = 0;
+        int acceptedCount = 0;
+        while (!bucketQueue.isEmpty()) {
+            int bucketIndex = bucketQueue.pollBucketIndex();
+            if (bucketIndex < 0) {
+                break;
+            }
+            IntArrayList bucketEntries = bucketQueue.takeBucket(bucketIndex);
+            if (bucketEntries == null || bucketEntries.isEmpty()) {
+                continue;
+            }
+            bucketPasses++;
+            if (krakkPhaseTimingLoggingEnabled
+                    && (bucketPasses % KRAKK_DELTA_STEPPING_PROGRESS_LOG_INTERVAL_BUCKETS) == 0) {
+                LOGGER.info(
+                        "Krakk delta-stepping progress: bucketPasses={} accepted={} activeFrontierBuckets={} arrivalSize={} fieldDims=[{},{},{}] heap={}",
+                        bucketPasses,
+                        acceptedCount,
+                        bucketQueue.bucketCount(),
+                        arrivalTimes.size(),
+                        sizeX,
+                        sizeY,
+                        sizeZ,
+                        formatKrakkHeapSnapshot()
+                );
+            }
+            for (int i = 0; i < bucketEntries.size(); i++) {
+                int index = bucketEntries.getInt(i);
+                if (!bucketQueue.claim(index)) {
+                    continue;
+                }
+                if (index < 0 || index >= arrivalTimes.size()) {
+                    continue;
+                }
+                if (!activeMask.get(index) || accepted.get(index)) {
+                    continue;
+                }
+                double currentArrival = arrivalTimes.getFloat(index);
+                if (!Double.isFinite(currentArrival)) {
+                    continue;
+                }
+                int expectedBucket = krakkDeltaBucketIndex(currentArrival, bucketWidth);
+                if (expectedBucket != bucketIndex) {
+                    bucketQueue.add(index, currentArrival);
+                    continue;
+                }
+                accepted.set(index);
+                acceptedCount++;
+                int x = index / strideX;
+                int yz = index - (x * strideX);
+                int y = yz / strideY;
+                int z = yz - (y * strideY);
+
+                if (x > 0) {
+                    updateKrakkNeighborFromAcceptedDelta(
+                            arrivalTimes,
+                            resolvedSlowness,
+                            accepted,
+                            bucketQueue,
+                            index - strideX,
+                            field
+                    );
+                }
+                if (x + 1 < sizeX) {
+                    updateKrakkNeighborFromAcceptedDelta(
+                            arrivalTimes,
+                            resolvedSlowness,
+                            accepted,
+                            bucketQueue,
+                            index + strideX,
+                            field
+                    );
+                }
+                if (y > 0) {
+                    updateKrakkNeighborFromAcceptedDelta(
+                            arrivalTimes,
+                            resolvedSlowness,
+                            accepted,
+                            bucketQueue,
+                            index - strideY,
+                            field
+                    );
+                }
+                if (y + 1 < sizeY) {
+                    updateKrakkNeighborFromAcceptedDelta(
+                            arrivalTimes,
+                            resolvedSlowness,
+                            accepted,
+                            bucketQueue,
+                            index + strideY,
+                            field
+                    );
+                }
+                if (z > 0) {
+                    updateKrakkNeighborFromAcceptedDelta(
+                            arrivalTimes,
+                            resolvedSlowness,
+                            accepted,
+                            bucketQueue,
+                            index - 1,
+                            field
+                    );
+                }
+                if (z + 1 < sizeZ) {
+                    updateKrakkNeighborFromAcceptedDelta(
+                            arrivalTimes,
+                            resolvedSlowness,
+                            accepted,
+                            bucketQueue,
+                            index + 1,
+                            field
+                    );
+                }
+            }
+        }
+
+        return new KrakkSolveResult(arrivalTimes, sourceCount, bucketPasses);
+    }
+
+    private static int refineKrakkArrivalTimes(MutableFloatIndexedAccess arrivalTimes,
+                                                 FloatIndexedAccess resolvedSlowness,
                                                  KrakkField field,
-                                                 BitSet sourceMask,
+                                                 SourceIndexSet sourceMask,
                                                  boolean allowParallelSweep,
                                                  int maxSweepCycles) {
         int boundedCycles = Math.max(0, Math.min(maxSweepCycles, computeKrakkMaxSweepCycles(field)));
@@ -1503,17 +5055,17 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return sweepCycles;
     }
 
-    private static BitSet buildKrakkSourceRowMask(KrakkField field, BitSet sourceMask) {
+    private static BitSet buildKrakkSourceRowMask(KrakkField field, SourceIndexSet sourceMask) {
         int rowCount = Math.max(1, field.sizeX() * field.sizeY());
         BitSet sourceRows = new BitSet(rowCount);
         int strideX = field.sizeY() * field.sizeZ();
         int strideY = field.sizeZ();
-        for (int index = sourceMask.nextSetBit(0); index >= 0; index = sourceMask.nextSetBit(index + 1)) {
+        sourceMask.forEach(index -> {
             int x = index / strideX;
             int yz = index - (x * strideX);
             int y = yz / strideY;
             sourceRows.set(krakkRowIndex(x, y, field.sizeY()));
-        }
+        });
         return sourceRows;
     }
 
@@ -1542,9 +5094,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     }
 
     private static KrakkCoarseSolveContext buildCoarseKrakkSolveContext(KrakkField fineField,
-                                                                             float[] fineSlowness,
-                                                                             BitSet fineSourceMask,
-                                                                             float[] fineArrivalTimes,
+                                                                             FloatIndexedAccess fineSlowness,
+                                                                             SourceIndexSet fineSourceMask,
+                                                                             FloatIndexedAccess fineArrivalTimes,
                                                                              int downsampleFactor) {
         if (downsampleFactor <= 1) {
             return null;
@@ -1568,10 +5120,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             return null;
         }
         int coarseVolume = (int) coarseVolumeLong;
-        float[] coarseSlowness = new float[Math.max(1, coarseVolume)];
-        float[] coarseArrivalTimes = new float[Math.max(1, coarseVolume)];
-        Arrays.fill(coarseArrivalTimes, Float.POSITIVE_INFINITY);
-        BitSet coarseSourceMask = new BitSet(coarseArrivalTimes.length);
+        MutableFloatIndexedAccess coarseSlowness = createKrakkFloatStorage(Math.max(1, coarseVolume));
+        MutableFloatIndexedAccess coarseArrivalTimes = createKrakkArrivalStorage(Math.max(1, coarseVolume));
+        coarseArrivalTimes.fill(Float.POSITIVE_INFINITY);
+        SourceIndexSet coarseSourceMask = createSourceIndexSet(coarseArrivalTimes.size());
         int coarseSourceCount = 0;
         LongArrayList coarseSolidPositions = new LongArrayList(Math.max(16, fineField.solidPositions().size() / Math.max(1, downsampleFactor * downsampleFactor)));
 
@@ -1598,16 +5150,16 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                             int base = baseX + (fineY * fineStrideY);
                             for (int fineZ = fineStartZ; fineZ < fineEndZ; fineZ++) {
                                 int fineIndex = base + fineZ;
-                                float slowness = fineSlowness[fineIndex];
+                                float slowness = fineSlowness.getFloat(fineIndex);
                                 if (slowness <= 0.0F) {
                                     continue;
                                 }
                                 active = true;
                                 minSlowness = Math.min(minSlowness, slowness);
                                 hasSolid |= slowness > airSlowness + 1.0E-6F;
-                                if (fineSourceMask.get(fineIndex)) {
+                                if (fineSourceMask.contains(fineIndex)) {
                                     hasSource = true;
-                                    minSourceArrival = Math.min(minSourceArrival, fineArrivalTimes[fineIndex]);
+                                    minSourceArrival = Math.min(minSourceArrival, fineArrivalTimes.getFloat(fineIndex));
                                 }
                             }
                         }
@@ -1618,7 +5170,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     }
 
                     int coarseIndex = krakkGridIndex(coarseX, coarseY, coarseZ, coarseSizeY, coarseSizeZ);
-                    coarseSlowness[coarseIndex] = minSlowness;
+                    coarseSlowness.setFloat(coarseIndex, minSlowness);
                     if (hasSolid) {
                         coarseSolidPositions.add(BlockPos.asLong(
                                 fineField.minX() + fineStartX,
@@ -1627,11 +5179,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                         ));
                     }
                     if (hasSource && Float.isFinite(minSourceArrival)) {
-                        if (!coarseSourceMask.get(coarseIndex)) {
-                            coarseSourceMask.set(coarseIndex);
+                        if (coarseSourceMask.add(coarseIndex)) {
                             coarseSourceCount++;
                         }
-                        coarseArrivalTimes[coarseIndex] = minSourceArrival;
+                        coarseArrivalTimes.setFloat(coarseIndex, minSourceArrival);
                     }
                 }
             }
@@ -1650,7 +5201,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 coarseSizeZ,
                 coarseSampledVoxels,
                 coarseSlowness,
-                coarseSolidPositions
+                wrapLongArrayList(coarseSolidPositions)
         );
         if (coarseField.activeMask().isEmpty()) {
             return null;
@@ -1672,8 +5223,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                                        int sizeY,
                                                                        int sizeZ,
                                                                        int sampledVoxelCount,
-                                                                       float[] slowness,
-                                                                       LongArrayList solidPositions) {
+                                                                       FloatIndexedAccess slowness,
+                                                                       LongIndexedAccess solidPositions) {
         int volume = Math.max(1, sizeX * sizeY * sizeZ);
         BitSet activeMask = new BitSet(volume);
         int rowCount = Math.max(1, sizeX * sizeY);
@@ -1689,7 +5240,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 int activeCount = 0;
                 for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
                     int index = base + zOffset;
-                    if (slowness[index] <= 0.0F) {
+                    if (slowness.getFloat(index) <= 0.0F) {
                         continue;
                     }
                     activeMask.set(index);
@@ -1699,83 +5250,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             }
         }
 
-        int[] activeRowOffsets = new int[rowCount];
-        int totalActive = 0;
-        for (int rowIndex = 0; rowIndex < rowCount; rowIndex++) {
-            activeRowOffsets[rowIndex] = totalActive;
-            totalActive += activeCountByRow[rowIndex];
-        }
-        int[] activeRowIndices = new int[Math.max(1, totalActive)];
-        int[] writeCursorByRow = Arrays.copyOf(activeRowOffsets, activeRowOffsets.length);
-        for (int xOffset = 0; xOffset < sizeX; xOffset++) {
-            int baseX = xOffset * strideX;
-            for (int yOffset = 0; yOffset < sizeY; yOffset++) {
-                int rowIndex = krakkRowIndex(xOffset, yOffset, sizeY);
-                int base = baseX + (yOffset * strideY);
-                for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
-                    int index = base + zOffset;
-                    if (slowness[index] <= 0.0F) {
-                        continue;
-                    }
-                    activeRowIndices[writeCursorByRow[rowIndex]++] = index;
-                }
-            }
-        }
-
-        int[] neighborNegX = new int[Math.max(1, volume)];
-        int[] neighborPosX = new int[Math.max(1, volume)];
-        int[] neighborNegY = new int[Math.max(1, volume)];
-        int[] neighborPosY = new int[Math.max(1, volume)];
-        int[] neighborNegZ = new int[Math.max(1, volume)];
-        int[] neighborPosZ = new int[Math.max(1, volume)];
-        Arrays.fill(neighborNegX, -1);
-        Arrays.fill(neighborPosX, -1);
-        Arrays.fill(neighborNegY, -1);
-        Arrays.fill(neighborPosY, -1);
-        Arrays.fill(neighborNegZ, -1);
-        Arrays.fill(neighborPosZ, -1);
-        for (int index = activeMask.nextSetBit(0); index >= 0; index = activeMask.nextSetBit(index + 1)) {
-            int xOffset = index / strideX;
-            int yz = index - (xOffset * strideX);
-            int yOffset = yz / strideY;
-            int zOffset = yz - (yOffset * strideY);
-            if (xOffset > 0) {
-                int neighbor = index - strideX;
-                if (activeMask.get(neighbor)) {
-                    neighborNegX[index] = neighbor;
-                }
-            }
-            if (xOffset + 1 < sizeX) {
-                int neighbor = index + strideX;
-                if (activeMask.get(neighbor)) {
-                    neighborPosX[index] = neighbor;
-                }
-            }
-            if (yOffset > 0) {
-                int neighbor = index - strideY;
-                if (activeMask.get(neighbor)) {
-                    neighborNegY[index] = neighbor;
-                }
-            }
-            if (yOffset + 1 < sizeY) {
-                int neighbor = index + strideY;
-                if (activeMask.get(neighbor)) {
-                    neighborPosY[index] = neighbor;
-                }
-            }
-            if (zOffset > 0) {
-                int neighbor = index - 1;
-                if (activeMask.get(neighbor)) {
-                    neighborNegZ[index] = neighbor;
-                }
-            }
-            if (zOffset + 1 < sizeZ) {
-                int neighbor = index + 1;
-                if (activeMask.get(neighbor)) {
-                    neighborPosZ[index] = neighbor;
-                }
-            }
-        }
         return new KrakkField(
                 minX,
                 minY,
@@ -1787,25 +5261,17 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 activeMask,
                 slowness,
                 solidPositions,
-                activeRowOffsets,
-                activeCountByRow,
-                activeRowIndices,
-                neighborNegX,
-                neighborPosX,
-                neighborNegY,
-                neighborPosY,
-                neighborNegZ,
-                neighborPosZ
+                activeCountByRow
         );
     }
 
-    private static void seedFineArrivalTimesFromCoarse(float[] fineArrivalTimes,
-                                                       float[] fineSlowness,
+    private static void seedFineArrivalTimesFromCoarse(MutableFloatIndexedAccess fineArrivalTimes,
+                                                       FloatIndexedAccess fineSlowness,
                                                        KrakkField fineField,
-                                                       BitSet fineSourceMask,
+                                                       SourceIndexSet fineSourceMask,
                                                        KrakkCoarseSolveContext coarseContext) {
         KrakkField coarseField = coarseContext.coarseField();
-        float[] coarseArrivalTimes = coarseContext.coarseArrivalTimes();
+        FloatIndexedAccess coarseArrivalTimes = coarseContext.coarseArrivalTimes();
         int downsampleFactor = coarseContext.downsampleFactor();
         int fineSizeY = fineField.sizeY();
         int fineSizeZ = fineField.sizeZ();
@@ -1816,9 +5282,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int maxCoarseX = coarseField.sizeX() - 1;
         int maxCoarseY = coarseField.sizeY() - 1;
         int maxCoarseZ = coarseField.sizeZ() - 1;
-        int[] activeIndices = fineField.activeRowIndices();
-        for (int fineIndex : activeIndices) {
-            if (fineSourceMask.get(fineIndex) || fineSlowness[fineIndex] <= 0.0F) {
+        BitSet activeMask = fineField.activeMask();
+        for (int fineIndex = activeMask.nextSetBit(0); fineIndex >= 0; fineIndex = activeMask.nextSetBit(fineIndex + 1)) {
+            if (fineSourceMask.contains(fineIndex) || fineSlowness.getFloat(fineIndex) <= 0.0F) {
                 continue;
             }
             int fineX = fineIndex / fineStrideX;
@@ -1830,7 +5296,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             int coarseY = Math.min(maxCoarseY, fineY / downsampleFactor);
             int coarseZ = Math.min(maxCoarseZ, fineZ / downsampleFactor);
             int coarseIndex = ((coarseX * coarseSizeY) + coarseY) * coarseSizeZ + coarseZ;
-            float coarseArrival = coarseArrivalTimes[coarseIndex];
+            float coarseArrival = coarseArrivalTimes.getFloat(coarseIndex);
             if (!Float.isFinite(coarseArrival)) {
                 continue;
             }
@@ -1842,14 +5308,14 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             double dy = (fineY + 0.5D) - coarseCenterY;
             double dz = (fineZ + 0.5D) - coarseCenterZ;
             double localDistance = Math.sqrt((dx * dx) + (dy * dy) + (dz * dz));
-            float seededArrival = (float) (coarseArrival + (localDistance * Math.max(1.0E-6F, fineSlowness[fineIndex])));
-            if (seededArrival < fineArrivalTimes[fineIndex]) {
-                fineArrivalTimes[fineIndex] = seededArrival;
+            float seededArrival = (float) (coarseArrival + (localDistance * Math.max(1.0E-6F, fineSlowness.getFloat(fineIndex))));
+            if (seededArrival < fineArrivalTimes.getFloat(fineIndex)) {
+                fineArrivalTimes.setFloat(fineIndex, seededArrival);
             }
         }
     }
 
-    private static float[] resolveKrakkSlownessField(KrakkField field,
+    private static FloatIndexedAccess resolveKrakkSlownessField(KrakkField field,
                                                        float uniformSlownessOverride,
                                                        float solidSlownessScale) {
         return resolvePairedKrakkSlownessField(
@@ -1864,7 +5330,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                                                   float uniformSlownessOverride,
                                                                                   float normalSolidSlownessScale,
                                                                                   float shadowSolidSlownessScale) {
-        float[] baseSlowness = field.slowness();
+        FloatIndexedAccess baseSlowness = field.slowness();
         boolean uniformOverrideActive = Float.isFinite(uniformSlownessOverride) && uniformSlownessOverride > 0.0F;
         float resolvedNormalScale = Float.isFinite(normalSolidSlownessScale) && normalSolidSlownessScale > 0.0F
                 ? normalSolidSlownessScale
@@ -1878,12 +5344,12 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             return new PairedKrakkSlownessResult(baseSlowness, baseSlowness);
         }
 
-        int[] activeIndices = field.activeRowIndices();
         if (uniformOverrideActive) {
-            float[] resolvedSlowness = new float[baseSlowness.length];
-            for (int index : activeIndices) {
-                if (baseSlowness[index] > 0.0F) {
-                    resolvedSlowness[index] = uniformSlownessOverride;
+            MutableFloatIndexedAccess resolvedSlowness = createKrakkFloatStorage(baseSlowness.size());
+            BitSet activeMask = field.activeMask();
+            for (int index = activeMask.nextSetBit(0); index >= 0; index = activeMask.nextSetBit(index + 1)) {
+                if (baseSlowness.getFloat(index) > 0.0F) {
+                    resolvedSlowness.setFloat(index, uniformSlownessOverride);
                 }
             }
             return new PairedKrakkSlownessResult(resolvedSlowness, resolvedSlowness);
@@ -1892,46 +5358,48 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         boolean normalIsBase = Math.abs(resolvedNormalScale - 1.0F) <= 1.0E-6F;
         boolean shadowIsBase = Math.abs(resolvedShadowScale - 1.0F) <= 1.0E-6F;
         if (!normalIsBase && !shadowIsBase && Math.abs(resolvedNormalScale - resolvedShadowScale) <= 1.0E-6F) {
-            float[] resolvedSlowness = new float[baseSlowness.length];
-            applyKrakkSlownessScale(resolvedSlowness, baseSlowness, activeIndices, resolvedNormalScale);
+            MutableFloatIndexedAccess resolvedSlowness = createKrakkFloatStorage(baseSlowness.size());
+            applyKrakkSlownessScale(resolvedSlowness, baseSlowness, field.activeMask(), resolvedNormalScale);
             return new PairedKrakkSlownessResult(resolvedSlowness, resolvedSlowness);
         }
 
-        float[] normalSlowness = normalIsBase ? baseSlowness : new float[baseSlowness.length];
-        float[] shadowSlowness = shadowIsBase ? baseSlowness : new float[baseSlowness.length];
-        if (!normalIsBase) {
-            applyKrakkSlownessScale(normalSlowness, baseSlowness, activeIndices, resolvedNormalScale);
+        MutableFloatIndexedAccess normalScaledSlowness = normalIsBase ? null : createKrakkFloatStorage(baseSlowness.size());
+        MutableFloatIndexedAccess shadowScaledSlowness = shadowIsBase ? null : createKrakkFloatStorage(baseSlowness.size());
+        if (normalScaledSlowness != null) {
+            applyKrakkSlownessScale(normalScaledSlowness, baseSlowness, field.activeMask(), resolvedNormalScale);
         }
-        if (!shadowIsBase) {
-            applyKrakkSlownessScale(shadowSlowness, baseSlowness, activeIndices, resolvedShadowScale);
+        if (shadowScaledSlowness != null) {
+            applyKrakkSlownessScale(shadowScaledSlowness, baseSlowness, field.activeMask(), resolvedShadowScale);
         }
+        FloatIndexedAccess normalSlowness = normalIsBase ? baseSlowness : normalScaledSlowness;
+        FloatIndexedAccess shadowSlowness = shadowIsBase ? baseSlowness : shadowScaledSlowness;
         return new PairedKrakkSlownessResult(normalSlowness, shadowSlowness);
     }
 
-    private static void applyKrakkSlownessScale(float[] outputSlowness,
-                                                  float[] baseSlowness,
-                                                  int[] activeIndices,
+    private static void applyKrakkSlownessScale(MutableFloatIndexedAccess outputSlowness,
+                                                  FloatIndexedAccess baseSlowness,
+                                                  BitSet activeMask,
                                                   float scale) {
         float airSlowness = (float) KRAKK_AIR_SLOWNESS;
-        for (int index : activeIndices) {
-            float base = baseSlowness[index];
+        for (int index = activeMask.nextSetBit(0); index >= 0; index = activeMask.nextSetBit(index + 1)) {
+            float base = baseSlowness.getFloat(index);
             if (base <= 0.0F) {
                 continue;
             }
             float solidOverrun = Math.max(0.0F, base - airSlowness);
             if (solidOverrun <= 1.0E-6F) {
-                outputSlowness[index] = base;
+                outputSlowness.setFloat(index, base);
                 continue;
             }
-            outputSlowness[index] = airSlowness + (solidOverrun * scale);
+            outputSlowness.setFloat(index, airSlowness + (solidOverrun * scale));
         }
     }
 
-    private static int initializeKrakkSources(float[] arrivalTimes,
-                                                BitSet sourceMask,
+    private static int initializeKrakkSources(MutableFloatIndexedAccess arrivalTimes,
+                                                SourceIndexSet sourceMask,
                                                 KrakkField field,
                                                 BitSet traversableMask,
-                                                float[] resolvedSlowness,
+                                                FloatIndexedAccess resolvedSlowness,
                                                 double centerX,
                                                 double centerY,
                                                 double centerZ) {
@@ -1951,12 +5419,12 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return sourceResult.normalSourceCount();
     }
 
-    private static PairedKrakkSourceResult initializePairedKrakkSources(float[] normalArrivalTimes,
-                                                                             BitSet normalSourceMask,
-                                                                             float[] normalSlowness,
-                                                                             float[] shadowArrivalTimes,
-                                                                             BitSet shadowSourceMask,
-                                                                             float[] shadowSlowness,
+    private static PairedKrakkSourceResult initializePairedKrakkSources(MutableFloatIndexedAccess normalArrivalTimes,
+                                                                             SourceIndexSet normalSourceMask,
+                                                                             FloatIndexedAccess normalSlowness,
+                                                                             MutableFloatIndexedAccess shadowArrivalTimes,
+                                                                             SourceIndexSet shadowSourceMask,
+                                                                             FloatIndexedAccess shadowSlowness,
                                                                              KrakkField field,
                                                                              BitSet traversableMask,
                                                                              double centerX,
@@ -1989,30 +5457,28 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     double dz = worldZ - centerZ;
                     double distance = Math.sqrt((dx * dx) + (dy * dy) + (dz * dz));
 
-                    float normalCellSlowness = normalSlowness[index];
+                    float normalCellSlowness = normalSlowness.getFloat(index);
                     if (normalCellSlowness > 0.0F) {
                         double normalArrival = distance * normalCellSlowness;
-                        if (normalArrival + 1.0E-6D < normalArrivalTimes[index]) {
-                            if (!normalSourceMask.get(index)) {
-                                normalSourceMask.set(index);
+                        if (normalArrival + 1.0E-6D < normalArrivalTimes.getFloat(index)) {
+                            if (normalSourceMask.add(index)) {
                                 normalSourceCount++;
                             }
-                            normalArrivalTimes[index] = (float) normalArrival;
+                            normalArrivalTimes.setFloat(index, (float) normalArrival);
                         }
                     }
 
                     if (computeShadow) {
-                        float shadowCellSlowness = shadowSlowness[index];
+                        float shadowCellSlowness = shadowSlowness.getFloat(index);
                         if (shadowCellSlowness <= 0.0F) {
                             continue;
                         }
                         double shadowArrival = distance * shadowCellSlowness;
-                        if (shadowArrival + 1.0E-6D < shadowArrivalTimes[index]) {
-                            if (!shadowSourceMask.get(index)) {
-                                shadowSourceMask.set(index);
+                        if (shadowArrival + 1.0E-6D < shadowArrivalTimes.getFloat(index)) {
+                            if (shadowSourceMask.add(index)) {
                                 shadowSourceCount++;
                             }
-                            shadowArrivalTimes[index] = (float) shadowArrival;
+                            shadowArrivalTimes.setFloat(index, (float) shadowArrival);
                         }
                     }
                 }
@@ -2023,15 +5489,17 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         if (normalSourceCount <= 0 || (computeShadow && shadowSourceCount <= 0)) {
             seedIndex = resolveKrakkSeedIndex(field, traversableMask, centerX, centerY, centerZ);
         }
-        if (normalSourceCount <= 0 && seedIndex >= 0 && normalSlowness[seedIndex] > 0.0F) {
-            normalArrivalTimes[seedIndex] = 0.0F;
-            normalSourceMask.set(seedIndex);
-            normalSourceCount = 1;
+        if (normalSourceCount <= 0 && seedIndex >= 0 && normalSlowness.getFloat(seedIndex) > 0.0F) {
+            normalArrivalTimes.setFloat(seedIndex, 0.0F);
+            if (normalSourceMask.add(seedIndex)) {
+                normalSourceCount++;
+            }
         }
-        if (computeShadow && shadowSourceCount <= 0 && seedIndex >= 0 && shadowSlowness[seedIndex] > 0.0F) {
-            shadowArrivalTimes[seedIndex] = 0.0F;
-            shadowSourceMask.set(seedIndex);
-            shadowSourceCount = 1;
+        if (computeShadow && shadowSourceCount <= 0 && seedIndex >= 0 && shadowSlowness.getFloat(seedIndex) > 0.0F) {
+            shadowArrivalTimes.setFloat(seedIndex, 0.0F);
+            if (shadowSourceMask.add(seedIndex)) {
+                shadowSourceCount++;
+            }
         }
         return new PairedKrakkSourceResult(normalSourceCount, shadowSourceCount);
     }
@@ -2081,10 +5549,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return bestIndex;
     }
 
-    private static double sweepKrakkPass(float[] arrivalTimes,
-                                           float[] resolvedSlowness,
+    private static double sweepKrakkPass(MutableFloatIndexedAccess arrivalTimes,
+                                           FloatIndexedAccess resolvedSlowness,
                                            KrakkField field,
-                                           BitSet sourceMask,
+                                           SourceIndexSet sourceMask,
                                            boolean allowParallelSweep,
                                            boolean xForward,
                                            boolean yForward,
@@ -2094,22 +5562,21 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int sizeX = field.sizeX();
         int sizeY = field.sizeY();
         int diagonalCount = sizeX + sizeY - 1;
-        int[] activeRowOffsets = field.activeRowOffsets();
         int[] activeRowLengths = field.activeRowLengths();
-        int[] activeRowIndices = field.activeRowIndices();
-        int[] neighborNegX = field.neighborNegX();
-        int[] neighborPosX = field.neighborPosX();
-        int[] neighborNegY = field.neighborNegY();
-        int[] neighborPosY = field.neighborPosY();
-        int[] neighborNegZ = field.neighborNegZ();
-        int[] neighborPosZ = field.neighborPosZ();
+        long[] activeMaskWords = field.activeMask().toLongArray();
+        int activeMaskWordCount = activeMaskWords.length;
+        long[] activeRowsMaskWords = activeRowsMask != null ? activeRowsMask.toLongArray() : null;
+        int activeRowsMaskWordCount = activeRowsMaskWords != null ? activeRowsMaskWords.length : 0;
         double maxDelta = 0.0D;
+        boolean parallelSweepAllowed = allowParallelSweep
+                && !requiresSerializedFloatAccess(arrivalTimes)
+                && !requiresSerializedFloatAccess(resolvedSlowness);
         for (int diagonal = 0; diagonal < diagonalCount; diagonal++) {
             int minXOrder = Math.max(0, diagonal - (sizeY - 1));
             int maxXOrder = Math.min(sizeX - 1, diagonal);
             int rowSpan = maxXOrder - minXOrder + 1;
             int taskCount = resolveKrakkSweepTaskCount(rowSpan);
-            if (!allowParallelSweep || taskCount <= 1 || VOLUMETRIC_TARGET_SCAN_POOL == null) {
+            if (!parallelSweepAllowed || taskCount <= 1 || VOLUMETRIC_TARGET_SCAN_POOL == null) {
                 KrakkSweepChunkResult chunkResult = sweepKrakkDiagonalChunk(
                         arrivalTimes,
                         resolvedSlowness,
@@ -2121,16 +5588,11 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                         diagonal,
                         minXOrder,
                         maxXOrder + 1,
-                        activeRowOffsets,
                         activeRowLengths,
-                        activeRowIndices,
-                        neighborNegX,
-                        neighborPosX,
-                        neighborNegY,
-                        neighborPosY,
-                        neighborNegZ,
-                        neighborPosZ,
-                        activeRowsMask
+                        activeMaskWords,
+                        activeMaskWordCount,
+                        activeRowsMaskWords,
+                        activeRowsMaskWordCount
                 );
                 maxDelta = Math.max(maxDelta, chunkResult.maxDelta());
                 mergeKrakkDirtyRows(dirtyRowsOut, chunkResult.dirtyRows());
@@ -2160,16 +5622,11 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                 diagonalIndex,
                                 chunkStartXOrder,
                                 chunkEndXOrder,
-                                activeRowOffsets,
                                 activeRowLengths,
-                                activeRowIndices,
-                                neighborNegX,
-                                neighborPosX,
-                                neighborNegY,
-                                neighborPosY,
-                                neighborNegZ,
-                                neighborPosZ,
-                                activeRowsMask
+                                activeMaskWords,
+                                activeMaskWordCount,
+                                activeRowsMaskWords,
+                                activeRowsMaskWordCount
                         )
                 ));
             }
@@ -2190,28 +5647,26 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return maxDelta;
     }
 
-    private static KrakkSweepChunkResult sweepKrakkDiagonalChunk(float[] arrivalTimes,
-                                                                     float[] resolvedSlowness,
+    private static KrakkSweepChunkResult sweepKrakkDiagonalChunk(MutableFloatIndexedAccess arrivalTimes,
+                                                                     FloatIndexedAccess resolvedSlowness,
                                                                      KrakkField field,
-                                                                     BitSet sourceMask,
+                                                                     SourceIndexSet sourceMask,
                                                                      boolean xForward,
                                                                      boolean yForward,
                                                                      boolean zForward,
                                                                      int diagonal,
                                                                      int startXOrderInclusive,
                                                                      int endXOrderExclusive,
-                                                                     int[] activeRowOffsets,
                                                                      int[] activeRowLengths,
-                                                                     int[] activeRowIndices,
-                                                                     int[] neighborNegX,
-                                                                     int[] neighborPosX,
-                                                                     int[] neighborNegY,
-                                                                     int[] neighborPosY,
-                                                                     int[] neighborNegZ,
-                                                                     int[] neighborPosZ,
-                                                                     BitSet activeRowsMask) {
+                                                                     long[] activeMaskWords,
+                                                                     int activeMaskWordCount,
+                                                                     long[] activeRowsMaskWords,
+                                                                     int activeRowsMaskWordCount) {
         int sizeX = field.sizeX();
         int sizeY = field.sizeY();
+        int sizeZ = field.sizeZ();
+        int strideX = sizeY * sizeZ;
+        int strideY = sizeZ;
         double maxDelta = 0.0D;
         IntArrayList dirtyRows = new IntArrayList(Math.max(4, endXOrderExclusive - startXOrderInclusive));
         for (int xOrder = startXOrderInclusive; xOrder < endXOrderExclusive; xOrder++) {
@@ -2222,39 +5677,43 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             int x = xForward ? xOrder : (sizeX - 1 - xOrder);
             int y = yForward ? yOrder : (sizeY - 1 - yOrder);
             int rowIndex = krakkRowIndex(x, y, sizeY);
-            if (activeRowsMask != null && !activeRowsMask.get(rowIndex)) {
-                continue;
+            if (activeRowsMaskWords != null) {
+                int rowWordIdx = rowIndex >> 6;
+                if (rowWordIdx >= activeRowsMaskWordCount
+                        || (activeRowsMaskWords[rowWordIdx] & (1L << (rowIndex & 63))) == 0L) {
+                    continue;
+                }
             }
-            int rowOffset = activeRowOffsets[rowIndex];
             int rowLength = activeRowLengths[rowIndex];
             if (rowLength <= 0) {
                 continue;
             }
+            int baseIndex = (x * strideX) + (y * strideY);
             boolean rowChanged = false;
             if (zForward) {
-                int rowEnd = rowOffset + rowLength;
-                for (int i = rowOffset; i < rowEnd; i++) {
-                    int index = activeRowIndices[i];
-                    if (sourceMask.get(index)) {
+                for (int z = 0; z < sizeZ; z++) {
+                    int index = baseIndex + z;
+                    int wordIdx = index >> 6;
+                    if (wordIdx >= activeMaskWordCount
+                            || (activeMaskWords[wordIdx] & (1L << (index & 63))) == 0L
+                            || sourceMask.contains(index)) {
                         continue;
                     }
                     double candidate = solveKrakkCell(
                             arrivalTimes,
                             resolvedSlowness,
-                            index,
-                            neighborNegX,
-                            neighborPosX,
-                            neighborNegY,
-                            neighborPosY,
-                            neighborNegZ,
-                            neighborPosZ
+                            activeMaskWords,
+                            activeMaskWordCount,
+                            index, x, y, z,
+                            sizeX, sizeY, sizeZ,
+                            strideX, strideY
                     );
                     if (!Double.isFinite(candidate)) {
                         continue;
                     }
-                    double previous = arrivalTimes[index];
+                    double previous = arrivalTimes.getFloat(index);
                     if (candidate + 1.0E-9D < previous) {
-                        arrivalTimes[index] = (float) candidate;
+                        arrivalTimes.setFloat(index, (float) candidate);
                         rowChanged = true;
                         if (Double.isFinite(previous)) {
                             maxDelta = Math.max(maxDelta, previous - candidate);
@@ -2268,28 +5727,29 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 }
                 continue;
             }
-            for (int i = rowOffset + rowLength - 1; i >= rowOffset; i--) {
-                int index = activeRowIndices[i];
-                if (sourceMask.get(index)) {
+            for (int z = sizeZ - 1; z >= 0; z--) {
+                int index = baseIndex + z;
+                int wordIdx = index >> 6;
+                if (wordIdx >= activeMaskWordCount
+                        || (activeMaskWords[wordIdx] & (1L << (index & 63))) == 0L
+                        || sourceMask.contains(index)) {
                     continue;
                 }
                 double candidate = solveKrakkCell(
                         arrivalTimes,
                         resolvedSlowness,
-                        index,
-                        neighborNegX,
-                        neighborPosX,
-                        neighborNegY,
-                        neighborPosY,
-                        neighborNegZ,
-                        neighborPosZ
+                        activeMaskWords,
+                        activeMaskWordCount,
+                        index, x, y, z,
+                        sizeX, sizeY, sizeZ,
+                        strideX, strideY
                 );
                 if (!Double.isFinite(candidate)) {
                     continue;
                 }
-                double previous = arrivalTimes[index];
+                double previous = arrivalTimes.getFloat(index);
                 if (candidate + 1.0E-9D < previous) {
-                    arrivalTimes[index] = (float) candidate;
+                    arrivalTimes.setFloat(index, (float) candidate);
                     rowChanged = true;
                     if (Double.isFinite(previous)) {
                         maxDelta = Math.max(maxDelta, previous - candidate);
@@ -2314,100 +5774,123 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
     }
 
-    private static double solveKrakkCell(float[] arrivalTimes,
-                                           float[] resolvedSlowness,
-                                           int index,
-                                           int[] neighborNegX,
-                                           int[] neighborPosX,
-                                           int[] neighborNegY,
-                                           int[] neighborPosY,
-                                           int[] neighborNegZ,
-                                           int[] neighborPosZ) {
+    private static double solveKrakkCell(FloatIndexedAccess arrivalTimes,
+                                           FloatIndexedAccess resolvedSlowness,
+                                           long[] activeMaskWords,
+                                           int activeMaskWordCount,
+                                           int index, int x, int y, int z,
+                                           int sizeX, int sizeY, int sizeZ,
+                                           int strideX, int strideY) {
         double a = Double.POSITIVE_INFINITY;
-        int negX = neighborNegX[index];
-        int posX = neighborPosX[index];
-        if (negX >= 0) {
-            a = Math.min(a, arrivalTimes[negX]);
+        if (x > 0) {
+            int negX = index - strideX;
+            int negXWord = negX >> 6;
+            if (negXWord < activeMaskWordCount && (activeMaskWords[negXWord] & (1L << (negX & 63))) != 0L) {
+                a = Math.min(a, arrivalTimes.getFloat(negX));
+            }
         }
-        if (posX >= 0) {
-            a = Math.min(a, arrivalTimes[posX]);
+        if (x + 1 < sizeX) {
+            int posX = index + strideX;
+            int posXWord = posX >> 6;
+            if (posXWord < activeMaskWordCount && (activeMaskWords[posXWord] & (1L << (posX & 63))) != 0L) {
+                a = Math.min(a, arrivalTimes.getFloat(posX));
+            }
         }
 
         double b = Double.POSITIVE_INFINITY;
-        int negY = neighborNegY[index];
-        int posY = neighborPosY[index];
-        if (negY >= 0) {
-            b = Math.min(b, arrivalTimes[negY]);
+        if (y > 0) {
+            int negY = index - strideY;
+            int negYWord = negY >> 6;
+            if (negYWord < activeMaskWordCount && (activeMaskWords[negYWord] & (1L << (negY & 63))) != 0L) {
+                b = Math.min(b, arrivalTimes.getFloat(negY));
+            }
         }
-        if (posY >= 0) {
-            b = Math.min(b, arrivalTimes[posY]);
+        if (y + 1 < sizeY) {
+            int posY = index + strideY;
+            int posYWord = posY >> 6;
+            if (posYWord < activeMaskWordCount && (activeMaskWords[posYWord] & (1L << (posY & 63))) != 0L) {
+                b = Math.min(b, arrivalTimes.getFloat(posY));
+            }
         }
 
         double c = Double.POSITIVE_INFINITY;
-        int negZ = neighborNegZ[index];
-        int posZ = neighborPosZ[index];
-        if (negZ >= 0) {
-            c = Math.min(c, arrivalTimes[negZ]);
+        if (z > 0) {
+            int negZ = index - 1;
+            int negZWord = negZ >> 6;
+            if (negZWord < activeMaskWordCount && (activeMaskWords[negZWord] & (1L << (negZ & 63))) != 0L) {
+                c = Math.min(c, arrivalTimes.getFloat(negZ));
+            }
         }
-        if (posZ >= 0) {
-            c = Math.min(c, arrivalTimes[posZ]);
+        if (z + 1 < sizeZ) {
+            int posZ = index + 1;
+            int posZWord = posZ >> 6;
+            if (posZWord < activeMaskWordCount && (activeMaskWords[posZWord] & (1L << (posZ & 63))) != 0L) {
+                c = Math.min(c, arrivalTimes.getFloat(posZ));
+            }
         }
 
         if (!Double.isFinite(a) && !Double.isFinite(b) && !Double.isFinite(c)) {
             return Double.POSITIVE_INFINITY;
         }
-        return solveKrakkDistance(a, b, c, resolvedSlowness[index]);
+        return solveKrakkDistance(a, b, c, resolvedSlowness.getFloat(index));
     }
 
-    private static double solveKrakkCellFromAccepted(float[] arrivalTimes,
-                                                       float[] resolvedSlowness,
+    private static double solveKrakkCellFromAccepted(FloatIndexedAccess arrivalTimes,
+                                                       FloatIndexedAccess resolvedSlowness,
                                                        BitSet accepted,
                                                        int index,
-                                                       int[] neighborNegX,
-                                                       int[] neighborPosX,
-                                                       int[] neighborNegY,
-                                                       int[] neighborPosY,
-                                                       int[] neighborNegZ,
-                                                       int[] neighborPosZ) {
+                                                       KrakkField field) {
+        BitSet activeMask = field.activeMask();
+        int sizeX = field.sizeX();
+        int sizeY = field.sizeY();
+        int sizeZ = field.sizeZ();
+        int strideX = sizeY * sizeZ;
+        int strideY = sizeZ;
+        int x = index / strideX;
+        int yz = index - (x * strideX);
+        int y = yz / strideY;
+        int z = yz - (y * strideY);
+        int negX = x > 0 && activeMask.get(index - strideX) ? index - strideX : -1;
+        int posX = x + 1 < sizeX && activeMask.get(index + strideX) ? index + strideX : -1;
+        int negY = y > 0 && activeMask.get(index - strideY) ? index - strideY : -1;
+        int posY = y + 1 < sizeY && activeMask.get(index + strideY) ? index + strideY : -1;
+        int negZ = z > 0 && activeMask.get(index - 1) ? index - 1 : -1;
+        int posZ = z + 1 < sizeZ && activeMask.get(index + 1) ? index + 1 : -1;
+
         double a = minAcceptedKrakkAxisNeighbor(
                 arrivalTimes,
                 resolvedSlowness,
                 accepted,
-                neighborNegX[index],
-                neighborPosX[index]
+                negX,
+                posX
         );
         double b = minAcceptedKrakkAxisNeighbor(
                 arrivalTimes,
                 resolvedSlowness,
                 accepted,
-                neighborNegY[index],
-                neighborPosY[index]
+                negY,
+                posY
         );
         double c = minAcceptedKrakkAxisNeighbor(
                 arrivalTimes,
                 resolvedSlowness,
                 accepted,
-                neighborNegZ[index],
-                neighborPosZ[index]
+                negZ,
+                posZ
         );
         if (!Double.isFinite(a) && !Double.isFinite(b) && !Double.isFinite(c)) {
             return Double.POSITIVE_INFINITY;
         }
-        return solveKrakkDistance(a, b, c, resolvedSlowness[index]);
+        return solveKrakkDistance(a, b, c, resolvedSlowness.getFloat(index));
     }
 
-    private static void updateKrakkNeighborFromAccepted(float[] arrivalTimes,
-                                                          float[] resolvedSlowness,
+    private static void updateKrakkNeighborFromAccepted(MutableFloatIndexedAccess arrivalTimes,
+                                                          FloatIndexedAccess resolvedSlowness,
                                                           BitSet accepted,
                                                           KrakkMinHeap heap,
                                                           int neighborIndex,
-                                                          int[] neighborNegX,
-                                                          int[] neighborPosX,
-                                                          int[] neighborNegY,
-                                                          int[] neighborPosY,
-                                                          int[] neighborNegZ,
-                                                          int[] neighborPosZ) {
-        if (neighborIndex < 0 || accepted.get(neighborIndex) || resolvedSlowness[neighborIndex] <= 0.0F) {
+                                                          KrakkField field) {
+        if (neighborIndex < 0 || accepted.get(neighborIndex) || resolvedSlowness.getFloat(neighborIndex) <= 0.0F) {
             return;
         }
         double candidate = solveKrakkCellFromAccepted(
@@ -2415,35 +5898,66 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 resolvedSlowness,
                 accepted,
                 neighborIndex,
-                neighborNegX,
-                neighborPosX,
-                neighborNegY,
-                neighborPosY,
-                neighborNegZ,
-                neighborPosZ
+                field
         );
         if (!Double.isFinite(candidate)) {
             return;
         }
-        if (candidate + 1.0E-9D < arrivalTimes[neighborIndex]) {
-            arrivalTimes[neighborIndex] = (float) candidate;
+        if (candidate + 1.0E-9D < arrivalTimes.getFloat(neighborIndex)) {
+            arrivalTimes.setFloat(neighborIndex, (float) candidate);
             heap.add(neighborIndex, candidate);
         }
     }
 
-    private static double minAcceptedKrakkAxisNeighbor(float[] arrivalTimes,
-                                                         float[] resolvedSlowness,
+    private static void updateKrakkNeighborFromAcceptedDelta(MutableFloatIndexedAccess arrivalTimes,
+                                                               FloatIndexedAccess resolvedSlowness,
+                                                               BitSet accepted,
+                                                               KrakkDeltaBucketQueue bucketQueue,
+                                                               int neighborIndex,
+                                                               KrakkField field) {
+        if (neighborIndex < 0 || accepted.get(neighborIndex) || resolvedSlowness.getFloat(neighborIndex) <= 0.0F) {
+            return;
+        }
+        double candidate = solveKrakkCellFromAccepted(
+                arrivalTimes,
+                resolvedSlowness,
+                accepted,
+                neighborIndex,
+                field
+        );
+        if (!Double.isFinite(candidate)) {
+            return;
+        }
+        if (candidate + 1.0E-9D < arrivalTimes.getFloat(neighborIndex)) {
+            arrivalTimes.setFloat(neighborIndex, (float) candidate);
+            bucketQueue.add(neighborIndex, candidate);
+        }
+    }
+
+    private static double minAcceptedKrakkAxisNeighbor(FloatIndexedAccess arrivalTimes,
+                                                         FloatIndexedAccess resolvedSlowness,
                                                          BitSet accepted,
                                                          int negativeIndex,
                                                          int positiveIndex) {
         double min = Double.POSITIVE_INFINITY;
-        if (negativeIndex >= 0 && accepted.get(negativeIndex) && resolvedSlowness[negativeIndex] > 0.0F) {
-            min = Math.min(min, arrivalTimes[negativeIndex]);
+        if (negativeIndex >= 0 && accepted.get(negativeIndex) && resolvedSlowness.getFloat(negativeIndex) > 0.0F) {
+            min = Math.min(min, arrivalTimes.getFloat(negativeIndex));
         }
-        if (positiveIndex >= 0 && accepted.get(positiveIndex) && resolvedSlowness[positiveIndex] > 0.0F) {
-            min = Math.min(min, arrivalTimes[positiveIndex]);
+        if (positiveIndex >= 0 && accepted.get(positiveIndex) && resolvedSlowness.getFloat(positiveIndex) > 0.0F) {
+            min = Math.min(min, arrivalTimes.getFloat(positiveIndex));
         }
         return min;
+    }
+
+    private static int krakkDeltaBucketIndex(double arrival, double bucketWidth) {
+        if (!Double.isFinite(arrival) || arrival <= 0.0D) {
+            return 0;
+        }
+        double scaled = arrival / Math.max(1.0E-9D, bucketWidth);
+        if (scaled >= Integer.MAX_VALUE) {
+            return Integer.MAX_VALUE;
+        }
+        return (int) Math.floor(scaled);
     }
 
     private static double solveKrakkDistance(double a, double b, double c, double slowness) {
@@ -2470,20 +5984,22 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
 
         double s = Math.max(1.0E-6D, slowness);
+        double sSq = s * s;
         if (!Double.isFinite(t1)) {
             return t0 + s;
         }
         double result = t0 + s;
         if (result > t1) {
-            double discriminant2 = (2.0D * s * s) - square(t0 - t1);
+            double sq01 = square(t0 - t1);
+            double discriminant2 = (2.0D * sSq) - sq01;
             if (discriminant2 > 0.0D) {
                 result = (t0 + t1 + Math.sqrt(discriminant2)) * 0.5D;
             } else {
                 result = t1 + s;
             }
             if (Double.isFinite(t2) && result > t2) {
-                double discriminant3 = (3.0D * s * s)
-                        - square(t0 - t1)
+                double discriminant3 = (3.0D * sSq)
+                        - sq01
                         - square(t0 - t2)
                         - square(t1 - t2);
                 if (discriminant3 > 0.0D) {
@@ -2519,7 +6035,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                     int maxY,
                                                     int minZ,
                                                     int maxZ,
-                                                    LongArrayList candidateSolidPositions,
+                                                    LongIndexedAccess candidateSolidPositions,
                                                     Long2FloatOpenHashMap collapseWeightsByPos,
                                                     double impactBudget,
                                                     double normalizationWeight,
@@ -2665,6 +6181,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     collapseImpactPower,
                     source,
                     owner,
+                    KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS,
+                    false,
                     applyWorldChanges,
                     trace
             );
@@ -2857,7 +6375,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 directionLookupResolution
         );
         VolumetricTargetScanResult targetScanResult = scanVolumetricTargets(
-                solidPositions,
+                wrapLongArrayList(solidPositions),
                 targetScanContext,
                 true,
                 trace != null
@@ -2914,6 +6432,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     impactPower,
                     source,
                     owner,
+                    KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS,
+                    false,
                     applyWorldChanges,
                     trace
             );
@@ -2933,7 +6453,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 maxY,
                 minZ,
                 maxZ,
-                solidPositions,
+                wrapLongArrayList(solidPositions),
                 collapseWeightsByPos,
                 impactBudget,
                 normalizationWeight,
@@ -3146,6 +6666,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             localResistanceCache.defaultReturnValue(Double.NaN);
         }
         BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        LevelChunk cachedChunk = null;
+        int cachedChunkX = Integer.MIN_VALUE;
+        int cachedChunkZ = Integer.MIN_VALUE;
         int sampledVoxelCount = 0;
         for (int xOffset = startXOffsetInclusive; xOffset < endXOffsetExclusive; xOffset++) {
             int x = minX + xOffset;
@@ -3165,7 +6688,16 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                         continue;
                     }
                     sampledVoxelCount++;
-                    BlockState blockState = level.getBlockState(mutablePos);
+                    int chunkX = SectionPos.blockToSectionCoord(x);
+                    int chunkZ = SectionPos.blockToSectionCoord(z);
+                    if (chunkX != cachedChunkX || chunkZ != cachedChunkZ) {
+                        cachedChunkX = chunkX;
+                        cachedChunkZ = chunkZ;
+                        cachedChunk = level.getChunkSource().getChunkNow(chunkX, chunkZ);
+                    }
+                    BlockState blockState = cachedChunk != null
+                            ? cachedChunk.getBlockState(mutablePos)
+                            : level.getBlockState(mutablePos);
                     if (blockState.isAir()) {
                         continue;
                     }
@@ -3189,7 +6721,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                                              double radiusSq,
                                                                              int startXOffsetInclusive,
                                                                              int endXOffsetExclusive,
-                                                                             float[] slowness,
+                                                                             MutableFloatIndexedAccess slowness,
+                                                                             BitSet activeMask,
                                                                              int[] activeCountByRow,
                                                                              Int2DoubleOpenHashMap sharedResistanceCostCache) {
         Int2DoubleOpenHashMap localResistanceCache = sharedResistanceCostCache != null
@@ -3198,8 +6731,13 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         if (sharedResistanceCostCache == null) {
             localResistanceCache.defaultReturnValue(Double.NaN);
         }
-        LongArrayList localSolidPositions = new LongArrayList(Math.max(16, (endXOffsetExclusive - startXOffsetInclusive) * sizeY));
+        IntArrayList localSolidIndices = new IntArrayList(
+                estimateKrakkChunkSolidPositionsCapacity(endXOffsetExclusive - startXOffsetInclusive, sizeY)
+        );
         BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        LevelChunk cachedChunk = null;
+        int cachedChunkX = Integer.MIN_VALUE;
+        int cachedChunkZ = Integer.MIN_VALUE;
         int sampledVoxelCount = 0;
         float airSlowness = (float) KRAKK_AIR_SLOWNESS;
         float solidScale = (float) KRAKK_SOLID_SLOWNESS_SCALE;
@@ -3226,21 +6764,33 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     }
                     sampledVoxelCount++;
                     int index = baseIndex + zOffset;
-                    BlockState blockState = level.getBlockState(mutablePos);
+                    if (activeMask != null) {
+                        activeMask.set(index);
+                    }
+                    int chunkX = SectionPos.blockToSectionCoord(x);
+                    int chunkZ = SectionPos.blockToSectionCoord(z);
+                    if (chunkX != cachedChunkX || chunkZ != cachedChunkZ) {
+                        cachedChunkX = chunkX;
+                        cachedChunkZ = chunkZ;
+                        cachedChunk = level.getChunkSource().getChunkNow(chunkX, chunkZ);
+                    }
+                    BlockState blockState = cachedChunk != null
+                            ? cachedChunk.getBlockState(mutablePos)
+                            : level.getBlockState(mutablePos);
                     if (blockState.isAir()) {
-                        slowness[index] = airSlowness;
+                        slowness.setFloat(index, airSlowness);
                         rowActiveCount++;
                         continue;
                     }
                     double resistance = getCachedResistanceCost(localResistanceCache, blockState);
-                    slowness[index] = airSlowness + ((float) resistance * solidScale);
+                    slowness.setFloat(index, airSlowness + ((float) resistance * solidScale));
                     rowActiveCount++;
-                    localSolidPositions.add(mutablePos.asLong());
+                    localSolidIndices.add(index);
                 }
                 activeCountByRow[rowIndex] = rowActiveCount;
             }
         }
-        return new KrakkResistanceFieldChunkResult(localSolidPositions, sampledVoxelCount);
+        return new KrakkResistanceFieldChunkResult(localSolidIndices, sampledVoxelCount);
     }
 
     private static ResistanceFieldSnapshot sampleResistanceFieldSnapshot(ServerLevel level,
@@ -3347,7 +6897,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                                              int sizeZ,
                                                                              int startXOffsetInclusive,
                                                                              int endXOffsetExclusive,
-                                                                             float[] slowness,
+                                                                             MutableFloatIndexedAccess slowness,
+                                                                             BitSet activeMask,
                                                                              int[] activeCountByRow,
                                                                              Int2DoubleOpenHashMap sharedResistanceCostCache) {
         Int2DoubleOpenHashMap localResistanceCache = sharedResistanceCostCache != null
@@ -3356,7 +6907,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         if (sharedResistanceCostCache == null) {
             localResistanceCache.defaultReturnValue(Double.NaN);
         }
-        LongArrayList localSolidPositions = new LongArrayList(Math.max(16, (endXOffsetExclusive - startXOffsetInclusive) * sizeY));
+        IntArrayList localSolidIndices = new IntArrayList(
+                estimateKrakkChunkSolidPositionsCapacity(endXOffsetExclusive - startXOffsetInclusive, sizeY)
+        );
         BlockState[] sampledStates = resistanceFieldSnapshot.sampledStates();
         int sampledVoxelCount = 0;
         float airSlowness = (float) KRAKK_AIR_SLOWNESS;
@@ -3377,23 +6930,30 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     }
                     sampledVoxelCount++;
                     int index = baseIndex + zOffset;
+                    if (activeMask != null) {
+                        activeMask.set(index);
+                    }
                     if (blockState.isAir()) {
-                        slowness[index] = airSlowness;
+                        slowness.setFloat(index, airSlowness);
                         rowActiveCount++;
                         continue;
                     }
                     double resistance = getCachedResistanceCost(localResistanceCache, blockState);
-                    slowness[index] = airSlowness + ((float) resistance * solidScale);
+                    slowness.setFloat(index, airSlowness + ((float) resistance * solidScale));
                     rowActiveCount++;
-                    localSolidPositions.add(BlockPos.asLong(x, y, z));
+                    localSolidIndices.add(index);
                 }
                 activeCountByRow[rowIndex] = rowActiveCount;
             }
         }
-        return new KrakkResistanceFieldChunkResult(localSolidPositions, sampledVoxelCount);
+        return new KrakkResistanceFieldChunkResult(localSolidIndices, sampledVoxelCount);
     }
 
     private static int resolveResistanceFieldTaskCount(int sizeX, int sizeY, int sizeZ) {
+        RuntimeExecutionPolicy policy = activeRuntimeExecutionPolicy();
+        if (policy.forceDirectResistanceSampling()) {
+            return 1;
+        }
         if (!parallelResistanceFieldSamplingEnabled || VOLUMETRIC_TARGET_SCAN_POOL == null) {
             return 1;
         }
@@ -3404,12 +6964,127 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         if (voxelCount < RESISTANCE_FIELD_MIN_VOXELS_FOR_PARALLEL) {
             return 1;
         }
+        if (voxelCount > RESISTANCE_FIELD_MAX_PARALLEL_SNAPSHOT_VOXELS) {
+            return 1;
+        }
         int tasksByColumns = Math.max(1, sizeX / RESISTANCE_FIELD_COLUMNS_PER_TASK);
         int tasksByVoxels = (int) Math.max(1L, voxelCount / RESISTANCE_FIELD_MIN_VOXELS_PER_TASK);
         int tasksByWorkers = Math.max(1, VOLUMETRIC_TARGET_SCAN_PARALLELISM);
         int taskCount = Math.min(tasksByColumns, Math.min(tasksByVoxels, tasksByWorkers));
         taskCount = Math.min(taskCount, RESISTANCE_FIELD_MAX_TASKS);
         return taskCount >= 2 ? taskCount : 1;
+    }
+
+    private static int estimateKrakkSolidPositionsCapacity(int volume) {
+        long requested = Math.max(64L, Math.max(1L, (long) volume) / 64L);
+        return clampKrakkPreallocation(requested, 64, KRAKK_SOLID_POSITIONS_PREALLOC_CAP);
+    }
+
+    private static int estimateKrakkChunkSolidPositionsCapacity(int chunkWidth, int sizeY) {
+        long chunkCells = Math.max(1L, (long) Math.max(1, chunkWidth) * (long) Math.max(1, sizeY));
+        long requested = Math.max(16L, chunkCells / 8L);
+        return clampKrakkPreallocation(requested, 16, KRAKK_CHUNK_SOLID_POSITIONS_PREALLOC_CAP);
+    }
+
+    private static int estimateKrakkTargetMergeCapacity(int solidCount) {
+        long requested = Math.max(64L, Math.max(1L, (long) solidCount) / 16L);
+        return clampKrakkPreallocation(requested, 64, KRAKK_TARGET_MERGE_PREALLOC_CAP);
+    }
+
+    private static int clampKrakkPreallocation(long requested, int min, int cap) {
+        long bounded = Math.max(min, requested);
+        bounded = Math.min(bounded, cap);
+        return (int) Math.min(Integer.MAX_VALUE - 8L, bounded);
+    }
+
+    private static MutableFloatIndexedAccess createKrakkFloatStorage(int size) {
+        return createKrakkFloatStorage(size, true);
+    }
+
+    private static SourceIndexSet createSourceIndexSet(int approximateVolume) {
+        RuntimeExecutionPolicy policy = activeRuntimeExecutionPolicy();
+        if (policy.compactSourceTracking()) {
+            return new SparseSourceIndexSet();
+        }
+        int boundedSize = Math.max(1, approximateVolume);
+        return new BitSetSourceIndexSet(boundedSize);
+    }
+
+    private static FloatChunk createAdaptiveFloatChunk(int chunkSize, boolean preferOffHeapFirst) {
+        if (preferOffHeapFirst) {
+            try {
+                return new DirectFloatChunk(chunkSize);
+            } catch (OutOfMemoryError directAllocationFailure) {
+                // Fall back to heap for this chunk.
+            }
+            return new HeapFloatChunk(chunkSize);
+        }
+
+        try {
+            return new HeapFloatChunk(chunkSize);
+        } catch (OutOfMemoryError heapAllocationFailure) {
+            // Fall back to direct for this chunk.
+        }
+        return new DirectFloatChunk(chunkSize);
+    }
+
+    private static MutableFloatIndexedAccess createKrakkFloatStorage(int size, boolean preferOffHeapForLarge) {
+        int boundedSize = Math.max(1, size);
+        if (boundedSize >= KRAKK_PAGED_FLOAT_OFFLOAD_THRESHOLD) {
+            try {
+                return new PagedFloatArrayStorage(boundedSize, KRAKK_PAGED_FLOAT_CACHE_PAGES);
+            } catch (RuntimeException | OutOfMemoryError pagedStorageFailure) {
+                // Fall through to adaptive in-memory storage if paging cannot be initialized.
+            }
+        }
+        if (boundedSize >= KRAKK_OFFHEAP_FLOAT_OFFLOAD_THRESHOLD) {
+            if (!preferOffHeapForLarge) {
+                // Heap-first: try a single contiguous float[] before falling back to chunked.
+                // HeapFloatArrayStorage.getFloat() = values[index] — a plain array access with no
+                // chunk dispatch, bit-shift, or bounds-check overhead above the JVM's own array check.
+                // For 50kt explosions (~4.2M cells, 16.8 MB), this fits comfortably in a modern JVM heap.
+                try {
+                    return new HeapFloatArrayStorage(boundedSize);
+                } catch (OutOfMemoryError heapArrayOom) {
+                    // Heap is fragmented; fall through to chunked adaptive storage.
+                }
+            }
+            return new AdaptiveFloatArrayStorage(boundedSize, preferOffHeapForLarge);
+        }
+        return new HeapFloatArrayStorage(boundedSize);
+    }
+
+    private static MutableFloatIndexedAccess createKrakkSlownessStorage(int size) {
+        int boundedSize = Math.max(1, size);
+        if (boundedSize >= KRAKK_SPARSE_SLOWNESS_OFFLOAD_THRESHOLD) {
+            return new SparseAirSolidSlownessStorage(boundedSize, (float) KRAKK_AIR_SLOWNESS);
+        }
+        // Heap-first for slowness lets arrival buffers consume more direct memory later.
+        return createKrakkFloatStorage(boundedSize, false);
+    }
+
+    private static MutableFloatIndexedAccess createKrakkArrivalStorage(int size) {
+        // Heap-first for arrival: HeapFloatChunk.getFloat() = values[index] is ~3x faster than
+        // DirectFloatChunk.getFloat() = ByteBuffer.getFloat(), which incurs Buffer.checkIndex +
+        // ScopedMemoryAccess + Unsafe overhead on every solveKrakkCell call (7x per cell).
+        // For 50kt explosions, slowness uses SparseAirSolidSlownessStorage, so there is no
+        // heap/direct memory competition that motivated the original direct-first choice.
+        return createKrakkFloatStorage(size, false);
+    }
+
+    private static boolean requiresSerializedFloatAccess(FloatIndexedAccess indexedAccess) {
+        return indexedAccess instanceof PagedFloatArrayStorage;
+    }
+
+    private static boolean tracksActiveMaskInSlowness(FloatIndexedAccess indexedAccess) {
+        return indexedAccess instanceof SparseAirSolidSlownessStorage;
+    }
+
+    private static LongIndexedAccess wrapLongArrayList(LongArrayList values) {
+        if (values == null || values.isEmpty()) {
+            return EmptyLongIndexedAccess.INSTANCE;
+        }
+        return new LongArrayListIndexedAccess(values);
     }
 
     private static void cancelVolumetricResistanceFieldFutures(List<Future<VolumetricResistanceFieldChunkResult>> futures) {
@@ -3440,7 +7115,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
     }
 
-    private static VolumetricTargetScanResult scanVolumetricTargets(LongArrayList solidPositions,
+    private static VolumetricTargetScanResult scanVolumetricTargets(LongIndexedAccess solidPositions,
                                                                      VolumetricTargetScanContext context,
                                                                      boolean allowParallel,
                                                                      boolean profileSubstages) {
@@ -3465,8 +7140,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             ));
         }
 
-        LongArrayList mergedPositions = new LongArrayList(Math.max(64, solidCount / 8));
-        FloatArrayList mergedWeights = new FloatArrayList(Math.max(64, solidCount / 8));
+        int mergedCapacity = estimateKrakkTargetMergeCapacity(solidCount);
+        LongArrayList mergedPositions = new LongArrayList(mergedCapacity);
+        FloatArrayList mergedWeights = new FloatArrayList(mergedCapacity);
         long precheckNanos = 0L;
         long blendNanos = 0L;
         try {
@@ -3491,7 +7167,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return scanVolumetricTargetScanChunk(solidPositions, 0, solidCount, context, profileSubstages);
     }
 
-    private static VolumetricTargetScanResult scanVolumetricTargetScanChunk(LongArrayList solidPositions,
+    private static VolumetricTargetScanResult scanVolumetricTargetScanChunk(LongIndexedAccess solidPositions,
                                                                             int startInclusive,
                                                                             int endExclusive,
                                                                             VolumetricTargetScanContext context,
@@ -3507,6 +7183,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         double radialStepSize = Math.max(context.radialStepSize(), 1.0E-9D);
         double invRadialStepSize = 1.0D / radialStepSize;
         double resolvedRadius = Math.max(context.resolvedRadius(), 1.0E-9D);
+        double resolvedRadiusSq = resolvedRadius * resolvedRadius;
         double invResolvedRadius = 1.0D / resolvedRadius;
         int radialSteps = context.radialSteps();
         float[] maxPressureByShell = context.maxPressureByShell();
@@ -3529,6 +7206,12 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             double dy = (y + 0.5D) - centerY;
             double dz = (z + 0.5D) - centerZ;
             double distSq = (dx * dx) + (dy * dy) + (dz * dz);
+            if (distSq >= resolvedRadiusSq) {
+                if (profileSubstages) {
+                    precheckNanos += (System.nanoTime() - precheckStart);
+                }
+                continue;
+            }
             double dist = Math.sqrt(distSq);
             double shellPosition = dist * invRadialStepSize;
             double nx;
@@ -3547,14 +7230,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             double radialFraction = dist * invResolvedRadius;
             if (radialFraction >= VOLUMETRIC_EDGE_SPIKE_START_FRACTION) {
                 double edgeRadiusScale = computeVolumetricEdgeRadiusScale(
-                        centerX,
-                        centerY,
-                        centerZ,
-                        radialFraction,
-                        nx,
-                        ny,
-                        nz
-                );
+                        centerX, centerY, centerZ, radialFraction, nx, ny, nz);
                 radialFraction = dist / Math.max(resolvedRadius * edgeRadiusScale, 1.0E-9D);
             }
             if (radialFraction >= 1.0D) {
@@ -3565,7 +7241,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             }
             radialFraction = Mth.clamp(radialFraction, 0.0D, 1.0D);
             double centerGradient = 1.0D - radialFraction;
-            double edgeGradient = Math.pow(radialFraction, VOLUMETRIC_EDGE_POINT_BIAS_EXPONENT);
+            // 2.25 = 2 + 1/4, so x^2.25 = x² · ⁴√x — avoids Math.pow in the hot loop
+            double rfSq = radialFraction * radialFraction;
+            double edgeGradient = rfSq * Math.sqrt(Math.sqrt(radialFraction));
             double gradient = Mth.lerp(VOLUMETRIC_EDGE_POINT_BIAS_BLEND, centerGradient, edgeGradient);
             if (gradient <= 0.0D) {
                 if (profileSubstages) {
@@ -3574,10 +7252,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 continue;
             }
 
-            double outerSmoothFactor = radialFraction <= VOLUMETRIC_OUTER_SMOOTHING_FULL_WEIGHT_FRACTION
-                    ? 1.0D
-                    : computeVolumetricOuterSmoothFactor(radialFraction, x, y, z);
-            double maxWeight = gradient * outerSmoothFactor;
+            double maxWeight = gradient;
             if (maxWeight <= VOLUMETRIC_MIN_ENERGY) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
@@ -3660,25 +7335,72 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
     }
 
-    private static KrakkTargetScanResult scanKrakkTargets(LongArrayList solidPositions,
-                                                              float[] volumetricBaselineByIndex,
-                                                              float[] arrivalTimes,
-                                                              float[] shadowArrivalTimes,
+    private static double computeVolumetricEdgeRadiusScale(double centerX,
+                                                           double centerY,
+                                                           double centerZ,
+                                                           double radialFraction,
+                                                           double nx,
+                                                           double ny,
+                                                           double nz) {
+        int qx = Mth.floor((nx + 1.0D) * VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION);
+        int qy = Mth.floor((ny + 1.0D) * VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION);
+        int qz = Mth.floor((nz + 1.0D) * VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION);
+        int cx = Mth.floor(centerX * 2.0D);
+        int cy = Mth.floor(centerY * 2.0D);
+        int cz = Mth.floor(centerZ * 2.0D);
+        double primary = sampleVolumetricEdgeSpikeNoise(qx, qy, qz, cx, cy, cz);
+        double secondary = sampleVolumetricEdgeSpikeNoise((qx * 2) + 17, (qy * 2) + 31, (qz * 2) + 47, cx, cy, cz);
+        double noise = Mth.clamp((primary * 0.72D) + (secondary * 0.28D), 0.0D, 1.0D);
+        double outerSpan = Math.max(1.0E-6D, 1.0D - VOLUMETRIC_EDGE_SPIKE_START_FRACTION);
+        double edgeProgress = Mth.clamp((radialFraction - VOLUMETRIC_EDGE_SPIKE_START_FRACTION) / outerSpan, 0.0D, 1.0D);
+        double smoothStep = edgeProgress * edgeProgress * (3.0D - (2.0D * edgeProgress));
+        double ramp = Math.pow(smoothStep, VOLUMETRIC_EDGE_SPIKE_RAMP_EXPONENT);
+        double strength = Mth.lerp(ramp, VOLUMETRIC_EDGE_SPIKE_MIN_STRENGTH, 1.0D);
+        double reduction = VOLUMETRIC_EDGE_SPIKE_MAX_REDUCTION
+                * strength
+                * Math.pow(noise, VOLUMETRIC_EDGE_SPIKE_REDUCTION_EXPONENT);
+        return Mth.clamp(1.0D - reduction, 0.55D, 1.0D);
+    }
+
+    private static double sampleVolumetricEdgeSpikeNoise(int x, int y, int z, int cx, int cy, int cz) {
+        long hash = 0xD6E8FEB86659FD93L;
+        hash ^= ((long) x) * 0x9E3779B97F4A7C15L;
+        hash ^= ((long) y) * 0xC2B2AE3D27D4EB4FL;
+        hash ^= ((long) z) * 0x165667B19E3779F9L;
+        hash ^= ((long) cx) * 0x94D049BB133111EBL;
+        hash ^= ((long) cy) * 0xFF51AFD7ED558CCDL;
+        hash ^= ((long) cz) * 0xC4CEB9FE1A85EC53L;
+        hash ^= (hash >>> 33);
+        hash *= 0xFF51AFD7ED558CCDL;
+        hash ^= (hash >>> 33);
+        hash *= 0xC4CEB9FE1A85EC53L;
+        hash ^= (hash >>> 33);
+        return ((hash >>> 11) & 0x1FFFFFL) / 2097151.0D;
+    }
+
+    private static KrakkTargetScanResult scanKrakkTargets(LongIndexedAccess solidPositions,
+                                                              float[] baselineByIndex,
+                                                              FloatIndexedAccess arrivalTimes,
+                                                              FloatIndexedAccess shadowArrivalTimes,
                                                               KrakkField krakkField,
                                                               double centerX,
                                                               double centerY,
                                                               double centerZ,
                                                               double maxArrival,
+                                                              double blastTransmittance,
                                                               boolean allowParallel,
                                                               boolean profileSubstages) {
         int solidCount = solidPositions.size();
+        boolean parallelTargetScanAllowed = allowParallel
+                && !requiresSerializedFloatAccess(arrivalTimes)
+                && !requiresSerializedFloatAccess(shadowArrivalTimes);
         int taskCount = resolveKrakkTargetScanTaskCount(solidCount);
-        if (!allowParallel || taskCount <= 1 || VOLUMETRIC_TARGET_SCAN_POOL == null) {
+        if (!parallelTargetScanAllowed || taskCount <= 1 || VOLUMETRIC_TARGET_SCAN_POOL == null) {
             return scanKrakkTargetScanChunk(
                     solidPositions,
                     0,
                     solidCount,
-                    volumetricBaselineByIndex,
+                    baselineByIndex,
                     arrivalTimes,
                     shadowArrivalTimes,
                     krakkField,
@@ -3686,6 +7408,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     centerY,
                     centerZ,
                     maxArrival,
+                    blastTransmittance,
                     profileSubstages
             );
         }
@@ -3705,7 +7428,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                             solidPositions,
                             chunkStart,
                             chunkEnd,
-                            volumetricBaselineByIndex,
+                            baselineByIndex,
                             arrivalTimes,
                             shadowArrivalTimes,
                             krakkField,
@@ -3713,20 +7436,24 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                             centerY,
                             centerZ,
                             maxArrival,
+                            blastTransmittance,
                             profileSubstages
                     )
             ));
         }
 
-        LongArrayList mergedPositions = new LongArrayList(Math.max(64, solidCount / 8));
-        FloatArrayList mergedWeights = new FloatArrayList(Math.max(64, solidCount / 8));
+        int mergedCapacity = estimateKrakkTargetMergeCapacity(solidCount);
+        LongArrayList mergedPositions = new LongArrayList(mergedCapacity);
+        FloatArrayList mergedWeights = new FloatArrayList(mergedCapacity);
         double solidWeight = 0.0D;
+        double maxWeight = 0.0D;
         long precheckNanos = 0L;
         try {
             for (Future<KrakkTargetScanResult> future : futures) {
                 KrakkTargetScanResult chunkResult = future.get();
                 precheckNanos += chunkResult.precheckNanos();
                 solidWeight += chunkResult.solidWeight();
+                maxWeight = Math.max(maxWeight, chunkResult.maxWeight());
                 LongArrayList chunkPositions = chunkResult.targetPositions();
                 FloatArrayList chunkWeights = chunkResult.targetWeights();
                 for (int i = 0; i < chunkPositions.size(); i++) {
@@ -3734,7 +7461,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     mergedWeights.add(chunkWeights.getFloat(i));
                 }
             }
-            return new KrakkTargetScanResult(mergedPositions, mergedWeights, solidWeight, precheckNanos);
+            return new KrakkTargetScanResult(mergedPositions, mergedWeights, solidWeight, maxWeight, precheckNanos);
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             cancelKrakkTargetScanFutures(futures);
@@ -3745,7 +7472,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 solidPositions,
                 0,
                 solidCount,
-                volumetricBaselineByIndex,
+                baselineByIndex,
                 arrivalTimes,
                 shadowArrivalTimes,
                 krakkField,
@@ -3753,25 +7480,28 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 centerY,
                 centerZ,
                 maxArrival,
+                blastTransmittance,
                 profileSubstages
         );
     }
 
-    private static KrakkTargetScanResult scanKrakkTargetScanChunk(LongArrayList solidPositions,
+    private static KrakkTargetScanResult scanKrakkTargetScanChunk(LongIndexedAccess solidPositions,
                                                                        int startInclusive,
                                                                        int endExclusive,
-                                                                       float[] volumetricBaselineByIndex,
-                                                                       float[] arrivalTimes,
-                                                                       float[] shadowArrivalTimes,
+                                                                       float[] baselineByIndex,
+                                                                       FloatIndexedAccess arrivalTimes,
+                                                                       FloatIndexedAccess shadowArrivalTimes,
                                                                        KrakkField krakkField,
                                                                        double centerX,
                                                                        double centerY,
                                                                        double centerZ,
                                                                        double maxArrival,
+                                                                       double blastTransmittance,
                                                                        boolean profileSubstages) {
         int expectedTargets = Math.max(16, (endExclusive - startInclusive) / 8);
         LongArrayList targetPositions = new LongArrayList(expectedTargets);
         FloatArrayList targetWeights = new FloatArrayList(expectedTargets);
+        double maxWeight = 0.0D;
         long precheckNanos = 0L;
         double solidWeight = 0.0D;
         int fieldMinX = krakkField.minX();
@@ -3779,29 +7509,26 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int fieldMinZ = krakkField.minZ();
         int fieldSizeY = krakkField.sizeY();
         int fieldSizeZ = krakkField.sizeZ();
+        // Hoisted out of the per-block loop: depends only on the loop-invariant blastTransmittance.
+        // At blastTransmittanceScale=0 the Fibonacci-sampled baseline is not used to cull blocks —
+        // its irregular boundary coverage would produce a lumpy outer surface; the eikonal arrival
+        // gate and final weight threshold are sufficient.
+        double blastTransmittanceScale = Math.min(1.0D, blastTransmittance / KRAKK_BASELINE_SMOOTH_BLEND);
         for (int i = startInclusive; i < endExclusive; i++) {
             long posLong = solidPositions.getLong(i);
             long precheckStart = profileSubstages ? System.nanoTime() : 0L;
-            float baselineWeight = i >= 0 && i < volumetricBaselineByIndex.length
-                    ? volumetricBaselineByIndex[i]
-                    : Float.NaN;
-            if (!Float.isFinite(baselineWeight) || baselineWeight <= KRAKK_TARGET_MIN_WEIGHT) {
+            int x = BlockPos.getX(posLong);
+            int y = BlockPos.getY(posLong);
+            int z = BlockPos.getZ(posLong);
+            int index = krakkGridIndex(x - fieldMinX, y - fieldMinY, z - fieldMinZ, fieldSizeY, fieldSizeZ);
+            float baselineWeight = baselineByIndex[index];
+            if (blastTransmittanceScale > 0.0D && (!Float.isFinite(baselineWeight) || baselineWeight <= KRAKK_TARGET_MIN_WEIGHT)) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
                 }
                 continue;
             }
-            int x = BlockPos.getX(posLong);
-            int y = BlockPos.getY(posLong);
-            int z = BlockPos.getZ(posLong);
-            int index = krakkGridIndex(
-                    x - fieldMinX,
-                    y - fieldMinY,
-                    z - fieldMinZ,
-                    fieldSizeY,
-                    fieldSizeZ
-            );
-            double arrival = arrivalTimes[index];
+            double arrival = arrivalTimes.getFloat(index);
             if (!Double.isFinite(arrival) || arrival > maxArrival) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
@@ -3825,7 +7552,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             double resistanceOverrun = Math.max(0.0D, arrival - airArrival);
             double effectiveOverrun = Math.max(0.0D, resistanceOverrun - KRAKK_OVERRUN_DEADZONE);
             double normalizedOverrun = effectiveOverrun / Math.max(1.0D, airArrival);
-            if (normalizedOverrun >= KRAKK_HARD_BLOCK_NORMALIZED_OVERRUN) {
+            // At blastTransmittanceScale=0 (smooth) bypass material-resistance filters so the result is
+            // a clean sphere unaffected by block density. At blastTransmittanceScale=1 the
+            // original hard-block rules apply in full.
+            if (blastTransmittanceScale > 0.0D && normalizedOverrun >= KRAKK_HARD_BLOCK_NORMALIZED_OVERRUN) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
                 }
@@ -3835,13 +7565,13 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     -(effectiveOverrun * KRAKK_RESISTANCE_ATTENUATION_PER_OVERRUN)
                             - (normalizedOverrun * KRAKK_RESISTANCE_NORMALIZED_ATTENUATION)
             );
-            if (transmittance <= KRAKK_MIN_TRANSMITTANCE) {
+            if (blastTransmittanceScale > 0.0D && transmittance <= KRAKK_MIN_TRANSMITTANCE) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
                 }
                 continue;
             }
-            double shadowArrival = shadowArrivalTimes[index];
+            double shadowArrival = shadowArrivalTimes.getFloat(index);
             if (!Double.isFinite(shadowArrival)) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
@@ -3851,7 +7581,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             double shadowOverrun = Math.max(0.0D, shadowArrival - arrival);
             double effectiveShadowOverrun = Math.max(0.0D, shadowOverrun - KRAKK_SHADOW_OVERRUN_DEADZONE);
             double normalizedShadowOverrun = effectiveShadowOverrun / Math.max(0.25D, airArrival);
-            if (normalizedShadowOverrun >= KRAKK_HARD_BLOCK_SHADOW_NORMALIZED_OVERRUN) {
+            if (blastTransmittanceScale > 0.0D && normalizedShadowOverrun >= KRAKK_HARD_BLOCK_SHADOW_NORMALIZED_OVERRUN) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
                 }
@@ -3861,25 +7591,91 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     -(effectiveShadowOverrun * KRAKK_SHADOW_ATTENUATION_PER_OVERRUN)
                             - (normalizedShadowOverrun * KRAKK_SHADOW_NORMALIZED_ATTENUATION)
             );
-            if (shadowTransmittance <= KRAKK_MIN_TRANSMITTANCE) {
+            if (blastTransmittanceScale > 0.0D && shadowTransmittance <= KRAKK_MIN_TRANSMITTANCE) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
                 }
                 continue;
             }
-            double eikEnvelope = Math.pow(normalized, KRAKK_WEIGHT_EXPONENT);
-            double krakkTransFactor = Mth.lerp(
+            double eikNormalized = normalized;
+            boolean outerGatePassed = false;
+            if (normalized < 0.5D) {
+                long h = ((long) x * 0x9E3779B97F4A7C15L)
+                       ^ ((long) y * 0x6C62272E07BB0142L)
+                       ^ ((long) z * 0xCB9C59B3F9F87D4DL)
+                       ^ ((long) Mth.floor(centerX) * 0xBF58476D1CE4E5B9L)
+                       ^ ((long) Mth.floor(centerZ) * 0x94D049BB133111EBL);
+                h ^= (h >>> 33);
+                h *= 0xFF51AFD7ED558CCDL;
+                h ^= (h >>> 33);
+                double blockNoise = (h >>> 11 & 0x1FFFFFL) / 2097151.0D;
+                // keepProbability: 1.0 when blastTransmittanceScale=0 (nothing skipped),
+                // normalized*2.0 when blastTransmittanceScale=1 (original gate).
+                double keepProbability = 1.0D - blastTransmittanceScale * (1.0D - normalized * 2.0D);
+                if (blockNoise >= keepProbability) {
+                    if (profileSubstages) {
+                        precheckNanos += (System.nanoTime() - precheckStart);
+                    }
+                    continue;
+                }
+                outerGatePassed = blastTransmittanceScale > 0.0D;
+            }
+            double weightExponent = Mth.lerp(blastTransmittanceScale, KRAKK_WEIGHT_EXPONENT_SMOOTH, KRAKK_WEIGHT_EXPONENT);
+            double eikEnvelope = Math.pow(eikNormalized, weightExponent);
+            double rawTransFactor = Mth.lerp(
                     KRAKK_ENVELOPE_TRANSMITTANCE_BLEND,
                     1.0D,
                     transmittance * shadowTransmittance
             );
+            // At blastTransmittanceScale=0 (smooth) transmittance has no effect (factor=1.0);
+            // at blastTransmittanceScale=1 it applies fully.
+            double krakkTransFactor = Mth.lerp(blastTransmittanceScale, 1.0D, rawTransFactor);
+            double blendFloor = Mth.lerp(blastTransmittanceScale, KRAKK_BASELINE_SMOOTH_BLEND_FLOOR, KRAKK_BASELINE_SMOOTH_BLEND);
             double smoothingFactor = Mth.lerp(
-                    KRAKK_BASELINE_SMOOTH_BLEND,
+                    blendFloor,
                     1.0D,
                     eikEnvelope * krakkTransFactor
             );
-            double cutoffRetention = computeKrakkCutoffEdgeRetention(normalized);
-            double weight = baselineWeight * smoothingFactor * cutoffRetention;
+            // Gate-passing blocks blend cutoffRetention toward 1.0 proportionally to
+            // blastTransmittanceScale: at full blastTransmittance the gate is the sole break/spare decision
+            // (retention=1), at zero blastTransmittance the smooth curve is used in full.
+            double smoothCutoff = computeKrakkCutoffEdgeRetention(eikNormalized);
+            double cutoffRetention = outerGatePassed
+                    ? Mth.lerp(blastTransmittanceScale, smoothCutoff, 1.0D)
+                    : smoothCutoff;
+            double rawWeight = baselineWeight * smoothingFactor * cutoffRetention;
+            // At blastTransmittanceScale=0 (smooth) ignore baselineWeight/eikonal variation entirely —
+            // all blocks inside the sphere get uniform weight; only the edge soft-falloff remains.
+            // At blastTransmittanceScale=1 the full eikonal+fibonacci shaped weight is used.
+            // Nonlinear (squared) so that moderate blastTransmittanceScale values lean smoothly quickly.
+            double smoothT = blastTransmittanceScale * blastTransmittanceScale;
+            double weight = Mth.lerp(smoothT, cutoffRetention, rawWeight);
+            // Near the blast boundary (normalized < 0.20), suppress non-spike directions so
+            // the inner side of each spike has a valley. Spike directions are left untouched;
+            // the matching outward tips are added in applyExtraRadiusImpacts using the same noise.
+            if (normalized < 0.20D && blastTransmittanceScale > 0.0D) {
+                double ddx = x + 0.5D - centerX;
+                double ddy = y + 0.5D - centerY;
+                double ddz = z + 0.5D - centerZ;
+                double ddist = Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+                double invDist = ddist > 1.0E-9D ? 1.0D / ddist : 0.0D;
+                int qx = Mth.floor((ddx * invDist + 1.0D) * VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION);
+                int qy = Mth.floor((ddy * invDist + 1.0D) * VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION);
+                int qz = Mth.floor((ddz * invDist + 1.0D) * VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION);
+                int cx = Mth.floor(centerX * 2.0D);
+                int cy = Mth.floor(centerY * 2.0D);
+                int cz = Mth.floor(centerZ * 2.0D);
+                double primary   = sampleVolumetricEdgeSpikeNoise(qx, qy, qz, cx, cy, cz);
+                double secondary = sampleVolumetricEdgeSpikeNoise((qx * 2) + 7, (qy * 2) + 13, (qz * 2) + 19, cx, cy, cz);
+                double noiseVal  = Mth.clamp(primary * 0.72D + secondary * 0.28D, 0.0D, 1.0D);
+                if (noiseVal < 0.5D) {
+                    // Non-spike direction: suppress weight proportional to boundary proximity
+                    // and how far the noise is below the threshold — hard suppression for valleys.
+                    double boundaryT   = 1.0D - normalized / 0.20D; // 0 at normalized=0.20, 1 at boundary
+                    double belowThresh = (0.5D - noiseVal) * 2.0D;  // 0 at threshold, 1 at min noise
+                    weight *= Math.max(0.0D, 1.0D - blastTransmittanceScale * boundaryT * belowThresh);
+                }
+            }
             if (weight <= KRAKK_TARGET_MIN_WEIGHT) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
@@ -3887,49 +7683,15 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 continue;
             }
             double sampledWeight = weight;
-            if (KRAKK_ENABLE_LOW_WEIGHT_STOCHASTIC_SAMPLING
-                    && weight < KRAKK_LOW_WEIGHT_STOCHASTIC_THRESHOLD) {
-                double keepProbability = Mth.clamp(
-                        weight / KRAKK_LOW_WEIGHT_STOCHASTIC_THRESHOLD,
-                        KRAKK_LOW_WEIGHT_STOCHASTIC_MIN_KEEP_PROBABILITY,
-                        1.0D
-                );
-                double keepRoll = sampleKrakkLowWeightKeepNoise(x, y, z, centerX, centerY, centerZ);
-                if (keepRoll > keepProbability) {
-                    if (profileSubstages) {
-                        precheckNanos += (System.nanoTime() - precheckStart);
-                    }
-                    continue;
-                }
-                sampledWeight = weight / keepProbability;
-            }
             if (profileSubstages) {
                 precheckNanos += (System.nanoTime() - precheckStart);
             }
             targetPositions.add(posLong);
             targetWeights.add((float) sampledWeight);
             solidWeight += sampledWeight;
+            if (sampledWeight > maxWeight) maxWeight = sampledWeight;
         }
-        return new KrakkTargetScanResult(targetPositions, targetWeights, solidWeight, precheckNanos);
-    }
-
-    private static double sampleKrakkLowWeightKeepNoise(int x, int y, int z, double centerX, double centerY, double centerZ) {
-        int cx = Mth.floor(centerX * 2.0D);
-        int cy = Mth.floor(centerY * 2.0D);
-        int cz = Mth.floor(centerZ * 2.0D);
-        long hash = 0xA24BAED4963EE407L;
-        hash ^= ((long) x) * 0x9E3779B97F4A7C15L;
-        hash ^= ((long) y) * 0xC2B2AE3D27D4EB4FL;
-        hash ^= ((long) z) * 0x165667B19E3779F9L;
-        hash ^= ((long) cx) * 0x94D049BB133111EBL;
-        hash ^= ((long) cy) * 0xFF51AFD7ED558CCDL;
-        hash ^= ((long) cz) * 0xC4CEB9FE1A85EC53L;
-        hash ^= (hash >>> 33);
-        hash *= 0xFF51AFD7ED558CCDL;
-        hash ^= (hash >>> 33);
-        hash *= 0xC4CEB9FE1A85EC53L;
-        hash ^= (hash >>> 33);
-        return ((hash >>> 11) & 0x1FFFFFL) / 2097151.0D;
+        return new KrakkTargetScanResult(targetPositions, targetWeights, solidWeight, maxWeight, precheckNanos);
     }
 
     private static int resolveKrakkTargetScanTaskCount(int solidCount) {
@@ -3981,132 +7743,74 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     VOLUMETRIC_DIRECTION_NEIGHBOR_COUNT
             );
             int lookupResolution = Math.max(8, VOLUMETRIC_DIRECTION_LOOKUP_RESOLUTION);
-            int[] directionLookup = buildVolumetricDirectionLookup(dirX, dirY, dirZ, lookupResolution);
+            int[] directionLookup = buildVolumetricDirectionCubeMap(dirX, dirY, dirZ, lookupResolution);
             return new VolumetricDirectionCache(dirX, dirY, dirZ, neighbors, directionLookup, lookupResolution);
         });
     }
 
-    private static int[] buildVolumetricDirectionLookup(double[] dirX,
-                                                        double[] dirY,
-                                                        double[] dirZ,
-                                                        int resolution) {
-        int entryCount = resolution * resolution;
-        int[] lookup = new int[Math.max(1, entryCount)];
+    // Cube-map direction lookup: 6 faces × resolution² cells. Each face covers one
+    // dominant-axis hemisphere (+x, -x, +y, -y, +z, -z). No fold-back, no signum(0)
+    // singularity, no seam along any world axis. Total table size = 6 × resolution².
+    private static int[] buildVolumetricDirectionCubeMap(double[] dirX,
+                                                          double[] dirY,
+                                                          double[] dirZ,
+                                                          int resolution) {
+        int faceSize = resolution * resolution;
+        int[] cubeMap = new int[6 * faceSize];
         int directionCount = dirX.length;
-        for (int v = 0; v < resolution; v++) {
-            for (int u = 0; u < resolution; u++) {
-                Direction direction = decodeOctahedralDirection(u, v, resolution);
-                double nx = direction.x();
-                double ny = direction.y();
-                double nz = direction.z();
-                int bestIndex = 0;
-                double bestDot = -Double.MAX_VALUE;
-                for (int i = 0; i < directionCount; i++) {
-                    double dot = (nx * dirX[i]) + (ny * dirY[i]) + (nz * dirZ[i]);
-                    if (dot > bestDot) {
-                        bestDot = dot;
-                        bestIndex = i;
+        for (int face = 0; face < 6; face++) {
+            for (int v = 0; v < resolution; v++) {
+                for (int u = 0; u < resolution; u++) {
+                    Direction dir = decodeCubeMapDirection(face, u, v, resolution);
+                    double dnx = dir.x();
+                    double dny = dir.y();
+                    double dnz = dir.z();
+                    int bestIndex = 0;
+                    double bestDot = -Double.MAX_VALUE;
+                    for (int i = 0; i < directionCount; i++) {
+                        double dot = (dnx * dirX[i]) + (dny * dirY[i]) + (dnz * dirZ[i]);
+                        if (dot > bestDot) {
+                            bestDot = dot;
+                            bestIndex = i;
+                        }
                     }
+                    cubeMap[face * faceSize + v * resolution + u] = bestIndex;
                 }
-                lookup[(v * resolution) + u] = bestIndex;
             }
         }
-        return lookup;
+        return cubeMap;
     }
 
-    private static Direction decodeOctahedralDirection(int u, int v, int resolution) {
-        double ox = (((u + 0.5D) / resolution) * 2.0D) - 1.0D;
-        double oy = (((v + 0.5D) / resolution) * 2.0D) - 1.0D;
-        double oz = 1.0D - Math.abs(ox) - Math.abs(oy);
-        if (oz < 0.0D) {
-            double oldX = ox;
-            double oldY = oy;
-            ox = (1.0D - Math.abs(oldY)) * Math.signum(oldX);
-            oy = (1.0D - Math.abs(oldX)) * Math.signum(oldY);
-            oz = -oz;
+    // Face layout (ou, ov are the two non-dominant Minecraft axes, ref is the dominant):
+    //   0 = +x: ref=+1, ou=ny/nx,   ov=nz/nx   → decode (1,  ou, ov)
+    //   1 = -x: ref=-1, ou=ny/|nx|, ov=nz/|nx| → decode (-1, ou, ov)
+    //   2 = +y: ref=+1, ou=nx/ny,   ov=nz/ny   → decode (ou, 1,  ov)
+    //   3 = -y: ref=-1, ou=nx/|ny|, ov=nz/|ny| → decode (ou, -1, ov)
+    //   4 = +z: ref=+1, ou=nx/nz,   ov=ny/nz   → decode (ou, ov, 1 )
+    //   5 = -z: ref=-1, ou=nx/|nz|, ov=ny/|nz| → decode (ou, ov, -1)
+    private static Direction decodeCubeMapDirection(int face, int u, int v, int resolution) {
+        double ou = (((u + 0.5D) / resolution) * 2.0D) - 1.0D;
+        double ov = (((v + 0.5D) / resolution) * 2.0D) - 1.0D;
+        double dx, dy, dz;
+        switch (face) {
+            case 0:  dx =  1.0D; dy = ou;  dz = ov;  break;
+            case 1:  dx = -1.0D; dy = ou;  dz = ov;  break;
+            case 2:  dx = ou;  dy =  1.0D; dz = ov;  break;
+            case 3:  dx = ou;  dy = -1.0D; dz = ov;  break;
+            case 4:  dx = ou;  dy = ov;  dz =  1.0D; break;
+            default: dx = ou;  dy = ov;  dz = -1.0D; break;
         }
-        double length = Math.sqrt((ox * ox) + (oy * oy) + (oz * oz));
-        if (length <= 1.0E-9D) {
+        double len = Math.sqrt((dx * dx) + (dy * dy) + (dz * dz));
+        if (len <= 1.0E-9D) {
             return new Direction(0.0D, 1.0D, 0.0D);
         }
-        double invLength = 1.0D / length;
-        return new Direction(ox * invLength, oy * invLength, oz * invLength);
+        double inv = 1.0D / len;
+        return new Direction(dx * inv, dy * inv, dz * inv);
     }
 
     private static double computeVolumetricRadiusScale(double radius, double maxScale) {
         double normalized = radius / VOLUMETRIC_RADIUS_SCALE_BASE;
         return Mth.clamp(normalized, 1.0D, maxScale);
-    }
-
-    private static double computeVolumetricOuterSmoothFactor(double radialFraction, int x, int y, int z) {
-        double smoothingRatio = VOLUMETRIC_OUTER_SMOOTHING_RATIO
-                + (sampleVolumetricOuterSmoothingVariance(x, y, z) * VOLUMETRIC_OUTER_SMOOTHING_VARIANCE);
-        smoothingRatio = Mth.clamp(smoothingRatio, 0.01D, 0.20D);
-        double start = 1.0D - smoothingRatio;
-        if (radialFraction <= start) {
-            return 1.0D;
-        }
-        double t = Mth.clamp((radialFraction - start) / Math.max(smoothingRatio, 1.0E-9D), 0.0D, 1.0D);
-        double smoothStep = t * t * (3.0D - (2.0D * t));
-        return 1.0D - smoothStep;
-    }
-
-    private static double computeVolumetricEdgeRadiusScale(double centerX,
-                                                           double centerY,
-                                                           double centerZ,
-                                                           double radialFraction,
-                                                           double nx,
-                                                           double ny,
-                                                           double nz) {
-        int qx = Mth.floor((nx + 1.0D) * VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION);
-        int qy = Mth.floor((ny + 1.0D) * VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION);
-        int qz = Mth.floor((nz + 1.0D) * VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION);
-        int cx = Mth.floor(centerX * 2.0D);
-        int cy = Mth.floor(centerY * 2.0D);
-        int cz = Mth.floor(centerZ * 2.0D);
-
-        double primary = sampleVolumetricEdgeSpikeNoise(qx, qy, qz, cx, cy, cz);
-        double secondary = sampleVolumetricEdgeSpikeNoise((qx * 2) + 17, (qy * 2) + 31, (qz * 2) + 47, cx, cy, cz);
-        double noise = Mth.clamp((primary * 0.72D) + (secondary * 0.28D), 0.0D, 1.0D);
-        double outerSpan = Math.max(1.0E-6D, 1.0D - VOLUMETRIC_EDGE_SPIKE_START_FRACTION);
-        double edgeProgress = Mth.clamp((radialFraction - VOLUMETRIC_EDGE_SPIKE_START_FRACTION) / outerSpan, 0.0D, 1.0D);
-        double smoothStep = edgeProgress * edgeProgress * (3.0D - (2.0D * edgeProgress));
-        double ramp = Math.pow(smoothStep, VOLUMETRIC_EDGE_SPIKE_RAMP_EXPONENT);
-        double strength = Mth.lerp(ramp, VOLUMETRIC_EDGE_SPIKE_MIN_STRENGTH, 1.0D);
-        double reduction = VOLUMETRIC_EDGE_SPIKE_MAX_REDUCTION
-                * strength
-                * Math.pow(noise, VOLUMETRIC_EDGE_SPIKE_REDUCTION_EXPONENT);
-        return Mth.clamp(1.0D - reduction, 0.55D, 1.0D);
-    }
-
-    private static double sampleVolumetricEdgeSpikeNoise(int x, int y, int z, int cx, int cy, int cz) {
-        long hash = 0xD6E8FEB86659FD93L;
-        hash ^= ((long) x) * 0x9E3779B97F4A7C15L;
-        hash ^= ((long) y) * 0xC2B2AE3D27D4EB4FL;
-        hash ^= ((long) z) * 0x165667B19E3779F9L;
-        hash ^= ((long) cx) * 0x94D049BB133111EBL;
-        hash ^= ((long) cy) * 0xFF51AFD7ED558CCDL;
-        hash ^= ((long) cz) * 0xC4CEB9FE1A85EC53L;
-        hash ^= (hash >>> 33);
-        hash *= 0xFF51AFD7ED558CCDL;
-        hash ^= (hash >>> 33);
-        hash *= 0xC4CEB9FE1A85EC53L;
-        hash ^= (hash >>> 33);
-        return ((hash >>> 11) & 0x1FFFFFL) / 2097151.0D;
-    }
-
-    private static double sampleVolumetricOuterSmoothingVariance(int x, int y, int z) {
-        long hash = 0x9E3779B97F4A7C15L;
-        hash ^= ((long) x) * 0xC2B2AE3D27D4EB4FL;
-        hash ^= ((long) y) * 0x165667B19E3779F9L;
-        hash ^= ((long) z) * 0x85EBCA77C2B2AE63L;
-        hash ^= (hash >>> 33);
-        hash *= 0xFF51AFD7ED558CCDL;
-        hash ^= (hash >>> 33);
-        hash *= 0xC4CEB9FE1A85EC53L;
-        hash ^= (hash >>> 33);
-        double unit = ((hash >>> 11) & 0x1FFFFFL) / 2097151.0D;
-        return (unit * 2.0D) - 1.0D;
     }
 
     private static double sampleBlendedVolumetricPressure(float[] pressureByShell,
@@ -4140,95 +7844,68 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         double dot5 = -Double.MAX_VALUE;
         double dot6 = -Double.MAX_VALUE;
         double dot7 = -Double.MAX_VALUE;
-        for (int i = 0; i < directionCount; i++) {
+        // Fast-path: octahedral lookup gives nearest Fibonacci seed in O(1), then
+        // search only the seed + its pre-computed 20 neighbors (~21 candidates total)
+        // instead of the full O(directionCount=3072) scan. The decodeOctahedralDirection
+        // fix ensures the lookup covers both hemispheres correctly.
+        int seedCell = cubeMapLookupIndex(nx, ny, nz, directionLookupResolution);
+        int seed = directionLookup[seedCell];
+        int[] seedNeighbors = directionNeighbors[seed];
+        for (int pass = 0; pass <= seedNeighbors.length; pass++) {
+            int i = (pass == 0) ? seed : seedNeighbors[pass - 1];
+            if (i < 0) break;
             double dot = (nx * dirX[i]) + (ny * dirY[i]) + (nz * dirZ[i]);
             if (dot > dot0) {
-                dot7 = dot6;
-                best7 = best6;
-                dot6 = dot5;
-                best6 = best5;
-                dot5 = dot4;
-                best5 = best4;
-                dot4 = dot3;
-                best4 = best3;
-                dot3 = dot2;
-                best3 = best2;
-                dot2 = dot1;
-                best2 = best1;
-                dot1 = dot0;
-                best1 = best0;
-                dot0 = dot;
-                best0 = i;
+                dot7 = dot6; best7 = best6;
+                dot6 = dot5; best6 = best5;
+                dot5 = dot4; best5 = best4;
+                dot4 = dot3; best4 = best3;
+                dot3 = dot2; best3 = best2;
+                dot2 = dot1; best2 = best1;
+                dot1 = dot0; best1 = best0;
+                dot0 = dot; best0 = i;
             } else if (dot > dot1) {
-                dot7 = dot6;
-                best7 = best6;
-                dot6 = dot5;
-                best6 = best5;
-                dot5 = dot4;
-                best5 = best4;
-                dot4 = dot3;
-                best4 = best3;
-                dot3 = dot2;
-                best3 = best2;
-                dot2 = dot1;
-                best2 = best1;
-                dot1 = dot;
-                best1 = i;
+                dot7 = dot6; best7 = best6;
+                dot6 = dot5; best6 = best5;
+                dot5 = dot4; best5 = best4;
+                dot4 = dot3; best4 = best3;
+                dot3 = dot2; best3 = best2;
+                dot2 = dot1; best2 = best1;
+                dot1 = dot; best1 = i;
             } else if (dot > dot2) {
-                dot7 = dot6;
-                best7 = best6;
-                dot6 = dot5;
-                best6 = best5;
-                dot5 = dot4;
-                best5 = best4;
-                dot4 = dot3;
-                best4 = best3;
-                dot3 = dot2;
-                best3 = best2;
-                dot2 = dot;
-                best2 = i;
+                dot7 = dot6; best7 = best6;
+                dot6 = dot5; best6 = best5;
+                dot5 = dot4; best5 = best4;
+                dot4 = dot3; best4 = best3;
+                dot3 = dot2; best3 = best2;
+                dot2 = dot; best2 = i;
             } else if (dot > dot3) {
-                dot7 = dot6;
-                best7 = best6;
-                dot6 = dot5;
-                best6 = best5;
-                dot5 = dot4;
-                best5 = best4;
-                dot4 = dot3;
-                best4 = best3;
-                dot3 = dot;
-                best3 = i;
+                dot7 = dot6; best7 = best6;
+                dot6 = dot5; best6 = best5;
+                dot5 = dot4; best5 = best4;
+                dot4 = dot3; best4 = best3;
+                dot3 = dot; best3 = i;
             } else if (dot > dot4) {
-                dot7 = dot6;
-                best7 = best6;
-                dot6 = dot5;
-                best6 = best5;
-                dot5 = dot4;
-                best5 = best4;
-                dot4 = dot;
-                best4 = i;
+                dot7 = dot6; best7 = best6;
+                dot6 = dot5; best6 = best5;
+                dot5 = dot4; best5 = best4;
+                dot4 = dot; best4 = i;
             } else if (dot > dot5) {
-                dot7 = dot6;
-                best7 = best6;
-                dot6 = dot5;
-                best6 = best5;
-                dot5 = dot;
-                best5 = i;
+                dot7 = dot6; best7 = best6;
+                dot6 = dot5; best6 = best5;
+                dot5 = dot; best5 = i;
             } else if (dot > dot6) {
-                dot7 = dot6;
-                best7 = best6;
-                dot6 = dot;
-                best6 = i;
+                dot7 = dot6; best7 = best6;
+                dot6 = dot; best6 = i;
             } else if (dot > dot7) {
-                dot7 = dot;
-                best7 = i;
+                dot7 = dot; best7 = i;
             }
         }
 
         double weightedPressure = 0.0D;
         double weightSum = 0.0D;
         if (best0 >= 0) {
-            double weight0 = Math.pow(Math.max(0.0D, dot0), VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT);
+            double weight0 = DOT_WEIGHT_LUT[(int) (Math.max(0.0D, dot0) * 1023.0)];
             if (weight0 > 0.0D) {
                 double pressure0 = Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best0], pressureByShell[upperRowOffset + best0]);
                 weightedPressure += pressure0 * weight0;
@@ -4236,7 +7913,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             }
         }
         if (blendCount >= 2 && best1 >= 0) {
-            double weight1 = Math.pow(Math.max(0.0D, dot1), VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT);
+            double weight1 = DOT_WEIGHT_LUT[(int) (Math.max(0.0D, dot1) * 1023.0)];
             if (weight1 > 0.0D) {
                 double pressure1 = Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best1], pressureByShell[upperRowOffset + best1]);
                 weightedPressure += pressure1 * weight1;
@@ -4244,7 +7921,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             }
         }
         if (blendCount >= 3 && best2 >= 0) {
-            double weight2 = Math.pow(Math.max(0.0D, dot2), VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT);
+            double weight2 = DOT_WEIGHT_LUT[(int) (Math.max(0.0D, dot2) * 1023.0)];
             if (weight2 > 0.0D) {
                 double pressure2 = Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best2], pressureByShell[upperRowOffset + best2]);
                 weightedPressure += pressure2 * weight2;
@@ -4252,7 +7929,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             }
         }
         if (blendCount >= 4 && best3 >= 0) {
-            double weight3 = Math.pow(Math.max(0.0D, dot3), VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT);
+            double weight3 = DOT_WEIGHT_LUT[(int) (Math.max(0.0D, dot3) * 1023.0)];
             if (weight3 > 0.0D) {
                 double pressure3 = Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best3], pressureByShell[upperRowOffset + best3]);
                 weightedPressure += pressure3 * weight3;
@@ -4260,7 +7937,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             }
         }
         if (blendCount >= 5 && best4 >= 0) {
-            double weight4 = Math.pow(Math.max(0.0D, dot4), VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT);
+            double weight4 = DOT_WEIGHT_LUT[(int) (Math.max(0.0D, dot4) * 1023.0)];
             if (weight4 > 0.0D) {
                 double pressure4 = Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best4], pressureByShell[upperRowOffset + best4]);
                 weightedPressure += pressure4 * weight4;
@@ -4268,7 +7945,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             }
         }
         if (blendCount >= 6 && best5 >= 0) {
-            double weight5 = Math.pow(Math.max(0.0D, dot5), VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT);
+            double weight5 = DOT_WEIGHT_LUT[(int) (Math.max(0.0D, dot5) * 1023.0)];
             if (weight5 > 0.0D) {
                 double pressure5 = Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best5], pressureByShell[upperRowOffset + best5]);
                 weightedPressure += pressure5 * weight5;
@@ -4276,7 +7953,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             }
         }
         if (blendCount >= 7 && best6 >= 0) {
-            double weight6 = Math.pow(Math.max(0.0D, dot6), VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT);
+            double weight6 = DOT_WEIGHT_LUT[(int) (Math.max(0.0D, dot6) * 1023.0)];
             if (weight6 > 0.0D) {
                 double pressure6 = Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best6], pressureByShell[upperRowOffset + best6]);
                 weightedPressure += pressure6 * weight6;
@@ -4284,7 +7961,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             }
         }
         if (blendCount >= 8 && best7 >= 0) {
-            double weight7 = Math.pow(Math.max(0.0D, dot7), VOLUMETRIC_DIRECTION_BLEND_DOT_EXPONENT);
+            double weight7 = DOT_WEIGHT_LUT[(int) (Math.max(0.0D, dot7) * 1023.0)];
             if (weight7 > 0.0D) {
                 double pressure7 = Mth.lerp(shellAlpha, pressureByShell[lowerRowOffset + best7], pressureByShell[upperRowOffset + best7]);
                 weightedPressure += pressure7 * weight7;
@@ -4300,23 +7977,31 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return 0.0D;
     }
 
-    private static int octahedralLookupIndex(double nx, double ny, double nz, int resolution) {
+    private static int cubeMapLookupIndex(double nx, double ny, double nz, int resolution) {
         double ax = Math.abs(nx);
         double ay = Math.abs(ny);
         double az = Math.abs(nz);
-        double invL1 = 1.0D / Math.max(1.0E-9D, ax + ay + az);
-        double ox = nx * invL1;
-        double oy = ny * invL1;
-        double oz = nz * invL1;
-        if (oz < 0.0D) {
-            double oldX = ox;
-            double oldY = oy;
-            ox = (1.0D - Math.abs(oldY)) * Math.signum(oldX);
-            oy = (1.0D - Math.abs(oldX)) * Math.signum(oldY);
+        int face;
+        double ou, ov;
+        if (ax >= ay && ax >= az) {
+            double inv = 1.0D / Math.max(ax, 1.0E-9D);
+            face = (nx >= 0.0D) ? 0 : 1;
+            ou = ny * inv;
+            ov = nz * inv;
+        } else if (ay >= az) {
+            double inv = 1.0D / Math.max(ay, 1.0E-9D);
+            face = (ny >= 0.0D) ? 2 : 3;
+            ou = nx * inv;
+            ov = nz * inv;
+        } else {
+            double inv = 1.0D / Math.max(az, 1.0E-9D);
+            face = (nz >= 0.0D) ? 4 : 5;
+            ou = nx * inv;
+            ov = ny * inv;
         }
-        int u = Mth.clamp(Mth.floor(((ox * 0.5D) + 0.5D) * resolution), 0, resolution - 1);
-        int v = Mth.clamp(Mth.floor(((oy * 0.5D) + 0.5D) * resolution), 0, resolution - 1);
-        return (v * resolution) + u;
+        int u = Mth.clamp(Mth.floor(((ou + 1.0D) * 0.5D) * resolution), 0, resolution - 1);
+        int v = Mth.clamp(Mth.floor(((ov + 1.0D) * 0.5D) * resolution), 0, resolution - 1);
+        return face * resolution * resolution + v * resolution + u;
     }
 
     private static int[][] computeVolumetricDirectionNeighbors(double[] dirX,
@@ -4379,35 +8064,37 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         level.sendParticles(ParticleTypes.EXPLOSION_EMITTER, x, y, z, 1, 0.0D, 0.0D, 0.0D, 0.0D);
     }
 
-    private static void applySingleBlockImpact(ServerLevel level,
-                                               BlockPos.MutableBlockPos mutablePos,
-                                               long blockPosLong,
-                                               double resolvedImpactPower,
-                                               Entity source,
-                                               LivingEntity owner,
-                                               boolean applyWorldChanges,
-                                               ExplosionProfileTrace trace) {
+    private static BlockImpactOutcome applySingleBlockImpact(ServerLevel level,
+                                                             BlockPos.MutableBlockPos mutablePos,
+                                                             long blockPosLong,
+                                                             double resolvedImpactPower,
+                                                             Entity source,
+                                                             LivingEntity owner,
+                                                             double impactHeatCelsius,
+                                                             boolean thermalOnly,
+                                                             boolean applyWorldChanges,
+                                                             ExplosionProfileTrace trace) {
         mutablePos.set(BlockPos.getX(blockPosLong), BlockPos.getY(blockPosLong), BlockPos.getZ(blockPosLong));
         if (!level.isInWorldBounds(mutablePos)) {
-            return;
+            return BlockImpactOutcome.NONE;
         }
 
         BlockState blockState = level.getBlockState(mutablePos);
         if (blockState.isAir()) {
-            return;
+            return BlockImpactOutcome.NONE;
         }
         if (trace != null) {
             trace.blocksEvaluated++;
         }
 
-        if (applyWorldChanges && specialBlockHandler.handle(level, mutablePos, blockState, source, owner)) {
+        if (!thermalOnly && applyWorldChanges && specialBlockHandler.handle(level, mutablePos, blockState, source, owner)) {
             if (trace != null) {
                 trace.specialHandled++;
             }
-            return;
+            return BlockImpactOutcome.NONE;
         }
 
-        if (blockState.is(Blocks.TNT)) {
+        if (!thermalOnly && blockState.is(Blocks.TNT)) {
             if (applyWorldChanges) {
                 TntBlock.explode(level, mutablePos);
                 level.removeBlock(mutablePos, false);
@@ -4415,29 +8102,57 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             if (trace != null) {
                 trace.tntTriggered++;
             }
-            return;
+            return BlockImpactOutcome.NONE;
         }
 
-        if (resolvedImpactPower <= MIN_RESOLVED_RAY_IMPACT) {
+        if (!thermalOnly && resolvedImpactPower <= MIN_RESOLVED_RAY_IMPACT) {
             if (trace != null) {
                 trace.lowImpactSkipped++;
             }
-            return;
+            return BlockImpactOutcome.NONE;
         }
 
         if (applyWorldChanges) {
             var damageApi = KrakkApi.damage();
             KrakkImpactResult result;
+            boolean converted = false;
+            boolean ignited = false;
             if (damageApi instanceof KrakkDamageRuntime damageRuntime) {
-                result = damageRuntime.applyImpactPrevalidated(
-                        level,
-                        mutablePos,
-                        blockState,
-                        source,
-                        resolvedImpactPower,
-                        false,
-                        KrakkDamageType.KRAKK_DAMAGE_EXPLOSION
-                );
+                KrakkDamageRuntime.ImpactExecutionResult executionResult;
+                if (thermalOnly) {
+                    executionResult = damageRuntime.applyThermalImpactPrevalidatedWithEvents(
+                            level, mutablePos, blockState, source,
+                            resolvedImpactPower, impactHeatCelsius,
+                            KrakkDamageType.KRAKK_DAMAGE_EXPLOSION);
+                } else {
+                    // Fast path: skip the full damage state machine for guaranteed-break blocks.
+                    // A block is guaranteed to break if it is instant-mine (hardness == 0) or if
+                    // the impact delta is >= MAX_DAMAGE_STATE regardless of current damage state.
+                    KrakkDamageRuntime.ImpactExecutionResult fastResult = null;
+                    boolean isFluid = blockState.getBlock() instanceof LiquidBlock
+                            && !blockState.getFluidState().isEmpty();
+                    if (!isFluid) {
+                        float hardness = blockState.getDestroySpeed(level, mutablePos);
+                        if (hardness >= 0.0F
+                                && (hardness == 0.0F || KrakkDamageCurves.computeImpactDamageDelta(
+                                blockState.getBlock() instanceof FallingBlock,
+                                resolvedImpactPower,
+                                blockState.getBlock().getExplosionResistance(),
+                                hardness) >= KrakkDamageCurves.MAX_DAMAGE_STATE)) {
+                            fastResult = damageRuntime.applyGuaranteedBreakExplosionImpact(
+                                    level, mutablePos, blockState, source,
+                                    resolvedImpactPower, impactHeatCelsius);
+                        }
+                    }
+                    executionResult = fastResult != null ? fastResult
+                            : damageRuntime.applyImpactPrevalidatedWithEvents(
+                            level, mutablePos, blockState, source,
+                            resolvedImpactPower, impactHeatCelsius,
+                            false, KrakkDamageType.KRAKK_DAMAGE_EXPLOSION);
+                }
+                result = executionResult.impactResult();
+                converted = executionResult.converted();
+                ignited = executionResult.ignited();
             } else {
                 result = damageApi.applyImpact(
                         level,
@@ -4445,6 +8160,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                         blockState,
                         source,
                         resolvedImpactPower,
+                        impactHeatCelsius,
                         false,
                         KrakkDamageType.KRAKK_DAMAGE_EXPLOSION
                 );
@@ -4456,10 +8172,144 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     trace.damagedBlocks++;
                 }
             }
-            return;
+            return new BlockImpactOutcome(result.broken(), result.damageState() > 0, converted, ignited);
         }
 
-        predictImpactOutcome(level, mutablePos, blockState, resolvedImpactPower, trace);
+        if (!thermalOnly) {
+            predictImpactOutcome(level, mutablePos, blockState, resolvedImpactPower, trace);
+        }
+        return BlockImpactOutcome.NONE;
+    }
+
+    /**
+     * Post-solve expansion pass: directly applies a synthetic impact to zero-hardness (instant-break)
+     * and damageable blocks in an annular shell just beyond the normal blast radius.
+     *
+     * <p>Instant-break blocks (hardness == 0) receive a trivial synthetic impact — the fast path
+     * in {@code applySingleBlockImpact} breaks them regardless of magnitude. Harder blocks receive
+     * a scaled impact proportional to {@code blastPower}, applying damage states and triggering the
+     * conversion handler at the periphery of the blast.
+     */
+    /**
+     * Per-block deterministic noise in [0, 1) derived from world coordinates.
+     * Uses a 64-bit finalizer mix so adjacent blocks have uncorrelated values.
+     */
+    private static float blockNoise(int x, int y, int z) {
+        long h = x * 0x9E3779B97F4A7C15L
+                ^ y * 0xD1B54A32D192ED03L
+                ^ z * 0xAEF17502108EF2D9L;
+        h = (h ^ (h >>> 30)) * 0xBF58476D1CE4E5B9L;
+        h = (h ^ (h >>> 27)) * 0x94D049BB133111EBL;
+        h ^= h >>> 31;
+        return (h & 0xFFFFL) / 65535.0f;
+    }
+
+    private static void applyExtraRadiusImpacts(
+            ServerLevel level, double centerX, double centerY, double centerZ,
+            double resolvedRadius, LongArrayList targetPositions,
+            Entity source, LivingEntity owner, double impactHeatCelsius,
+            double blastTransmittance,
+            boolean applyWorldChanges, ExplosionProfileTrace trace,
+            BlockPos.MutableBlockPos mutablePos) {
+        if (EXTRA_RADIUS_FRACTION <= 0.0 || targetPositions.isEmpty()) return;
+
+        double extraRadius = resolvedRadius * EXTRA_RADIUS_FRACTION;
+        int    maxSteps    = Math.max(1, (int) Math.ceil(extraRadius));
+
+        // Build a fast lookup set so we can detect blast-surface blocks (targeted blocks
+        // whose outward neighbor was not reached by the Eikonal solver). Resistance
+        // blocking is already baked in — the solver simply never reached occluded cells.
+        LongOpenHashSet targetSet = new LongOpenHashSet(targetPositions.size() * 2);
+        for (int i = 0; i < targetPositions.size(); i++) {
+            targetSet.add(targetPositions.getLong(i));
+        }
+
+        int scx = Mth.floor(centerX * 2.0D);
+        int scy = Mth.floor(centerY * 2.0D);
+        int scz = Mth.floor(centerZ * 2.0D);
+
+        for (int i = 0; i < targetPositions.size(); i++) {
+            long posLong = targetPositions.getLong(i);
+            int px = BlockPos.getX(posLong);
+            int py = BlockPos.getY(posLong);
+            int pz = BlockPos.getZ(posLong);
+
+            double dx   = px + 0.5D - centerX;
+            double dy   = py + 0.5D - centerY;
+            double dz   = pz + 0.5D - centerZ;
+            double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            if (dist < 1.0E-9D) continue;
+            double invDist = 1.0D / dist;
+            double nx = dx * invDist, ny = dy * invDist, nz = dz * invDist;
+
+            // Surface detection: the block just beyond this one in the outward direction
+            // must not have been reached by the solver.
+            int onx = Mth.floor(px + 0.5D + nx);
+            int ony = Mth.floor(py + 0.5D + ny);
+            int onz = Mth.floor(pz + 0.5D + nz);
+            if (targetSet.contains(BlockPos.asLong(onx, ony, onz))) continue;
+
+            int spikeDepth = 0;
+            if (blastTransmittance > 0.0D) {
+                // Directional spike noise — same quantization and seeds as the inner
+                // suppression in scanKrakkTargetScanChunk.
+                int qx = Mth.floor((nx + 1.0D) * VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION);
+                int qy = Mth.floor((ny + 1.0D) * VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION);
+                int qz = Mth.floor((nz + 1.0D) * VOLUMETRIC_EDGE_SPIKE_DIRECTION_QUANTIZATION);
+                double spikePrimary   = sampleVolumetricEdgeSpikeNoise(qx, qy, qz, scx, scy, scz);
+                double spikeSecondary = sampleVolumetricEdgeSpikeNoise((qx * 2) + 7, (qy * 2) + 13, (qz * 2) + 19, scx, scy, scz);
+                double spikeNoise     = Mth.clamp(spikePrimary * 0.72D + spikeSecondary * 0.28D, 0.0D, 1.0D);
+                double spikeStrength  = Math.max(0.0D, spikeNoise - 0.5D) * 2.0D * blastTransmittance;
+                spikeDepth = (int) Math.ceil(maxSteps * spikeStrength);
+            }
+            // Always walk at least 1 step so block conversions and instant-break apply
+            // across the full envelope, even in non-spike directions.  Spray damage only
+            // fires within spikeDepth (which is 0 for non-spike directions).
+            int totalDepth = Math.max(1, spikeDepth);
+
+            // Walk outward from this surface block, applying envelope treatment.
+            for (int step = 1; step <= totalDepth; step++) {
+                int tx = Mth.floor(px + 0.5D + nx * step);
+                int ty = Mth.floor(py + 0.5D + ny * step);
+                int tz = Mth.floor(pz + 0.5D + nz * step);
+                long tLong = BlockPos.asLong(tx, ty, tz);
+                if (targetSet.contains(tLong)) continue; // already handled by main blast
+
+                mutablePos.set(tx, ty, tz);
+                if (!level.isInWorldBounds(mutablePos)) break;
+                BlockState state = level.getBlockState(mutablePos);
+                if (state.isAir()) continue;
+                if (state.getBlock() instanceof LiquidBlock
+                        && !state.getFluidState().isEmpty()) continue;
+                float hardness = state.getDestroySpeed(level, mutablePos);
+                if (hardness < 0.0F) break; // indestructible — stop the spike here
+
+                double impactFraction = spikeDepth > 0 ? 1.0D - (double) step / (spikeDepth + 1) : 0.0D;
+
+                if (hardness == 0.0F) {
+                    applySingleBlockImpact(
+                            level, mutablePos, tLong,
+                            MIN_RESOLVED_RAY_IMPACT * 10.0, source, owner, impactHeatCelsius,
+                            false, applyWorldChanges, trace
+                    );
+                } else if (applyWorldChanges && KrakkDamageBlockConversions.hasConversionRule(state)) {
+                    KrakkDamageBlockConversions.applyConversionForDamageState(
+                            level, mutablePos, state,
+                            KrakkDamageCurves.MAX_DAMAGE_STATE,
+                            MIN_RESOLVED_RAY_IMPACT * 10.0, impactHeatCelsius
+                    );
+                } else if (step <= spikeDepth) {
+                    double impact = impactFraction * NOISE_SPRAY_MAX_IMPACT;
+                    if (impact > MIN_RESOLVED_RAY_IMPACT) {
+                        applySingleBlockImpact(
+                                level, mutablePos, tLong,
+                                impact, source, owner, impactHeatCelsius,
+                                false, applyWorldChanges, trace
+                        );
+                    }
+                }
+            }
+        }
     }
 
     private static SectionImpactAccumulator collectRaycastImpacts(ServerLevel level, double centerX, double centerY, double centerZ,
@@ -4499,10 +8349,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         resistanceCostCache.defaultReturnValue(Double.NaN);
 
         for (int i = 0; i < rayCount; i++) {
-            double t = (i + 0.5D) / rayCount;
+            double t = (i + random.nextDouble()) / rayCount;
             double dy = 1.0D - (2.0D * t);
             double radial = Math.sqrt(Math.max(0.0D, 1.0D - (dy * dy)));
-            double theta = i * GOLDEN_ANGLE;
+            double theta = i * GOLDEN_ANGLE + (random.nextDouble() - 0.5D) * GOLDEN_ANGLE;
             double dx = Math.cos(theta) * radial;
             double dz = Math.sin(theta) * radial;
             if (INITIAL_RAY_VARIANCE_RADIANS > 0.0D) {
@@ -6838,7 +10688,1590 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private record Direction(double x, double y, double z) {
     }
 
+    private interface FloatIndexedAccess {
+        int size();
+
+        float getFloat(int index);
+    }
+
+    private interface MutableFloatIndexedAccess extends FloatIndexedAccess {
+        void setFloat(int index, float value);
+
+        void fill(float value);
+    }
+
+    private static final class HeapFloatArrayStorage implements MutableFloatIndexedAccess {
+        private final float[] values;
+
+        private HeapFloatArrayStorage(int size) {
+            this.values = new float[size];
+        }
+
+        @Override
+        public int size() {
+            return values.length;
+        }
+
+        @Override
+        public float getFloat(int index) {
+            return values[index];
+        }
+
+        @Override
+        public void setFloat(int index, float value) {
+            values[index] = value;
+        }
+
+        @Override
+        public void fill(float value) {
+            Arrays.fill(values, value);
+        }
+    }
+
+    private static final class SparseAirSolidSlownessStorage implements MutableFloatIndexedAccess {
+        private final int size;
+        private final float airSlowness;
+        private final BitSet activeMask;
+        private final Int2FloatOpenHashMap solidSlownessByIndex;
+
+        private SparseAirSolidSlownessStorage(int size, float airSlowness) {
+            this.size = Math.max(1, size);
+            this.airSlowness = airSlowness;
+            this.activeMask = new BitSet(this.size);
+            this.solidSlownessByIndex = new Int2FloatOpenHashMap(1024);
+            this.solidSlownessByIndex.defaultReturnValue(Float.NaN);
+        }
+
+        @Override
+        public int size() {
+            return size;
+        }
+
+        @Override
+        public float getFloat(int index) {
+            if (index < 0 || index >= size) {
+                throw new IndexOutOfBoundsException("index=" + index + " size=" + size);
+            }
+            if (!activeMask.get(index)) {
+                return 0.0F;
+            }
+            float solidSlowness = solidSlownessByIndex.get(index);
+            return Float.isFinite(solidSlowness) ? solidSlowness : airSlowness;
+        }
+
+        @Override
+        public void setFloat(int index, float value) {
+            if (index < 0 || index >= size) {
+                throw new IndexOutOfBoundsException("index=" + index + " size=" + size);
+            }
+            if (!(value > 0.0F)) {
+                activeMask.clear(index);
+                solidSlownessByIndex.remove(index);
+                return;
+            }
+            activeMask.set(index);
+            if (Math.abs(value - airSlowness) <= 1.0E-6F) {
+                solidSlownessByIndex.remove(index);
+                return;
+            }
+            solidSlownessByIndex.put(index, value);
+        }
+
+        @Override
+        public void fill(float value) {
+            solidSlownessByIndex.clear();
+            if (!(value > 0.0F)) {
+                activeMask.clear();
+                return;
+            }
+            activeMask.set(0, size);
+            if (Math.abs(value - airSlowness) <= 1.0E-6F) {
+                return;
+            }
+            for (int index = 0; index < size; index++) {
+                solidSlownessByIndex.put(index, value);
+            }
+        }
+
+        private BitSet activeMask() {
+            return activeMask;
+        }
+    }
+
+    private static final class OffHeapFloatArrayStorage implements MutableFloatIndexedAccess {
+        private final ArrayList<ByteBuffer> chunks;
+        private final int size;
+
+        private OffHeapFloatArrayStorage(int size) {
+            int expectedChunks = Math.max(
+                    1,
+                    (size + KRAKK_OFFHEAP_FLOAT_CHUNK_SIZE - 1) / KRAKK_OFFHEAP_FLOAT_CHUNK_SIZE
+            );
+            this.chunks = new ArrayList<>(expectedChunks);
+            this.size = size;
+            for (int i = 0; i < expectedChunks; i++) {
+                chunks.add(ByteBuffer.allocateDirect(KRAKK_OFFHEAP_FLOAT_CHUNK_SIZE * Float.BYTES));
+            }
+        }
+
+        @Override
+        public int size() {
+            return size;
+        }
+
+        @Override
+        public float getFloat(int index) {
+            if (index < 0 || index >= size) {
+                throw new IndexOutOfBoundsException("index=" + index + " size=" + size);
+            }
+            int chunkIndex = index >>> KRAKK_OFFHEAP_FLOAT_CHUNK_SHIFT;
+            int chunkOffset = index & KRAKK_OFFHEAP_FLOAT_CHUNK_MASK;
+            return chunks.get(chunkIndex).getFloat(chunkOffset * Float.BYTES);
+        }
+
+        @Override
+        public void setFloat(int index, float value) {
+            if (index < 0 || index >= size) {
+                throw new IndexOutOfBoundsException("index=" + index + " size=" + size);
+            }
+            int chunkIndex = index >>> KRAKK_OFFHEAP_FLOAT_CHUNK_SHIFT;
+            int chunkOffset = index & KRAKK_OFFHEAP_FLOAT_CHUNK_MASK;
+            chunks.get(chunkIndex).putFloat(chunkOffset * Float.BYTES, value);
+        }
+
+        @Override
+        public void fill(float value) {
+            int remaining = size;
+            for (int chunkIndex = 0; chunkIndex < chunks.size() && remaining > 0; chunkIndex++) {
+                ByteBuffer chunk = chunks.get(chunkIndex);
+                int chunkLength = Math.min(KRAKK_OFFHEAP_FLOAT_CHUNK_SIZE, remaining);
+                for (int offset = 0; offset < chunkLength; offset++) {
+                    chunk.putFloat(offset * Float.BYTES, value);
+                }
+                remaining -= chunkLength;
+            }
+        }
+    }
+
+    private interface FloatChunk {
+        float getFloat(int index);
+
+        void setFloat(int index, float value);
+
+        void fill(float value);
+    }
+
+    private static final class HeapFloatChunk implements FloatChunk {
+        private final float[] values;
+
+        private HeapFloatChunk(int size) {
+            this.values = new float[size];
+        }
+
+        @Override
+        public float getFloat(int index) {
+            return values[index];
+        }
+
+        @Override
+        public void setFloat(int index, float value) {
+            values[index] = value;
+        }
+
+        @Override
+        public void fill(float value) {
+            Arrays.fill(values, value);
+        }
+    }
+
+    private static final class DirectFloatChunk implements FloatChunk {
+        private static final sun.misc.Unsafe UNSAFE;
+        private static final long BUFFER_ADDRESS_OFFSET;
+        static {
+            try {
+                java.lang.reflect.Field fu = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+                fu.setAccessible(true);
+                UNSAFE = (sun.misc.Unsafe) fu.get(null);
+                java.lang.reflect.Field fa = java.nio.Buffer.class.getDeclaredField("address");
+                BUFFER_ADDRESS_OFFSET = UNSAFE.objectFieldOffset(fa);
+            } catch (Exception e) {
+                throw new ExceptionInInitializerError(e);
+            }
+        }
+        private final ByteBuffer values; // held to prevent GC of native memory
+        private final long address;
+
+        private DirectFloatChunk(int size) {
+            this.values = ByteBuffer.allocateDirect(size * Float.BYTES);
+            this.address = UNSAFE.getLong(values, BUFFER_ADDRESS_OFFSET);
+        }
+
+        @Override
+        public float getFloat(int index) {
+            return UNSAFE.getFloat(address + (long) index * Float.BYTES);
+        }
+
+        @Override
+        public void setFloat(int index, float value) {
+            UNSAFE.putFloat(address + (long) index * Float.BYTES, value);
+        }
+
+        @Override
+        public void fill(float value) {
+            int limit = values.capacity() / Float.BYTES;
+            for (int i = 0; i < limit; i++) {
+                UNSAFE.putFloat(address + (long) i * Float.BYTES, value);
+            }
+        }
+    }
+
+    private static final class AdaptiveFloatArrayStorage implements MutableFloatIndexedAccess {
+        // Plain array instead of ArrayList: eliminates ArrayList.get() overhead (bounds check +
+        // virtual dispatch) on every getFloat/setFloat call in the solveKrakkCell hot path.
+        private final FloatChunk[] chunks;
+        private final int size;
+
+        private AdaptiveFloatArrayStorage(int size, boolean preferOffHeapFirst) {
+            this.size = size;
+            int expectedChunks = Math.max(
+                    1,
+                    (size + KRAKK_OFFHEAP_FLOAT_CHUNK_SIZE - 1) / KRAKK_OFFHEAP_FLOAT_CHUNK_SIZE
+            );
+            this.chunks = new FloatChunk[expectedChunks];
+            int remaining = size;
+            for (int i = 0; i < expectedChunks; i++) {
+                int chunkSize = Math.min(KRAKK_OFFHEAP_FLOAT_CHUNK_SIZE, remaining);
+                chunks[i] = createAdaptiveFloatChunk(chunkSize, preferOffHeapFirst);
+                remaining -= chunkSize;
+            }
+        }
+
+        @Override
+        public int size() {
+            return size;
+        }
+
+        @Override
+        public float getFloat(int index) {
+            if (index < 0 || index >= size) {
+                throw new IndexOutOfBoundsException("index=" + index + " size=" + size);
+            }
+            int chunkIndex = index >>> KRAKK_OFFHEAP_FLOAT_CHUNK_SHIFT;
+            int chunkOffset = index & KRAKK_OFFHEAP_FLOAT_CHUNK_MASK;
+            return chunks[chunkIndex].getFloat(chunkOffset);
+        }
+
+        @Override
+        public void setFloat(int index, float value) {
+            if (index < 0 || index >= size) {
+                throw new IndexOutOfBoundsException("index=" + index + " size=" + size);
+            }
+            int chunkIndex = index >>> KRAKK_OFFHEAP_FLOAT_CHUNK_SHIFT;
+            int chunkOffset = index & KRAKK_OFFHEAP_FLOAT_CHUNK_MASK;
+            chunks[chunkIndex].setFloat(chunkOffset, value);
+        }
+
+        @Override
+        public void fill(float value) {
+            for (FloatChunk chunk : chunks) {
+                chunk.fill(value);
+            }
+        }
+    }
+
+    private static final class PagedFloatArrayStorage implements MutableFloatIndexedAccess {
+        private final int size;
+        private final int pageCount;
+        private final int maxCachedPages;
+        private final float[][] cachePages;
+        private final int[] cachePageIds;
+        private final boolean[] cacheDirty;
+        private final long[] cacheAccessTicks;
+        private final Int2IntOpenHashMap pageToSlot;
+        private final boolean[] persistedPages;
+        private final FileChannel channel;
+        private final ByteBuffer ioBuffer;
+        private float defaultFillValue;
+        private long accessTick;
+
+        private PagedFloatArrayStorage(int size, int requestedCachePages) {
+            this.size = Math.max(1, size);
+            this.pageCount = Math.max(1, (this.size + KRAKK_PAGED_FLOAT_PAGE_SIZE - 1) / KRAKK_PAGED_FLOAT_PAGE_SIZE);
+            this.maxCachedPages = Math.max(4, Math.min(this.pageCount, requestedCachePages));
+            this.cachePages = new float[this.maxCachedPages][KRAKK_PAGED_FLOAT_PAGE_SIZE];
+            this.cachePageIds = new int[this.maxCachedPages];
+            Arrays.fill(this.cachePageIds, -1);
+            this.cacheDirty = new boolean[this.maxCachedPages];
+            this.cacheAccessTicks = new long[this.maxCachedPages];
+            this.pageToSlot = new Int2IntOpenHashMap(Math.max(16, this.maxCachedPages * 2));
+            this.pageToSlot.defaultReturnValue(-1);
+            this.persistedPages = new boolean[this.pageCount];
+            this.ioBuffer = ByteBuffer.allocate(KRAKK_PAGED_FLOAT_PAGE_SIZE * Float.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+            this.defaultFillValue = 0.0F;
+            this.accessTick = 1L;
+
+            Path backingFile = null;
+            FileChannel openedChannel = null;
+            try {
+                backingFile = Files.createTempFile("krakk-float-pages-", ".bin");
+                openedChannel = FileChannel.open(
+                        backingFile,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.TRUNCATE_EXISTING,
+                        StandardOpenOption.READ,
+                        StandardOpenOption.WRITE
+                );
+                PAGED_FLOAT_STORAGE_CLEANER.register(
+                        this,
+                        new PagedFloatStorageCleanup(openedChannel, backingFile)
+                );
+            } catch (IOException exception) {
+                if (openedChannel != null) {
+                    try {
+                        openedChannel.close();
+                    } catch (IOException ignored) {
+                    }
+                }
+                if (backingFile != null) {
+                    try {
+                        Files.deleteIfExists(backingFile);
+                    } catch (IOException ignored) {
+                    }
+                }
+                throw new IllegalStateException("Unable to create paged float storage.", exception);
+            }
+            this.channel = openedChannel;
+        }
+
+        @Override
+        public int size() {
+            return size;
+        }
+
+        @Override
+        public float getFloat(int index) {
+            if (index < 0 || index >= size) {
+                throw new IndexOutOfBoundsException("index=" + index + " size=" + size);
+            }
+            int pageIndex = index >>> KRAKK_PAGED_FLOAT_PAGE_SHIFT;
+            int pageOffset = index & KRAKK_PAGED_FLOAT_PAGE_MASK;
+            int slot = ensurePageLoaded(pageIndex);
+            cacheAccessTicks[slot] = accessTick++;
+            return cachePages[slot][pageOffset];
+        }
+
+        @Override
+        public void setFloat(int index, float value) {
+            if (index < 0 || index >= size) {
+                throw new IndexOutOfBoundsException("index=" + index + " size=" + size);
+            }
+            int pageIndex = index >>> KRAKK_PAGED_FLOAT_PAGE_SHIFT;
+            int pageOffset = index & KRAKK_PAGED_FLOAT_PAGE_MASK;
+            int slot = ensurePageLoaded(pageIndex);
+            cacheAccessTicks[slot] = accessTick++;
+            cachePages[slot][pageOffset] = value;
+            cacheDirty[slot] = true;
+        }
+
+        @Override
+        public void fill(float value) {
+            defaultFillValue = value;
+            Arrays.fill(persistedPages, false);
+            pageToSlot.clear();
+            Arrays.fill(cachePageIds, -1);
+            Arrays.fill(cacheDirty, false);
+            Arrays.fill(cacheAccessTicks, 0L);
+            accessTick = 1L;
+            try {
+                channel.truncate(0L);
+            } catch (IOException exception) {
+                throw new IllegalStateException("Unable to clear paged float storage.", exception);
+            }
+        }
+
+        private int ensurePageLoaded(int pageIndex) {
+            int existingSlot = pageToSlot.get(pageIndex);
+            if (existingSlot >= 0) {
+                return existingSlot;
+            }
+            int slot = claimSlot();
+            int previousPageIndex = cachePageIds[slot];
+            if (previousPageIndex >= 0) {
+                if (cacheDirty[slot]) {
+                    writePage(previousPageIndex, cachePages[slot]);
+                    cacheDirty[slot] = false;
+                }
+                pageToSlot.remove(previousPageIndex);
+            }
+
+            int length = pageLength(pageIndex);
+            if (persistedPages[pageIndex]) {
+                readPage(pageIndex, cachePages[slot], length);
+            } else {
+                Arrays.fill(cachePages[slot], 0, length, defaultFillValue);
+            }
+            cachePageIds[slot] = pageIndex;
+            cacheAccessTicks[slot] = accessTick++;
+            cacheDirty[slot] = false;
+            pageToSlot.put(pageIndex, slot);
+            return slot;
+        }
+
+        private int claimSlot() {
+            for (int i = 0; i < maxCachedPages; i++) {
+                if (cachePageIds[i] < 0) {
+                    return i;
+                }
+            }
+            int lruSlot = 0;
+            long lruTick = cacheAccessTicks[0];
+            for (int i = 1; i < maxCachedPages; i++) {
+                long tick = cacheAccessTicks[i];
+                if (tick < lruTick) {
+                    lruTick = tick;
+                    lruSlot = i;
+                }
+            }
+            return lruSlot;
+        }
+
+        private void writePage(int pageIndex, float[] pageData) {
+            int length = pageLength(pageIndex);
+            int byteLength = length * Float.BYTES;
+            ioBuffer.clear();
+            ioBuffer.limit(byteLength);
+            for (int i = 0; i < length; i++) {
+                ioBuffer.putFloat(pageData[i]);
+            }
+            ioBuffer.flip();
+            long writePos = pageStartOffset(pageIndex);
+            try {
+                while (ioBuffer.hasRemaining()) {
+                    int written = channel.write(ioBuffer, writePos);
+                    if (written <= 0) {
+                        throw new IOException("Unable to write paged float page.");
+                    }
+                    writePos += written;
+                }
+            } catch (IOException exception) {
+                throw new IllegalStateException("Unable to write paged float storage.", exception);
+            }
+            persistedPages[pageIndex] = true;
+        }
+
+        private void readPage(int pageIndex, float[] pageData, int length) {
+            int byteLength = length * Float.BYTES;
+            ioBuffer.clear();
+            ioBuffer.limit(byteLength);
+            long readPos = pageStartOffset(pageIndex);
+            int totalRead = 0;
+            try {
+                while (totalRead < byteLength) {
+                    int read = channel.read(ioBuffer, readPos + totalRead);
+                    if (read <= 0) {
+                        break;
+                    }
+                    totalRead += read;
+                }
+            } catch (IOException exception) {
+                throw new IllegalStateException("Unable to read paged float storage.", exception);
+            }
+            ioBuffer.flip();
+            int readableFloats = totalRead / Float.BYTES;
+            for (int i = 0; i < readableFloats; i++) {
+                pageData[i] = ioBuffer.getFloat();
+            }
+            if (readableFloats < length) {
+                Arrays.fill(pageData, readableFloats, length, defaultFillValue);
+            }
+        }
+
+        private int pageLength(int pageIndex) {
+            int pageStart = pageIndex << KRAKK_PAGED_FLOAT_PAGE_SHIFT;
+            int remaining = size - pageStart;
+            return Math.max(0, Math.min(KRAKK_PAGED_FLOAT_PAGE_SIZE, remaining));
+        }
+
+        private long pageStartOffset(int pageIndex) {
+            return (long) pageIndex * (long) KRAKK_PAGED_FLOAT_PAGE_SIZE * (long) Float.BYTES;
+        }
+    }
+
+    private static final class PagedFloatStorageCleanup implements Runnable {
+        private final FileChannel channel;
+        private final Path filePath;
+
+        private PagedFloatStorageCleanup(FileChannel channel, Path filePath) {
+            this.channel = channel;
+            this.filePath = filePath;
+        }
+
+        @Override
+        public void run() {
+            if (channel != null) {
+                try {
+                    channel.close();
+                } catch (IOException ignored) {
+                }
+            }
+            if (filePath != null) {
+                try {
+                    Files.deleteIfExists(filePath);
+                } catch (IOException ignored) {
+                }
+            }
+        }
+    }
+
+    @FunctionalInterface
+    private interface IntIndexConsumer {
+        void accept(int index);
+    }
+
+    private interface SourceIndexSet {
+        boolean contains(int index);
+
+        boolean add(int index);
+
+        void forEach(IntIndexConsumer consumer);
+    }
+
+    private static final class BitSetSourceIndexSet implements SourceIndexSet {
+        private final BitSet indices;
+
+        private BitSetSourceIndexSet(int approximateVolume) {
+            this.indices = new BitSet(Math.max(1, approximateVolume));
+        }
+
+        @Override
+        public boolean contains(int index) {
+            return indices.get(index);
+        }
+
+        @Override
+        public boolean add(int index) {
+            if (indices.get(index)) {
+                return false;
+            }
+            indices.set(index);
+            return true;
+        }
+
+        @Override
+        public void forEach(IntIndexConsumer consumer) {
+            if (consumer == null) {
+                return;
+            }
+            for (int index = indices.nextSetBit(0); index >= 0; index = indices.nextSetBit(index + 1)) {
+                consumer.accept(index);
+            }
+        }
+    }
+
+    private static final class SparseSourceIndexSet implements SourceIndexSet {
+        private final IntOpenHashSet membership;
+        private final IntArrayList insertionOrder;
+
+        private SparseSourceIndexSet() {
+            this.membership = new IntOpenHashSet(32);
+            this.insertionOrder = new IntArrayList(32);
+        }
+
+        @Override
+        public boolean contains(int index) {
+            return membership.contains(index);
+        }
+
+        @Override
+        public boolean add(int index) {
+            if (!membership.add(index)) {
+                return false;
+            }
+            insertionOrder.add(index);
+            return true;
+        }
+
+        @Override
+        public void forEach(IntIndexConsumer consumer) {
+            if (consumer == null) {
+                return;
+            }
+            for (int i = 0; i < insertionOrder.size(); i++) {
+                consumer.accept(insertionOrder.getInt(i));
+            }
+        }
+    }
+
+    private interface LongIndexedAccess {
+        int size();
+
+        boolean isEmpty();
+
+        long getLong(int index);
+    }
+
+    private static final class EmptyLongIndexedAccess implements LongIndexedAccess {
+        private static final EmptyLongIndexedAccess INSTANCE = new EmptyLongIndexedAccess();
+
+        @Override
+        public int size() {
+            return 0;
+        }
+
+        @Override
+        public boolean isEmpty() {
+            return true;
+        }
+
+        @Override
+        public long getLong(int index) {
+            throw new IndexOutOfBoundsException("index=" + index + " size=0");
+        }
+    }
+
+    private static final class LongArrayListIndexedAccess implements LongIndexedAccess {
+        private final LongArrayList values;
+
+        private LongArrayListIndexedAccess(LongArrayList values) {
+            this.values = values;
+        }
+
+        @Override
+        public int size() {
+            return values.size();
+        }
+
+        @Override
+        public boolean isEmpty() {
+            return values.isEmpty();
+        }
+
+        @Override
+        public long getLong(int index) {
+            return values.getLong(index);
+        }
+    }
+
+    private static final class PackedKrakkSolidPositions implements LongIndexedAccess {
+        private final IntArrayList indices;
+        private final int minX;
+        private final int minY;
+        private final int minZ;
+        private final int sizeY;
+        private final int sizeZ;
+        private final int strideX;
+        private final int strideY;
+
+        private PackedKrakkSolidPositions(int minX, int minY, int minZ, int sizeY, int sizeZ, int expectedEntries) {
+            this.indices = new IntArrayList(Math.max(16, expectedEntries));
+            this.minX = minX;
+            this.minY = minY;
+            this.minZ = minZ;
+            this.sizeY = sizeY;
+            this.sizeZ = sizeZ;
+            this.strideX = sizeY * sizeZ;
+            this.strideY = sizeZ;
+        }
+
+        private void addIndex(int index) {
+            indices.add(index);
+        }
+
+        private void clear() {
+            indices.clear();
+        }
+
+        @Override
+        public int size() {
+            return indices.size();
+        }
+
+        @Override
+        public boolean isEmpty() {
+            return indices.isEmpty();
+        }
+
+        @Override
+        public long getLong(int index) {
+            int gridIndex = indices.getInt(index);
+            int xOffset = gridIndex / strideX;
+            int yz = gridIndex - (xOffset * strideX);
+            int yOffset = yz / strideY;
+            int zOffset = yz - (yOffset * strideY);
+            return BlockPos.asLong(minX + xOffset, minY + yOffset, minZ + zOffset);
+        }
+    }
+
+    private static final class OffHeapLongList implements LongIndexedAccess {
+        private final ArrayList<ByteBuffer> chunks;
+        private int size;
+
+        private OffHeapLongList() {
+            this(64);
+        }
+
+        private OffHeapLongList(int expectedEntries) {
+            int expectedChunks = Math.max(
+                    1,
+                    (expectedEntries + KRAKK_OFFHEAP_SOLID_POSITIONS_CHUNK_SIZE - 1)
+                            / KRAKK_OFFHEAP_SOLID_POSITIONS_CHUNK_SIZE
+            );
+            this.chunks = new ArrayList<>(expectedChunks);
+            this.size = 0;
+        }
+
+        private void add(long value) {
+            int index = size;
+            int chunkIndex = index >>> KRAKK_OFFHEAP_SOLID_POSITIONS_CHUNK_SHIFT;
+            int chunkOffset = index & KRAKK_OFFHEAP_SOLID_POSITIONS_CHUNK_MASK;
+            ensureChunk(chunkIndex);
+            chunks.get(chunkIndex).putLong(chunkOffset * Long.BYTES, value);
+            size = index + 1;
+        }
+
+        @Override
+        public int size() {
+            return size;
+        }
+
+        @Override
+        public boolean isEmpty() {
+            return size <= 0;
+        }
+
+        private void clear() {
+            size = 0;
+        }
+
+        @Override
+        public long getLong(int index) {
+            if (index < 0 || index >= size) {
+                throw new IndexOutOfBoundsException("index=" + index + " size=" + size);
+            }
+            int chunkIndex = index >>> KRAKK_OFFHEAP_SOLID_POSITIONS_CHUNK_SHIFT;
+            int chunkOffset = index & KRAKK_OFFHEAP_SOLID_POSITIONS_CHUNK_MASK;
+            return chunks.get(chunkIndex).getLong(chunkOffset * Long.BYTES);
+        }
+
+        private void ensureChunk(int chunkIndex) {
+            while (chunks.size() <= chunkIndex) {
+                chunks.add(ByteBuffer.allocateDirect(KRAKK_OFFHEAP_SOLID_POSITIONS_CHUNK_SIZE * Long.BYTES));
+            }
+        }
+    }
+
     private record VolumetricResistanceField(Long2FloatOpenHashMap resistanceByPos, LongArrayList solidPositions, int sampledVoxelCount) {
+    }
+
+    private enum NarrowBandWavefrontPhase {
+        SEED,
+        PROPAGATE,
+        COMPLETE,
+        FAILED
+    }
+
+    private static final class NarrowBandWavefrontJob {
+        private final long jobId;
+        private final ResourceKey<Level> dimension;
+        private final double centerX;
+        private final double centerY;
+        private final double centerZ;
+        private final double resolvedRadius;
+        private final double radiusSq;
+        private final int minX;
+        private final int maxX;
+        private final int minY;
+        private final int maxY;
+        private final int minZ;
+        private final int maxZ;
+        private final double totalEnergy;
+        private final double impactHeatCelsius;
+        private final UUID sourceUuid;
+        private final UUID ownerUuid;
+        private final boolean applyWorldChanges;
+        private final ExplosionProfileTrace trace;
+        private final boolean phaseLoggingEnabled;
+        private final long phaseTraceId;
+        private final long queuedAtNanos;
+
+        private NarrowBandWavefrontPhase phase;
+        private String failureMessage;
+        private Entity cachedSource;
+        private LivingEntity cachedOwner;
+
+        private final Int2DoubleOpenHashMap resistanceCostCache = new Int2DoubleOpenHashMap(256);
+        private final WaveChunkStateCache chunkStateCache = new WaveChunkStateCache();
+        private final BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        private final Long2FloatOpenHashMap slownessByPos = new Long2FloatOpenHashMap(2048);
+        private final Long2FloatOpenHashMap arrivalByPos = new Long2FloatOpenHashMap(4096);
+        private final LongOpenHashSet finalized = new LongOpenHashSet(4096);
+        private final WaveLongMinHeap trialQueue = new WaveLongMinHeap(256);
+
+        private int sourceCount;
+        private double maxArrival;
+        private long solveStartNanos;
+        private long impactApplyStartNanos;
+        private double impactBudget;
+        private double directWeight;
+        private int acceptedNodes;
+        private int poppedNodes;
+        private int directImpactApplications;
+        private int thermalImpactApplications;
+        private long lastProgressLogNanos;
+
+        private NarrowBandWavefrontJob(long jobId,
+                                       ResourceKey<Level> dimension,
+                                       double centerX,
+                                       double centerY,
+                                       double centerZ,
+                                       double resolvedRadius,
+                                       double radiusSq,
+                                       int minX,
+                                       int maxX,
+                                       int minY,
+                                       int maxY,
+                                       int minZ,
+                                       int maxZ,
+                                       double totalEnergy,
+                                       double impactHeatCelsius,
+                                       UUID sourceUuid,
+                                       UUID ownerUuid,
+                                       boolean applyWorldChanges,
+                                       ExplosionProfileTrace trace,
+                                       boolean phaseLoggingEnabled,
+                                       long phaseTraceId,
+                                       long queuedAtNanos) {
+            this.jobId = jobId;
+            this.dimension = dimension;
+            this.centerX = centerX;
+            this.centerY = centerY;
+            this.centerZ = centerZ;
+            this.resolvedRadius = resolvedRadius;
+            this.radiusSq = radiusSq;
+            this.minX = minX;
+            this.maxX = maxX;
+            this.minY = minY;
+            this.maxY = maxY;
+            this.minZ = minZ;
+            this.maxZ = maxZ;
+            this.totalEnergy = totalEnergy;
+            this.impactHeatCelsius = impactHeatCelsius;
+            this.sourceUuid = sourceUuid;
+            this.ownerUuid = ownerUuid;
+            this.applyWorldChanges = applyWorldChanges;
+            this.trace = trace;
+            this.phaseLoggingEnabled = phaseLoggingEnabled;
+            this.phaseTraceId = phaseTraceId;
+            this.queuedAtNanos = queuedAtNanos;
+            this.phase = NarrowBandWavefrontPhase.SEED;
+            this.failureMessage = null;
+            this.lastProgressLogNanos = queuedAtNanos;
+
+            this.resistanceCostCache.defaultReturnValue(Double.NaN);
+            this.slownessByPos.defaultReturnValue(Float.NaN);
+            this.arrivalByPos.defaultReturnValue(Float.POSITIVE_INFINITY);
+        }
+
+        private long jobId() {
+            return jobId;
+        }
+
+        private ResourceKey<Level> dimension() {
+            return dimension;
+        }
+
+        private double centerX() {
+            return centerX;
+        }
+
+        private double centerY() {
+            return centerY;
+        }
+
+        private double centerZ() {
+            return centerZ;
+        }
+
+        private double resolvedRadius() {
+            return resolvedRadius;
+        }
+
+        private double radiusSq() {
+            return radiusSq;
+        }
+
+        private int minX() {
+            return minX;
+        }
+
+        private int maxX() {
+            return maxX;
+        }
+
+        private int minY() {
+            return minY;
+        }
+
+        private int maxY() {
+            return maxY;
+        }
+
+        private int minZ() {
+            return minZ;
+        }
+
+        private int maxZ() {
+            return maxZ;
+        }
+
+        private double totalEnergy() {
+            return totalEnergy;
+        }
+
+        private double impactHeatCelsius() {
+            return impactHeatCelsius;
+        }
+
+        private boolean applyWorldChanges() {
+            return applyWorldChanges;
+        }
+
+        private ExplosionProfileTrace trace() {
+            return trace;
+        }
+
+        private boolean phaseLoggingEnabled() {
+            return phaseLoggingEnabled;
+        }
+
+        private long phaseTraceId() {
+            return phaseTraceId;
+        }
+
+        private long queuedAtNanos() {
+            return queuedAtNanos;
+        }
+
+        private long lastProgressLogNanos() {
+            return lastProgressLogNanos;
+        }
+
+        private void lastProgressLogNanos(long value) {
+            this.lastProgressLogNanos = value;
+        }
+
+        private NarrowBandWavefrontPhase phase() {
+            return phase;
+        }
+
+        private void setPhase(NarrowBandWavefrontPhase phase) {
+            this.phase = phase == null ? NarrowBandWavefrontPhase.FAILED : phase;
+        }
+
+        private String failureMessage() {
+            return failureMessage;
+        }
+
+        private void failureMessage(String message) {
+            this.failureMessage = message;
+        }
+
+        private Int2DoubleOpenHashMap resistanceCostCache() {
+            return resistanceCostCache;
+        }
+
+        private WaveChunkStateCache chunkStateCache() {
+            return chunkStateCache;
+        }
+
+        private BlockPos.MutableBlockPos mutablePos() {
+            return mutablePos;
+        }
+
+        private Long2FloatOpenHashMap slownessByPos() {
+            return slownessByPos;
+        }
+
+        private Long2FloatOpenHashMap arrivalByPos() {
+            return arrivalByPos;
+        }
+
+        private LongOpenHashSet finalized() {
+            return finalized;
+        }
+
+        private WaveLongMinHeap trialQueue() {
+            return trialQueue;
+        }
+
+        private int sourceCount() {
+            return sourceCount;
+        }
+
+        private void sourceCount(int sourceCount) {
+            this.sourceCount = sourceCount;
+        }
+
+        private double maxArrival() {
+            return maxArrival;
+        }
+
+        private void maxArrival(double maxArrival) {
+            this.maxArrival = maxArrival;
+        }
+
+        private long solveStartNanos() {
+            return solveStartNanos;
+        }
+
+        private void solveStartNanos(long solveStartNanos) {
+            this.solveStartNanos = solveStartNanos;
+        }
+
+        private long impactApplyStartNanos() {
+            return impactApplyStartNanos;
+        }
+
+        private void impactApplyStartNanos(long impactApplyStartNanos) {
+            this.impactApplyStartNanos = impactApplyStartNanos;
+        }
+
+        private Entity resolveSource(ServerLevel level) {
+            if (sourceUuid == null) {
+                return null;
+            }
+            if (cachedSource != null && !cachedSource.isRemoved()) {
+                return cachedSource;
+            }
+            Entity resolved = level.getEntity(sourceUuid);
+            if (resolved != null && !resolved.isRemoved()) {
+                cachedSource = resolved;
+                return resolved;
+            }
+            cachedSource = null;
+            return null;
+        }
+
+        private LivingEntity resolveOwner(ServerLevel level) {
+            if (ownerUuid == null) {
+                return null;
+            }
+            if (cachedOwner != null && !cachedOwner.isRemoved()) {
+                return cachedOwner;
+            }
+            Entity resolved = level.getEntity(ownerUuid);
+            if (resolved instanceof LivingEntity living && !living.isRemoved()) {
+                cachedOwner = living;
+                return living;
+            }
+            cachedOwner = null;
+            return null;
+        }
+    }
+
+
+    private enum StreamingWavefrontPhase {
+        SEED,
+        SOLVE_NORMAL,
+        SOLVE_SHADOW,
+        TARGET_SCAN,
+        IMPACT_DIRECT,
+        IMPACT_THERMAL,
+        COMPLETE,
+        FAILED
+    }
+
+    private static final class StreamingWavefrontJob {
+        private final long jobId;
+        private final ResourceKey<Level> dimension;
+        private final double centerX;
+        private final double centerY;
+        private final double centerZ;
+        private final double resolvedRadius;
+        private final double radiusSq;
+        private final int minX;
+        private final int maxX;
+        private final int minY;
+        private final int maxY;
+        private final int minZ;
+        private final int maxZ;
+        private final double totalEnergy;
+        private final double impactHeatCelsius;
+        private final UUID sourceUuid;
+        private final UUID ownerUuid;
+        private final boolean phaseLoggingEnabled;
+        private final long phaseTraceId;
+        private final long queuedAtNanos;
+        private final ExplosionProfileTrace trace;
+
+        private StreamingWavefrontPhase phase;
+        private String failureMessage;
+        private Entity cachedSource;
+        private LivingEntity cachedOwner;
+
+        private final Int2DoubleOpenHashMap resistanceCostCache = new Int2DoubleOpenHashMap(256);
+        private final WaveChunkStateCache chunkStateCache = new WaveChunkStateCache();
+        private final BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        private final Long2FloatOpenHashMap normalSlownessByPos = new Long2FloatOpenHashMap(2048);
+        private final LongOpenHashSet sampledSolidPositions = new LongOpenHashSet(2048);
+        private final Long2FloatOpenHashMap normalArrivalByPos = new Long2FloatOpenHashMap(4096);
+        private final Long2FloatOpenHashMap shadowArrivalByPos = new Long2FloatOpenHashMap(4096);
+        private final LongOpenHashSet normalAccepted = new LongOpenHashSet(4096);
+        private final LongOpenHashSet shadowAccepted = new LongOpenHashSet(4096);
+        private final WaveLongMinHeap normalQueue = new WaveLongMinHeap(256);
+        private final WaveLongMinHeap shadowQueue = new WaveLongMinHeap(256);
+        private LongArrayList sampledSolidList = new LongArrayList(0);
+        private final LongArrayList targetPositions = new LongArrayList(128);
+        private final FloatArrayList targetWeights = new FloatArrayList(128);
+        private final Long2FloatOpenHashMap collapseWeightsByPos = new Long2FloatOpenHashMap(128);
+        private ThermalTargetShape thermalTargetShape = new ThermalTargetShape(new LongArrayList(0), new Long2FloatOpenHashMap());
+
+        private int normalSourceCount;
+        private int shadowSourceCount;
+        private double maxArrival;
+        private int targetScanIndex;
+        private int directImpactIndex;
+        private int thermalIndex;
+        private int thermalPermutationStart;
+        private int thermalPermutationStep = 1;
+        private long solveStartNanos;
+        private long targetScanStartNanos;
+        private long impactApplyStartNanos;
+        private long impactDirectStartNanos;
+        private long thermalApplyStartNanos;
+        private double impactBudget;
+        private double normalizationWeight;
+        private double solidWeight;
+
+        private int normalAcceptedNodes;
+        private int normalPoppedNodes;
+        private int shadowAcceptedNodes;
+        private int shadowPoppedNodes;
+        private int directImpactApplications;
+        private int thermalImpactApplications;
+        private long lastProgressLogNanos;
+
+        private StreamingWavefrontJob(long jobId,
+                                      ResourceKey<Level> dimension,
+                                      double centerX,
+                                      double centerY,
+                                      double centerZ,
+                                      double resolvedRadius,
+                                      double radiusSq,
+                                      int minX,
+                                      int maxX,
+                                      int minY,
+                                      int maxY,
+                                      int minZ,
+                                      int maxZ,
+                                      double totalEnergy,
+                                      double impactHeatCelsius,
+                                      UUID sourceUuid,
+                                      UUID ownerUuid,
+                                      boolean phaseLoggingEnabled,
+                                      long phaseTraceId,
+                                      long queuedAtNanos) {
+            this.jobId = jobId;
+            this.dimension = dimension;
+            this.centerX = centerX;
+            this.centerY = centerY;
+            this.centerZ = centerZ;
+            this.resolvedRadius = resolvedRadius;
+            this.radiusSq = radiusSq;
+            this.minX = minX;
+            this.maxX = maxX;
+            this.minY = minY;
+            this.maxY = maxY;
+            this.minZ = minZ;
+            this.maxZ = maxZ;
+            this.totalEnergy = totalEnergy;
+            this.impactHeatCelsius = impactHeatCelsius;
+            this.sourceUuid = sourceUuid;
+            this.ownerUuid = ownerUuid;
+            this.phaseLoggingEnabled = phaseLoggingEnabled;
+            this.phaseTraceId = phaseTraceId;
+            this.queuedAtNanos = queuedAtNanos;
+            this.trace = null;
+            this.phase = StreamingWavefrontPhase.SEED;
+            this.failureMessage = null;
+            this.lastProgressLogNanos = queuedAtNanos;
+
+            this.resistanceCostCache.defaultReturnValue(Double.NaN);
+            this.normalSlownessByPos.defaultReturnValue(Float.NaN);
+            this.normalArrivalByPos.defaultReturnValue(Float.POSITIVE_INFINITY);
+            this.shadowArrivalByPos.defaultReturnValue(Float.POSITIVE_INFINITY);
+            this.collapseWeightsByPos.defaultReturnValue(0.0F);
+        }
+
+        private long jobId() {
+            return jobId;
+        }
+
+        private ResourceKey<Level> dimension() {
+            return dimension;
+        }
+
+        private double centerX() {
+            return centerX;
+        }
+
+        private double centerY() {
+            return centerY;
+        }
+
+        private double centerZ() {
+            return centerZ;
+        }
+
+        private double resolvedRadius() {
+            return resolvedRadius;
+        }
+
+        private double radiusSq() {
+            return radiusSq;
+        }
+
+        private int minX() {
+            return minX;
+        }
+
+        private int maxX() {
+            return maxX;
+        }
+
+        private int minY() {
+            return minY;
+        }
+
+        private int maxY() {
+            return maxY;
+        }
+
+        private int minZ() {
+            return minZ;
+        }
+
+        private int maxZ() {
+            return maxZ;
+        }
+
+        private double totalEnergy() {
+            return totalEnergy;
+        }
+
+        private double impactHeatCelsius() {
+            return impactHeatCelsius;
+        }
+
+        private boolean phaseLoggingEnabled() {
+            return phaseLoggingEnabled;
+        }
+
+        private long phaseTraceId() {
+            return phaseTraceId;
+        }
+
+        private long queuedAtNanos() {
+            return queuedAtNanos;
+        }
+
+        private long lastProgressLogNanos() {
+            return lastProgressLogNanos;
+        }
+
+        private void lastProgressLogNanos(long value) {
+            this.lastProgressLogNanos = value;
+        }
+
+        private ExplosionProfileTrace trace() {
+            return trace;
+        }
+
+        private StreamingWavefrontPhase phase() {
+            return phase;
+        }
+
+        private void setPhase(StreamingWavefrontPhase phase) {
+            this.phase = phase == null ? StreamingWavefrontPhase.FAILED : phase;
+        }
+
+        private String failureMessage() {
+            return failureMessage;
+        }
+
+        private void failureMessage(String message) {
+            this.failureMessage = message;
+        }
+
+        private Int2DoubleOpenHashMap resistanceCostCache() {
+            return resistanceCostCache;
+        }
+
+        private WaveChunkStateCache chunkStateCache() {
+            return chunkStateCache;
+        }
+
+        private BlockPos.MutableBlockPos mutablePos() {
+            return mutablePos;
+        }
+
+        private Long2FloatOpenHashMap normalSlownessByPos() {
+            return normalSlownessByPos;
+        }
+
+        private LongOpenHashSet sampledSolidPositions() {
+            return sampledSolidPositions;
+        }
+
+        private Long2FloatOpenHashMap normalArrivalByPos() {
+            return normalArrivalByPos;
+        }
+
+        private Long2FloatOpenHashMap shadowArrivalByPos() {
+            return shadowArrivalByPos;
+        }
+
+        private LongOpenHashSet normalAccepted() {
+            return normalAccepted;
+        }
+
+        private LongOpenHashSet shadowAccepted() {
+            return shadowAccepted;
+        }
+
+        private WaveLongMinHeap normalQueue() {
+            return normalQueue;
+        }
+
+        private WaveLongMinHeap shadowQueue() {
+            return shadowQueue;
+        }
+
+        private LongArrayList sampledSolidList() {
+            return sampledSolidList;
+        }
+
+        private void sampledSolidList(LongArrayList sampledSolidList) {
+            this.sampledSolidList = sampledSolidList == null ? new LongArrayList(0) : sampledSolidList;
+        }
+
+        private LongArrayList targetPositions() {
+            return targetPositions;
+        }
+
+        private FloatArrayList targetWeights() {
+            return targetWeights;
+        }
+
+        private Long2FloatOpenHashMap collapseWeightsByPos() {
+            return collapseWeightsByPos;
+        }
+
+        private ThermalTargetShape thermalTargetShape() {
+            return thermalTargetShape;
+        }
+
+        private void thermalTargetShape(ThermalTargetShape thermalTargetShape) {
+            this.thermalTargetShape = thermalTargetShape == null
+                    ? new ThermalTargetShape(new LongArrayList(0), new Long2FloatOpenHashMap())
+                    : thermalTargetShape;
+        }
+
+        private int normalSourceCount() {
+            return normalSourceCount;
+        }
+
+        private void normalSourceCount(int normalSourceCount) {
+            this.normalSourceCount = normalSourceCount;
+        }
+
+        private int shadowSourceCount() {
+            return shadowSourceCount;
+        }
+
+        private void shadowSourceCount(int shadowSourceCount) {
+            this.shadowSourceCount = shadowSourceCount;
+        }
+
+        private double maxArrival() {
+            return maxArrival;
+        }
+
+        private void maxArrival(double maxArrival) {
+            this.maxArrival = maxArrival;
+        }
+
+        private long solveStartNanos() {
+            return solveStartNanos;
+        }
+
+        private void solveStartNanos(long solveStartNanos) {
+            this.solveStartNanos = solveStartNanos;
+        }
+
+        private long targetScanStartNanos() {
+            return targetScanStartNanos;
+        }
+
+        private void targetScanStartNanos(long targetScanStartNanos) {
+            this.targetScanStartNanos = targetScanStartNanos;
+        }
+
+        private long impactApplyStartNanos() {
+            return impactApplyStartNanos;
+        }
+
+        private void impactApplyStartNanos(long impactApplyStartNanos) {
+            this.impactApplyStartNanos = impactApplyStartNanos;
+        }
+
+        private long impactDirectStartNanos() {
+            return impactDirectStartNanos;
+        }
+
+        private void impactDirectStartNanos(long impactDirectStartNanos) {
+            this.impactDirectStartNanos = impactDirectStartNanos;
+        }
+
+        private long thermalApplyStartNanos() {
+            return thermalApplyStartNanos;
+        }
+
+        private void thermalApplyStartNanos(long thermalApplyStartNanos) {
+            this.thermalApplyStartNanos = thermalApplyStartNanos;
+        }
+
+        private Entity resolveSource(ServerLevel level) {
+            if (sourceUuid == null) {
+                return null;
+            }
+            if (cachedSource != null && !cachedSource.isRemoved()) {
+                return cachedSource;
+            }
+            Entity resolved = level.getEntity(sourceUuid);
+            if (resolved != null && !resolved.isRemoved()) {
+                cachedSource = resolved;
+                return resolved;
+            }
+            cachedSource = null;
+            return null;
+        }
+
+        private LivingEntity resolveOwner(ServerLevel level) {
+            if (ownerUuid == null) {
+                return null;
+            }
+            if (cachedOwner != null && !cachedOwner.isRemoved()) {
+                return cachedOwner;
+            }
+            Entity resolved = level.getEntity(ownerUuid);
+            if (resolved instanceof LivingEntity living && !living.isRemoved()) {
+                cachedOwner = living;
+                return living;
+            }
+            cachedOwner = null;
+            return null;
+        }
+    }
+
+    private static final class WaveChunkStateCache {
+        private final Long2ObjectOpenHashMap<LevelChunk> chunksByPos = new Long2ObjectOpenHashMap<>();
+
+        private BlockState getBlockState(ServerLevel level, BlockPos.MutableBlockPos mutablePos, int x, int y, int z) {
+            int chunkX = x >> 4;
+            int chunkZ = z >> 4;
+            long chunkKey = ChunkPos.asLong(chunkX, chunkZ);
+            LevelChunk chunk = chunksByPos.get(chunkKey);
+            if (chunk == null) {
+                chunk = level.getChunk(chunkX, chunkZ);
+                chunksByPos.put(chunkKey, chunk);
+            }
+            mutablePos.set(x, y, z);
+            return chunk.getBlockState(mutablePos);
+        }
+    }
+
+    private static final class WaveLongMinHeap {
+        private long[] keys;
+        private double[] priorities;
+        private int size;
+        private double polledPriority;
+
+        private WaveLongMinHeap(int initialCapacity) {
+            int capacity = Math.max(16, initialCapacity);
+            this.keys = new long[capacity];
+            this.priorities = new double[capacity];
+            this.size = 0;
+            this.polledPriority = Double.POSITIVE_INFINITY;
+        }
+
+        private boolean isEmpty() {
+            return size <= 0;
+        }
+
+        private int size() {
+            return size;
+        }
+
+        private void add(long key, double priority) {
+            ensureCapacity(size + 1);
+            int cursor = size++;
+            while (cursor > 0) {
+                int parent = (cursor - 1) >>> 1;
+                if (priority >= priorities[parent]) {
+                    break;
+                }
+                keys[cursor] = keys[parent];
+                priorities[cursor] = priorities[parent];
+                cursor = parent;
+            }
+            keys[cursor] = key;
+            priorities[cursor] = priority;
+        }
+
+        private long pollKey() {
+            long rootKey = keys[0];
+            polledPriority = priorities[0];
+            size--;
+            if (size > 0) {
+                long tailKey = keys[size];
+                double tailPriority = priorities[size];
+                int cursor = 0;
+                while (true) {
+                    int left = (cursor << 1) + 1;
+                    if (left >= size) {
+                        break;
+                    }
+                    int right = left + 1;
+                    int child = right < size && priorities[right] < priorities[left] ? right : left;
+                    if (tailPriority <= priorities[child]) {
+                        break;
+                    }
+                    keys[cursor] = keys[child];
+                    priorities[cursor] = priorities[child];
+                    cursor = child;
+                }
+                keys[cursor] = tailKey;
+                priorities[cursor] = tailPriority;
+            }
+            return rootKey;
+        }
+
+        private double pollPriority() {
+            return polledPriority;
+        }
+
+        private void ensureCapacity(int minCapacity) {
+            if (minCapacity <= keys.length) {
+                return;
+            }
+            int newCapacity = Math.max(minCapacity, keys.length << 1);
+            keys = Arrays.copyOf(keys, newCapacity);
+            priorities = Arrays.copyOf(priorities, newCapacity);
+        }
+    }
+
+    private record WavefrontSolveStats(int acceptedNodes, int poppedNodes) {
     }
 
     private static final class KrakkMinHeap {
@@ -6917,6 +12350,74 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
     }
 
+    private static final class KrakkDeltaBucketQueue {
+        private final double bucketWidth;
+        private final Int2ObjectOpenHashMap<IntArrayList> buckets;
+        private final PriorityQueue<Integer> bucketOrder;
+        private final IntOpenHashSet queuedBuckets;
+        private final BitSet pendingEntries;
+
+        private KrakkDeltaBucketQueue(double bucketWidth, int indexCapacity) {
+            this.bucketWidth = Math.max(1.0E-9D, bucketWidth);
+            this.buckets = new Int2ObjectOpenHashMap<>();
+            this.bucketOrder = new PriorityQueue<>();
+            this.queuedBuckets = new IntOpenHashSet();
+            this.pendingEntries = new BitSet(Math.max(1, indexCapacity));
+        }
+
+        private boolean isEmpty() {
+            return buckets.isEmpty();
+        }
+
+        private int bucketCount() {
+            return buckets.size();
+        }
+
+        private void add(int index, double arrival) {
+            if (index < 0) {
+                return;
+            }
+            if (pendingEntries.get(index)) {
+                return;
+            }
+            int bucketIndex = krakkDeltaBucketIndex(arrival, bucketWidth);
+            IntArrayList entries = buckets.get(bucketIndex);
+            if (entries == null) {
+                entries = new IntArrayList(16);
+                buckets.put(bucketIndex, entries);
+            }
+            entries.add(index);
+            pendingEntries.set(index);
+            if (queuedBuckets.add(bucketIndex)) {
+                bucketOrder.add(bucketIndex);
+            }
+        }
+
+        private boolean claim(int index) {
+            if (index < 0 || !pendingEntries.get(index)) {
+                return false;
+            }
+            pendingEntries.clear(index);
+            return true;
+        }
+
+        private int pollBucketIndex() {
+            while (!bucketOrder.isEmpty()) {
+                int bucketIndex = bucketOrder.poll();
+                queuedBuckets.remove(bucketIndex);
+                IntArrayList entries = buckets.get(bucketIndex);
+                if (entries != null && !entries.isEmpty()) {
+                    return bucketIndex;
+                }
+            }
+            return -1;
+        }
+
+        private IntArrayList takeBucket(int bucketIndex) {
+            return buckets.remove(bucketIndex);
+        }
+    }
+
     private record VolumetricDirectionCache(double[] dirX,
                                             double[] dirY,
                                             double[] dirZ,
@@ -6963,7 +12464,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     }
 
     private record KrakkResistanceFieldChunkResult(
-            LongArrayList solidPositions,
+            IntArrayList solidIndices,
             int sampledVoxelCount
     ) {
     }
@@ -6972,12 +12473,13 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             LongArrayList targetPositions,
             FloatArrayList targetWeights,
             double solidWeight,
+            double maxWeight,
             long precheckNanos
     ) {
     }
 
     private record KrakkVolumetricBaselineResult(
-            Long2FloatOpenHashMap baselineByPos,
+            float[] baselineByIndex,
             long directionSetupNanos,
             long pressureSolveNanos,
             long targetScanNanos,
@@ -7003,40 +12505,46 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             int sizeZ,
             int sampledVoxelCount,
             BitSet activeMask,
-            float[] slowness,
-            LongArrayList solidPositions,
-            int[] activeRowOffsets,
-            int[] activeRowLengths,
-            int[] activeRowIndices,
-            int[] neighborNegX,
-            int[] neighborPosX,
-            int[] neighborNegY,
-            int[] neighborPosY,
-            int[] neighborNegZ,
-            int[] neighborPosZ
+            FloatIndexedAccess slowness,
+            LongIndexedAccess solidPositions,
+            int[] activeRowLengths
     ) {
     }
 
     private record KrakkCoarseSolveContext(
             KrakkField coarseField,
-            float[] coarseArrivalTimes,
-            float[] coarseSlowness,
-            BitSet coarseSourceMask,
+            MutableFloatIndexedAccess coarseArrivalTimes,
+            MutableFloatIndexedAccess coarseSlowness,
+            SourceIndexSet coarseSourceMask,
             int coarseSourceCount,
             int downsampleFactor
     ) {
     }
 
-    private record KrakkSolveResult(float[] arrivalTimes, int sourceCells, int sweepCycles) {
+    private record KrakkSolveResult(MutableFloatIndexedAccess arrivalTimes, int sourceCells, int sweepCycles) {
     }
 
     private record PairedKrakkSolveResult(KrakkSolveResult normal, KrakkSolveResult shadow) {
     }
 
-    private record PairedKrakkSlownessResult(float[] normalSlowness, float[] shadowSlowness) {
+    private record PairedKrakkSlownessResult(FloatIndexedAccess normalSlowness, FloatIndexedAccess shadowSlowness) {
     }
 
     private record PairedKrakkSourceResult(int normalSourceCount, int shadowSourceCount) {
+    }
+
+    private enum KrakkArrivalSolver {
+        SWEEP,
+        DELTA_STEPPING,
+        ORDERED_UPWIND
+    }
+
+    private record RuntimeExecutionPolicy(
+            boolean compactSourceTracking,
+            boolean forceDirectResistanceSampling,
+            int maxMultiresVolume,
+            KrakkArrivalSolver arrivalSolver
+    ) {
     }
 
     @Override
@@ -7051,6 +12559,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 owner,
                 resolution.radius,
                 resolution.energy,
+                resolution.impactHeatCelsius,
+                resolution.blastTransmittance,
                 true,
                 true,
                 null
@@ -7071,6 +12581,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 owner,
                 resolution.radius,
                 resolution.energy,
+                resolution.impactHeatCelsius,
+                resolution.blastTransmittance,
                 applyWorldChanges,
                 applyWorldChanges,
                 trace
@@ -7140,13 +12652,14 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             double fallbackPower = KrakkExplosionCurves.DEFAULT_IMPACT_POWER;
             double resolvedRadius = sanitizeKrakkRadius(Double.NaN, fallbackPower);
             double resolvedEnergy = sanitizeKrakkEnergy(Double.NaN, fallbackPower);
-            return new ExplosionResolution(resolvedRadius, resolvedEnergy);
+            return new ExplosionResolution(resolvedRadius, resolvedEnergy, KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS, KrakkExplosionProfile.DEFAULT_BLAST_TRANSMITTANCE);
         }
 
         double fallbackPower = KrakkExplosionCurves.DEFAULT_IMPACT_POWER;
         double resolvedRadius = sanitizeKrakkRadius(profile.radius(), fallbackPower);
         double resolvedEnergy = sanitizeKrakkEnergy(profile.energy(), fallbackPower);
-        return new ExplosionResolution(resolvedRadius, resolvedEnergy);
+        double resolvedImpactHeatCelsius = sanitizeImpactHeatCelsius(profile.impactHeatCelsius());
+        return new ExplosionResolution(resolvedRadius, resolvedEnergy, resolvedImpactHeatCelsius, profile.blastTransmittance());
     }
 
     private static double sanitizeKrakkRadius(double radius, double fallbackPower) {
@@ -7163,15 +12676,14 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     }
 
     private static double resolveKrakkRadiusFromEnergyCutoff(double totalEnergy) {
+        // Use energy-driven blast calibration for the envelope radius so delta-stepping stays on
+        // the same power scale as baseline Krakk explosions and remains practically solvable.
         double normalizedEnergy = Math.max(totalEnergy, VOLUMETRIC_MIN_ENERGY);
-        double decayPerBlock = Mth.clamp(VOLUMETRIC_PRESSURE_AIR_DECAY_PER_BLOCK, 1.0E-4D, 0.95D);
-        double logDecay = Math.log1p(-decayPerBlock);
-        double cutoffRatio = VOLUMETRIC_MIN_ENERGY / normalizedEnergy;
-        double distance = Math.log(cutoffRatio) / logDecay;
-        if (!Double.isFinite(distance)) {
+        double calibratedRadius = KrakkExplosionCurves.computeBlastRadius(normalizedEnergy);
+        if (!Double.isFinite(calibratedRadius)) {
             return 1.0D;
         }
-        return Math.max(1.0D, distance);
+        return Math.max(1.0D, calibratedRadius);
     }
 
     private static double sanitizeKrakkEnergy(double energy, double fallbackPower) {
@@ -7181,7 +12693,25 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return Math.max(VOLUMETRIC_MIN_ENERGY, fallbackPower);
     }
 
-    private record ExplosionResolution(double radius, double energy) {
+    private static double sanitizeImpactHeatCelsius(double impactHeatCelsius) {
+        if (!Double.isFinite(impactHeatCelsius)) {
+            return KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS;
+        }
+        return impactHeatCelsius;
+    }
+
+    private record BlockImpactOutcome(boolean broken, boolean damaged, boolean converted, boolean ignited) {
+        private static final BlockImpactOutcome NONE = new BlockImpactOutcome(false, false, false, false);
+    }
+
+    private record ThermalTargetShape(LongArrayList positions, Long2FloatOpenHashMap weightsByPos) {
+    }
+
+    private record StreamingImpactSample(double impactPower, double weight) {
+        private static final StreamingImpactSample NONE = new StreamingImpactSample(0.0D, 0.0D);
+    }
+
+    private record ExplosionResolution(double radius, double energy, double impactHeatCelsius, double blastTransmittance) {
     }
 
     private static final class ExplosionProfileTrace {

@@ -1,0 +1,6 @@
+{
+  "source": "minecraft:raw_gold_block",
+  "target": "minecraft:gold_block",
+  "damage_state": 0,
+  "heat_celsius_min": 1064.0
+}

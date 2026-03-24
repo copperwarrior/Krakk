@@ -1,0 +1,11 @@
+{
+  "target": "minecraft:snow",
+  "placement_mode": "up_if_open",
+  "priority": 90,
+  "heat_celsius_max": 21.0,
+  "chance_min": 0.02,
+  "chance_max": 0.85,
+  "chance_heat_min": 21.0,
+  "chance_heat_max": -400.0,
+  "chance_exponent": 1.6
+}

@@ -1,0 +1,6 @@
+{
+  "source": "minecraft:water",
+  "target": "minecraft:air",
+  "damage_state": 0,
+  "heat_celsius_min": 400.0
+}

@@ -1,0 +1,5 @@
+{
+  "source": "minecraft:yellow_concrete",
+  "target": "minecraft:yellow_concrete_powder",
+  "damage_fraction": 0.60
+}

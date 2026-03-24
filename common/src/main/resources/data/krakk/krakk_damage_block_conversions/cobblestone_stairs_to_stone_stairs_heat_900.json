@@ -1,0 +1,6 @@
+{
+  "source": "minecraft:cobblestone_stairs",
+  "target": "minecraft:stone_stairs",
+  "damage_state": 0,
+  "heat_celsius_min": 900.0
+}

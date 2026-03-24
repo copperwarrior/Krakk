@@ -1,0 +1,12 @@
+{
+  "source": "minecraft:water",
+  "source_properties": {
+    "level": [3, 4]
+  },
+  "target": "minecraft:frosted_ice",
+  "target_properties": {
+    "age": 1
+  },
+  "damage_state": 0,
+  "heat_celsius_max": -10.0
+}

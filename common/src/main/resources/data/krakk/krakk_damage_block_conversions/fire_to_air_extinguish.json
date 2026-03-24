@@ -1,0 +1,6 @@
+{
+  "source": "minecraft:fire",
+  "target": "minecraft:air",
+  "damage_state": 0,
+  "heat_celsius_max": -30.0
+}

@@ -1,0 +1,6 @@
+{
+  "source": "minecraft:ice",
+  "target": "minecraft:packed_ice",
+  "damage_state": 0,
+  "heat_celsius_max": -80.0
+}
