@@ -58,6 +58,9 @@ import org.shipwrights.krakk.runtime.damage.KrakkDamageRuntime;
 import org.slf4j.Logger;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.lang.ref.Cleaner;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -72,7 +75,9 @@ import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.PriorityQueue;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
@@ -348,6 +353,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             new Direction(0.0D, 0.0D, -1.0D),
             new Direction(0.0D, 0.0D, 1.0D)
     };
+    private static final Map<Class<?>, Method> BLOCK_IGNITE_METHODS = new ConcurrentHashMap<>();
+    private static final Set<Class<?>> BLOCK_NO_IGNITE_METHOD = ConcurrentHashMap.newKeySet();
+    private static final Set<Class<?>> BLOCK_IGNITE_FAILURE_LOGGED = ConcurrentHashMap.newKeySet();
     private static volatile SpecialBlockHandler specialBlockHandler = SpecialBlockHandler.NOOP;
     private static volatile boolean parallelResistanceFieldSamplingEnabled = true;
     private static volatile double raySplitDistanceThreshold = DEFAULT_RAY_SPLIT_DISTANCE_THRESHOLD;
@@ -404,6 +412,147 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
     public static void setSpecialBlockHandler(SpecialBlockHandler handler) {
         specialBlockHandler = handler == null ? SpecialBlockHandler.NOOP : handler;
+    }
+
+    private static boolean tryTriggerNativeIgnite(ServerLevel level, BlockPos blockPos, BlockState blockState,
+                                                  Entity source, LivingEntity owner) {
+        Block block = blockState.getBlock();
+        Method igniteMethod = resolveNativeIgniteMethod(block.getClass());
+        if (igniteMethod == null) {
+            return false;
+        }
+
+        Object[] args = buildIgniteArgs(igniteMethod, level, blockPos, blockState, source, owner);
+        if (args == null) {
+            BLOCK_NO_IGNITE_METHOD.add(block.getClass());
+            BLOCK_IGNITE_METHODS.remove(block.getClass());
+            return false;
+        }
+
+        try {
+            Object result = igniteMethod.invoke(block, args);
+            boolean handled = !returnsBoolean(igniteMethod) || Boolean.TRUE.equals(result);
+            if (!handled) {
+                return false;
+            }
+            if (isOnCaughtFireMethod(igniteMethod) && block instanceof TntBlock && level.getBlockState(blockPos).is(block)) {
+                level.removeBlock(blockPos, false);
+            }
+            return true;
+        } catch (IllegalAccessException | InvocationTargetException exception) {
+            if (BLOCK_IGNITE_FAILURE_LOGGED.add(block.getClass())) {
+                LOGGER.warn("Failed to invoke ignite handler {} on block {}", igniteMethod.getName(), block, exception);
+            }
+            return false;
+        }
+    }
+
+    private static Method resolveNativeIgniteMethod(Class<?> blockClass) {
+        Method cached = BLOCK_IGNITE_METHODS.get(blockClass);
+        if (cached != null) {
+            return cached;
+        }
+        if (BLOCK_NO_IGNITE_METHOD.contains(blockClass)) {
+            return null;
+        }
+
+        Method resolved = findPublicIgniteMethod(blockClass, "ignite");
+        if (resolved == null) {
+            resolved = findPublicIgniteMethod(blockClass, "onCaughtFire");
+        }
+        if (resolved != null) {
+            BLOCK_IGNITE_METHODS.put(blockClass, resolved);
+            return resolved;
+        }
+
+        BLOCK_NO_IGNITE_METHOD.add(blockClass);
+        return null;
+    }
+
+    private static Method findPublicIgniteMethod(Class<?> blockClass, String methodName) {
+        for (Method method : blockClass.getMethods()) {
+            if (!method.getName().equals(methodName)) {
+                continue;
+            }
+            if (Modifier.isStatic(method.getModifiers())) {
+                continue;
+            }
+            if (!isIgniteCompatible(method)) {
+                continue;
+            }
+            return method;
+        }
+        return null;
+    }
+
+    private static boolean isIgniteCompatible(Method method) {
+        if (!returnsBoolean(method) && method.getReturnType() != Void.TYPE) {
+            return false;
+        }
+
+        boolean hasLevel = false;
+        boolean hasBlockPos = false;
+        for (Class<?> parameterType : method.getParameterTypes()) {
+            if (BlockState.class.isAssignableFrom(parameterType)
+                    || BlockPos.class.isAssignableFrom(parameterType)
+                    || Level.class.isAssignableFrom(parameterType)
+                    || net.minecraft.core.Direction.class.isAssignableFrom(parameterType)
+                    || LivingEntity.class.isAssignableFrom(parameterType)
+                    || Entity.class.isAssignableFrom(parameterType)) {
+                if (BlockPos.class.isAssignableFrom(parameterType)) {
+                    hasBlockPos = true;
+                }
+                if (Level.class.isAssignableFrom(parameterType)) {
+                    hasLevel = true;
+                }
+                continue;
+            }
+            return false;
+        }
+        return hasLevel && hasBlockPos;
+    }
+
+    private static boolean returnsBoolean(Method method) {
+        return method.getReturnType() == Boolean.TYPE || method.getReturnType() == Boolean.class;
+    }
+
+    private static boolean isOnCaughtFireMethod(Method method) {
+        return "onCaughtFire".equals(method.getName());
+    }
+
+    private static Object[] buildIgniteArgs(Method method, ServerLevel level, BlockPos blockPos, BlockState blockState,
+                                            Entity source, LivingEntity owner) {
+        Class<?>[] parameterTypes = method.getParameterTypes();
+        Object[] args = new Object[parameterTypes.length];
+        for (int i = 0; i < parameterTypes.length; i++) {
+            Class<?> parameterType = parameterTypes[i];
+            if (BlockState.class.isAssignableFrom(parameterType)) {
+                args[i] = blockState;
+                continue;
+            }
+            if (BlockPos.class.isAssignableFrom(parameterType)) {
+                args[i] = blockPos;
+                continue;
+            }
+            if (Level.class.isAssignableFrom(parameterType)) {
+                args[i] = level;
+                continue;
+            }
+            if (net.minecraft.core.Direction.class.isAssignableFrom(parameterType)) {
+                args[i] = null;
+                continue;
+            }
+            if (LivingEntity.class.isAssignableFrom(parameterType)) {
+                args[i] = owner;
+                continue;
+            }
+            if (Entity.class.isAssignableFrom(parameterType)) {
+                args[i] = owner != null ? owner : source;
+                continue;
+            }
+            return null;
+        }
+        return args;
     }
 
     public static boolean isKrakkPhaseTimingLoggingEnabled() {
@@ -8085,6 +8234,13 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
         if (trace != null) {
             trace.blocksEvaluated++;
+        }
+
+        if (!thermalOnly && applyWorldChanges && tryTriggerNativeIgnite(level, mutablePos, blockState, source, owner)) {
+            if (trace != null) {
+                trace.specialHandled++;
+            }
+            return BlockImpactOutcome.NONE;
         }
 
         if (!thermalOnly && applyWorldChanges && specialBlockHandler.handle(level, mutablePos, blockState, source, owner)) {
