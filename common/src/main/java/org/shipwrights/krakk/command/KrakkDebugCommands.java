@@ -1,7 +1,6 @@
 package org.shipwrights.krakk.command;
 
 import com.mojang.logging.LogUtils;
-import com.mojang.brigadier.arguments.BoolArgumentType;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
