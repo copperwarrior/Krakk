@@ -286,7 +286,6 @@ final class PagedFloatArrayStorage implements MutableFloatIndexedAccess {
     private static final Cleaner CLEANER = Cleaner.create();
 
     private final int size;
-    private final int pageCount;
     private final int maxCachedPages;
     private final float[][] cachePages;
     private final int[] cachePageIds;
@@ -301,8 +300,8 @@ final class PagedFloatArrayStorage implements MutableFloatIndexedAccess {
 
     PagedFloatArrayStorage(int size, int requestedCachePages) {
         this.size = Math.max(1, size);
-        this.pageCount = Math.max(1, (this.size + PAGE_SIZE - 1) / PAGE_SIZE);
-        this.maxCachedPages = Math.max(4, Math.min(this.pageCount, requestedCachePages));
+        int pageCount = Math.max(1, (this.size + PAGE_SIZE - 1) / PAGE_SIZE);
+        this.maxCachedPages = Math.max(4, Math.min(pageCount, requestedCachePages));
         this.cachePages = new float[this.maxCachedPages][PAGE_SIZE];
         this.cachePageIds = new int[this.maxCachedPages];
         Arrays.fill(this.cachePageIds, -1);
@@ -310,13 +309,13 @@ final class PagedFloatArrayStorage implements MutableFloatIndexedAccess {
         this.cacheAccessTicks = new long[this.maxCachedPages];
         this.pageToSlot = new Int2IntOpenHashMap(Math.max(16, this.maxCachedPages * 2));
         this.pageToSlot.defaultReturnValue(-1);
-        this.persistedPages = new boolean[this.pageCount];
+        this.persistedPages = new boolean[pageCount];
         this.ioBuffer = ByteBuffer.allocate(PAGE_SIZE * Float.BYTES).order(ByteOrder.LITTLE_ENDIAN);
         this.defaultFillValue = 0.0F;
         this.accessTick = 1L;
 
         Path backingFile = null;
-        FileChannel openedChannel = null;
+        FileChannel openedChannel;
         try {
             backingFile = Files.createTempFile("krakk-float-pages-", ".bin");
             openedChannel = FileChannel.open(

@@ -171,7 +171,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final double KRAKK_RESISTANCE_NORMALIZED_ATTENUATION = 3.5D;
     private static final double KRAKK_HARD_BLOCK_NORMALIZED_OVERRUN = 4.0D;
     private static final double KRAKK_OVERRUN_DEADZONE = 0.05D;
-    private static final double KRAKK_SHADOW_SOLID_SLOWNESS_SCALE = 4.0D;
     private static final double KRAKK_SHADOW_ATTENUATION_PER_OVERRUN = 4.0D;
     private static final double KRAKK_SHADOW_NORMALIZED_ATTENUATION = 7.0D;
     private static final double KRAKK_HARD_BLOCK_SHADOW_NORMALIZED_OVERRUN = 2.5D;
@@ -1563,8 +1562,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                             job.mutablePos(),
                             job.chunkStateCache(),
                             job.resistanceCostCache(),
-                            job.slownessByPos(),
-                            null
+                            job.slownessByPos()
                     );
                     if (slowness <= 0.0F) {
                         continue;
@@ -1590,8 +1588,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 job.mutablePos(),
                 job.chunkStateCache(),
                 job.resistanceCostCache(),
-                job.slownessByPos(),
-                null
+                job.slownessByPos()
         );
         if (seedSlowness > 0.0F && enqueueStreamingSource(seedPosLong, 0.0D, job.arrivalByPos(), job.trialQueue())) {
             sourceCount++;
@@ -1651,8 +1648,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     job.mutablePos(),
                     job.chunkStateCache(),
                     job.resistanceCostCache(),
-                    job.slownessByPos(),
-                    null
+                    job.slownessByPos()
             );
             if (currentSlowness <= 0.0F) {
                 continue;
@@ -1938,14 +1934,12 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 mutablePos,
                 chunkStateCache,
                 resistanceCostCache,
-                normalSlownessByPos,
-                null
+                normalSlownessByPos
         );
         if (normalSlowness <= 0.0F) {
             return Double.POSITIVE_INFINITY;
         }
-        double slowness = normalSlowness;
-        return solveKrakkDistance(a, b, c, slowness);
+        return solveKrakkDistance(a, b, c, normalSlowness);
     }
 
     private static double minStreamingAcceptedAxis(Long2FloatOpenHashMap arrivalByPos,
@@ -2003,8 +1997,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                         BlockPos.MutableBlockPos mutablePos,
                                                         WaveChunkStateCache chunkStateCache,
                                                         Int2DoubleOpenHashMap resistanceCostCache,
-                                                        Long2FloatOpenHashMap normalSlownessByPos,
-                                                        LongOpenHashSet sampledSolidPositions) {
+                                                        Long2FloatOpenHashMap normalSlownessByPos) {
         float cached = normalSlownessByPos.get(posLong);
         if (Float.isFinite(cached)) {
             return cached;
@@ -2015,9 +2008,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             double resistanceCost = getCachedResistanceCost(resistanceCostCache, blockState);
             double resistanceNoise = sampleBlockResistanceNoise(x, y, z) * KRAKK_BLOCK_RESISTANCE_NOISE_MAX;
             resolvedSlowness = (float) (KRAKK_AIR_SLOWNESS + ((resistanceCost + resistanceNoise) * KRAKK_SOLID_SLOWNESS_SCALE));
-            if (sampledSolidPositions != null) {
-                sampledSolidPositions.add(posLong);
-            }
         }
         normalSlownessByPos.put(posLong, resolvedSlowness);
         return resolvedSlowness;
@@ -2034,12 +2024,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         hash *= 0xC4CEB9FE1A85EC53L;
         hash ^= (hash >>> 33);
         return ((hash >>> 11) & 0x1FFFFFL) / 2097151.0D;
-    }
-
-    private static float resolveStreamingShadowSlowness(float normalSlowness) {
-        float airSlowness = (float) KRAKK_AIR_SLOWNESS;
-        float overrun = Math.max(0.0F, normalSlowness - airSlowness);
-        return (float) (airSlowness + (overrun * KRAKK_SHADOW_SOLID_SLOWNESS_SCALE));
     }
 
     private static void logKrakkPhaseTiming(long traceId, String phase, long elapsedNanos, String detail) {
@@ -2624,13 +2608,11 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static KrakkSolveResult solveKrakkArrivalTimes(KrakkField field,
                                                                double centerX,
                                                                double centerY,
-                                                               double centerZ,
-                                                               float uniformSlownessOverride,
-                                                               float solidSlownessScale) {
+                                                               double centerZ) {
         MutableFloatIndexedAccess arrivalTimes = createKrakkArrivalStorage(field.slowness().size());
         arrivalTimes.fill(Float.POSITIVE_INFINITY);
         BitSet traversableMask = field.activeMask();
-        FloatIndexedAccess resolvedSlowness = resolveKrakkSlownessField(field, uniformSlownessOverride, solidSlownessScale);
+        FloatIndexedAccess resolvedSlowness = field.slowness();
         SourceIndexSet sourceMask = createSourceIndexSet(arrivalTimes.size());
         int sourceCount = initializeKrakkSources(
                 arrivalTimes,
@@ -2660,9 +2642,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     field,
                     centerX,
                     centerY,
-                    centerZ,
-                    Float.NaN,
-                    1.0F
+                    centerZ
             );
             return new PairedKrakkSolveResult(normalSolveResult, normalSolveResult);
         }
@@ -2672,12 +2652,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         normalArrivalTimes.fill(Float.POSITIVE_INFINITY);
         shadowArrivalTimes.fill(Float.POSITIVE_INFINITY);
         BitSet traversableMask = field.activeMask();
-        PairedKrakkSlownessResult slownessResult = resolvePairedKrakkSlownessField(
-                field,
-                Float.NaN,
-                1.0F,
-                4.0F
-        );
+        PairedKrakkSlownessResult slownessResult = resolvePairedKrakkSlownessField(field);
         SourceIndexSet normalSourceMask = createSourceIndexSet(normalArrivalTimes.size());
         SourceIndexSet shadowSourceMask = createSourceIndexSet(shadowArrivalTimes.size());
         PairedKrakkSourceResult sourceResult = initializePairedKrakkSources(
@@ -2784,8 +2759,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                                        FloatIndexedAccess resolvedSlowness,
                                                                        KrakkField field,
                                                                        SourceIndexSet sourceMask,
-                                                                       int sourceCount,
-                                                                       boolean allowParallelSweep) {
+                                                                       int sourceCount) {
         if (sourceCount <= 0) {
             return new KrakkSolveResult(arrivalTimes, 0, 0);
         }
@@ -2807,7 +2781,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     resolvedSlowness,
                     field,
                     sourceMask,
-                    allowParallelSweep,
                     maxSweepCycles
             );
             return new KrakkSolveResult(arrivalTimes, sourceCount, Math.max(deltaSteppingResult.sweepCycles(), sweepCycles));
@@ -2826,7 +2799,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     resolvedSlowness,
                     field,
                     sourceMask,
-                    allowParallelSweep,
                     maxSweepCycles
             );
             return new KrakkSolveResult(arrivalTimes, sourceCount, Math.max(orderedUpwindResult.sweepCycles(), sweepCycles));
@@ -2837,13 +2809,12 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 resolvedSlowness,
                 field,
                 sourceMask,
-                allowParallelSweep,
                 maxSweepCycles
         );
         return new KrakkSolveResult(arrivalTimes, sourceCount, sweepCycles);
     }
 
-    private static void solveKrakkArrivalTimesPrepared(MutableFloatIndexedAccess arrivalTimes,
+    private static void solveKrakkCoarseArrivalTimesPrepared(MutableFloatIndexedAccess arrivalTimes,
                                                                        FloatIndexedAccess resolvedSlowness,
                                                                        KrakkField field,
                                                                        SourceIndexSet sourceMask,
@@ -2857,7 +2828,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 resolvedSlowness,
                 field,
                 sourceMask,
-                true,
                 maxSweepCycles
         );
     }
@@ -2875,8 +2845,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     resolvedSlowness,
                     field,
                     sourceMask,
-                    sourceCount,
-                    true
+                    sourceCount
             );
         }
         long fieldVolume = (long) field.sizeX() * (long) field.sizeY() * (long) field.sizeZ();
@@ -2886,8 +2855,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     resolvedSlowness,
                     field,
                     sourceMask,
-                    sourceCount,
-                    true
+                    sourceCount
             );
         }
 
@@ -2903,12 +2871,11 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     resolvedSlowness,
                     field,
                     sourceMask,
-                    sourceCount,
-                    true
+                    sourceCount
             );
         }
 
-        solveKrakkArrivalTimesPrepared(
+        solveKrakkCoarseArrivalTimesPrepared(
                 coarseContext.coarseArrivalTimes(),
                 coarseContext.coarseSlowness(),
                 coarseContext.coarseField(),
@@ -2928,7 +2895,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 resolvedSlowness,
                 field,
                 sourceMask,
-                true,
                 KRAKK_MULTIRES_FINE_REFINE_SWEEP_CYCLES
         );
         return new KrakkSolveResult(arrivalTimes, sourceCount, fineSweepCycles);
@@ -3208,7 +3174,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                  FloatIndexedAccess resolvedSlowness,
                                                  KrakkField field,
                                                  SourceIndexSet sourceMask,
-                                                 boolean allowParallelSweep,
                                                  int maxSweepCycles) {
         int boundedCycles = Math.max(0, Math.min(maxSweepCycles, computeKrakkMaxSweepCycles(field)));
         int rowCount = field.sizeX() * field.sizeY();
@@ -3225,14 +3190,14 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             }
             BitSet nextDirtyRows = new BitSet(Math.max(1, rowCount));
             double maxDelta = 0.0D;
-            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, true, true, true, activeRowsMask, nextDirtyRows));
-            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, true, true, false, activeRowsMask, nextDirtyRows));
-            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, true, false, true, activeRowsMask, nextDirtyRows));
-            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, true, false, false, activeRowsMask, nextDirtyRows));
-            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, false, true, true, activeRowsMask, nextDirtyRows));
-            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, false, true, false, activeRowsMask, nextDirtyRows));
-            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, false, false, true, activeRowsMask, nextDirtyRows));
-            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, allowParallelSweep, false, false, false, activeRowsMask, nextDirtyRows));
+            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, true, true, true, activeRowsMask, nextDirtyRows));
+            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, true, true, false, activeRowsMask, nextDirtyRows));
+            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, true, false, true, activeRowsMask, nextDirtyRows));
+            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, true, false, false, activeRowsMask, nextDirtyRows));
+            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, false, true, true, activeRowsMask, nextDirtyRows));
+            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, false, true, false, activeRowsMask, nextDirtyRows));
+            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, false, false, true, activeRowsMask, nextDirtyRows));
+            maxDelta = Math.max(maxDelta, sweepKrakkPass(arrivalTimes, resolvedSlowness, field, sourceMask, false, false, false, activeRowsMask, nextDirtyRows));
             dirtyRows = nextDirtyRows;
             sweepCycles++;
             if (maxDelta <= KRAKK_CONVERGENCE_EPSILON) {
@@ -3285,9 +3250,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                                              SourceIndexSet fineSourceMask,
                                                                              FloatIndexedAccess fineArrivalTimes) {
         int downsampleFactor = KRAKK_MULTIRES_DOWNSAMPLE_FACTOR;
-        if (downsampleFactor <= 1) {
-            return null;
-        }
         int fineSizeX = fineField.sizeX();
         int fineSizeY = fineField.sizeY();
         int fineSizeZ = fineField.sizeZ();
@@ -3307,7 +3269,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             return null;
         }
         int coarseVolume = (int) coarseVolumeLong;
-        MutableFloatIndexedAccess coarseSlowness = createKrakkFloatStorage(Math.max(1, coarseVolume));
+        MutableFloatIndexedAccess coarseSlowness = createKrakkFloatStorage(coarseVolume);
         MutableFloatIndexedAccess coarseArrivalTimes = createKrakkArrivalStorage(coarseVolume);
         coarseArrivalTimes.fill(Float.POSITIVE_INFINITY);
         SourceIndexSet coarseSourceMask = createSourceIndexSet(coarseArrivalTimes.size());
@@ -3499,71 +3461,16 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
     }
 
-    private static FloatIndexedAccess resolveKrakkSlownessField(KrakkField field,
-                                                       float uniformSlownessOverride,
-                                                       float solidSlownessScale) {
-        return resolvePairedKrakkSlownessField(
-                field,
-                uniformSlownessOverride,
-                solidSlownessScale,
-                solidSlownessScale
-        ).normalSlowness();
-    }
-
-    private static PairedKrakkSlownessResult resolvePairedKrakkSlownessField(KrakkField field,
-                                                                                  float uniformSlownessOverride,
-                                                                                  float normalSolidSlownessScale,
-                                                                                  float shadowSolidSlownessScale) {
+    private static PairedKrakkSlownessResult resolvePairedKrakkSlownessField(KrakkField field) {
         FloatIndexedAccess baseSlowness = field.slowness();
-        boolean uniformOverrideActive = Float.isFinite(uniformSlownessOverride) && uniformSlownessOverride > 0.0F;
-        float resolvedNormalScale = Float.isFinite(normalSolidSlownessScale) && normalSolidSlownessScale > 0.0F
-                ? normalSolidSlownessScale
-                : 1.0F;
-        float resolvedShadowScale = Float.isFinite(shadowSolidSlownessScale) && shadowSolidSlownessScale > 0.0F
-                ? shadowSolidSlownessScale
-                : 1.0F;
-        if (!uniformOverrideActive
-                && Math.abs(resolvedNormalScale - 1.0F) <= 1.0E-6F
-                && Math.abs(resolvedShadowScale - 1.0F) <= 1.0E-6F) {
-            return new PairedKrakkSlownessResult(baseSlowness, baseSlowness);
-        }
-
-        if (uniformOverrideActive) {
-            MutableFloatIndexedAccess resolvedSlowness = createKrakkFloatStorage(baseSlowness.size());
-            BitSet activeMask = field.activeMask();
-            for (int index = activeMask.nextSetBit(0); index >= 0; index = activeMask.nextSetBit(index + 1)) {
-                if (baseSlowness.getFloat(index) > 0.0F) {
-                    resolvedSlowness.setFloat(index, uniformSlownessOverride);
-                }
-            }
-            return new PairedKrakkSlownessResult(resolvedSlowness, resolvedSlowness);
-        }
-
-        boolean normalIsBase = Math.abs(resolvedNormalScale - 1.0F) <= 1.0E-6F;
-        boolean shadowIsBase = Math.abs(resolvedShadowScale - 1.0F) <= 1.0E-6F;
-        if (!normalIsBase && !shadowIsBase && Math.abs(resolvedNormalScale - resolvedShadowScale) <= 1.0E-6F) {
-            MutableFloatIndexedAccess resolvedSlowness = createKrakkFloatStorage(baseSlowness.size());
-            applyKrakkSlownessScale(resolvedSlowness, baseSlowness, field.activeMask(), resolvedNormalScale);
-            return new PairedKrakkSlownessResult(resolvedSlowness, resolvedSlowness);
-        }
-
-        MutableFloatIndexedAccess normalScaledSlowness = normalIsBase ? null : createKrakkFloatStorage(baseSlowness.size());
-        MutableFloatIndexedAccess shadowScaledSlowness = shadowIsBase ? null : createKrakkFloatStorage(baseSlowness.size());
-        if (normalScaledSlowness != null) {
-            applyKrakkSlownessScale(normalScaledSlowness, baseSlowness, field.activeMask(), resolvedNormalScale);
-        }
-        if (shadowScaledSlowness != null) {
-            applyKrakkSlownessScale(shadowScaledSlowness, baseSlowness, field.activeMask(), resolvedShadowScale);
-        }
-        FloatIndexedAccess normalSlowness = normalIsBase ? baseSlowness : normalScaledSlowness;
-        FloatIndexedAccess shadowSlowness = shadowIsBase ? baseSlowness : shadowScaledSlowness;
-        return new PairedKrakkSlownessResult(normalSlowness, shadowSlowness);
+        MutableFloatIndexedAccess shadowScaledSlowness = createKrakkFloatStorage(baseSlowness.size());
+        applyKrakkSlownessScale(shadowScaledSlowness, baseSlowness, field.activeMask());
+        return new PairedKrakkSlownessResult(baseSlowness, shadowScaledSlowness);
     }
 
     private static void applyKrakkSlownessScale(MutableFloatIndexedAccess outputSlowness,
                                                   FloatIndexedAccess baseSlowness,
-                                                  BitSet activeMask,
-                                                  float scale) {
+                                                  BitSet activeMask) {
         float airSlowness = (float) KRAKK_AIR_SLOWNESS;
         for (int index = activeMask.nextSetBit(0); index >= 0; index = activeMask.nextSetBit(index + 1)) {
             float base = baseSlowness.getFloat(index);
@@ -3575,7 +3482,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 outputSlowness.setFloat(index, base);
                 continue;
             }
-            outputSlowness.setFloat(index, airSlowness + (solidOverrun * scale));
+            outputSlowness.setFloat(index, airSlowness + (solidOverrun * 4.0F));
         }
     }
 
@@ -3737,7 +3644,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                            FloatIndexedAccess resolvedSlowness,
                                            KrakkField field,
                                            SourceIndexSet sourceMask,
-                                           boolean allowParallelSweep,
                                            boolean xForward,
                                            boolean yForward,
                                            boolean zForward,
@@ -3752,8 +3658,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         long[] activeRowsMaskWords = activeRowsMask != null ? activeRowsMask.toLongArray() : null;
         int activeRowsMaskWordCount = activeRowsMaskWords != null ? activeRowsMaskWords.length : 0;
         double maxDelta = 0.0D;
-        boolean parallelSweepAllowed = allowParallelSweep
-                && !requiresSerializedFloatAccess(arrivalTimes)
+        boolean parallelSweepAllowed = !requiresSerializedFloatAccess(arrivalTimes)
                 && !requiresSerializedFloatAccess(resolvedSlowness);
         for (int diagonal = 0; diagonal < diagonalCount; diagonal++) {
             int minXOrder = Math.max(0, diagonal - (sizeY - 1));
