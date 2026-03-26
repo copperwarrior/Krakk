@@ -3,20 +3,13 @@ package org.shipwrights.krakk.runtime.explosion;
 import com.mojang.logging.LogUtils;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.Int2DoubleOpenHashMap;
-import it.unimi.dsi.fastutil.ints.Int2FloatOpenHashMap;
-import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
-import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
-import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import it.unimi.dsi.fastutil.longs.Long2FloatOpenHashMap;
-import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.minecraft.core.BlockPos;
-import net.minecraft.world.level.ChunkPos;
 import net.minecraft.core.SectionPos;
-import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -52,18 +45,10 @@ import org.shipwrights.krakk.runtime.damage.KrakkDamageBlockConversions;
 import org.shipwrights.krakk.runtime.damage.KrakkDamageRuntime;
 import org.slf4j.Logger;
 
-import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
-import java.lang.ref.Cleaner;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -71,9 +56,7 @@ import java.util.BitSet;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
-import java.util.PriorityQueue;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ForkJoinPool;
@@ -225,15 +208,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final long RESISTANCE_FIELD_MIN_VOXELS_PER_TASK = 786_432L;
     private static final long RESISTANCE_FIELD_MAX_PARALLEL_SNAPSHOT_VOXELS = 300_000_000L;
     private static final int RESISTANCE_FIELD_MAX_TASKS = 16;
-    private static final int KRAKK_OFFHEAP_FLOAT_CHUNK_SHIFT = 20;
-    private static final int KRAKK_OFFHEAP_FLOAT_CHUNK_SIZE = 1 << KRAKK_OFFHEAP_FLOAT_CHUNK_SHIFT;
-    private static final int KRAKK_OFFHEAP_FLOAT_CHUNK_MASK = KRAKK_OFFHEAP_FLOAT_CHUNK_SIZE - 1;
     private static final int KRAKK_OFFHEAP_FLOAT_OFFLOAD_THRESHOLD = 4_194_304;
     private static final int KRAKK_SPARSE_SLOWNESS_OFFLOAD_THRESHOLD = 500_000_000;
     private static final int KRAKK_PAGED_FLOAT_OFFLOAD_THRESHOLD = Integer.MAX_VALUE;
-    private static final int KRAKK_PAGED_FLOAT_PAGE_SHIFT = 16;
-    private static final int KRAKK_PAGED_FLOAT_PAGE_SIZE = 1 << KRAKK_PAGED_FLOAT_PAGE_SHIFT;
-    private static final int KRAKK_PAGED_FLOAT_PAGE_MASK = KRAKK_PAGED_FLOAT_PAGE_SIZE - 1;
     private static final int KRAKK_PAGED_FLOAT_CACHE_PAGES = 256;
     // Profiler (wevmKiLqWp): ForkJoinPool-5 workers spent 44% in awaitDone waiting for sweep
     // sub-tasks. Raised MIN_ROWS from 144→256 and ROWS_PER_TASK from 24→64 to reduce task
@@ -252,7 +229,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final ForkJoinPool KRAKK_SOLVE_POOL = KRAKK_SOLVE_PARALLELISM > 1
             ? new ForkJoinPool(KRAKK_SOLVE_PARALLELISM)
             : null;
-    private static final Cleaner PAGED_FLOAT_STORAGE_CLEANER = Cleaner.create();
     private static final Direction[] THERMAL_EXPAND_DIRECTIONS = new Direction[]{
             new Direction(-1.0D, 0.0D, 0.0D),
             new Direction(1.0D, 0.0D, 0.0D),
@@ -338,7 +314,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
         try {
             Object result = igniteMethod.invoke(block, args);
-            boolean handled = !returnsBoolean(igniteMethod) || Boolean.TRUE.equals(result);
+            boolean handled = doesNotReturnBoolean(igniteMethod) || Boolean.TRUE.equals(result);
             if (!handled) {
                 return false;
             }
@@ -393,7 +369,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     }
 
     private static boolean isIgniteCompatible(Method method) {
-        if (!returnsBoolean(method) && method.getReturnType() != Void.TYPE) {
+        if (doesNotReturnBoolean(method) && method.getReturnType() != Void.TYPE) {
             return false;
         }
 
@@ -419,8 +395,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return hasLevel && hasBlockPos;
     }
 
-    private static boolean returnsBoolean(Method method) {
-        return method.getReturnType() == Boolean.TYPE || method.getReturnType() == Boolean.class;
+    private static boolean doesNotReturnBoolean(Method method) {
+        return method.getReturnType() != Boolean.TYPE && method.getReturnType() != Boolean.class;
     }
 
     private static boolean isOnCaughtFireMethod(Method method) {
@@ -1014,10 +990,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 krakkField,
                 centerX,
                 centerY,
-                centerZ,
-                Float.NaN,
-                1.0F,
-                (float) KRAKK_SHADOW_SOLID_SLOWNESS_SCALE
+                centerZ
         );
         KrakkSolveResult solveResult = pairedSolveResult.normal();
         KrakkSolveResult shadowSolveResult = pairedSolveResult.shadow();
@@ -1319,7 +1292,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     if (weight <= 0.0F) {
                         continue;
                     }
-                    double thermalHeat = computeHeatFalloff(impactHeatCelsius, weight, resolvedRadius);
+                    double thermalHeat = computeHeatFalloff(impactHeatCelsius);
                     applySingleBlockImpact(
                             level,
                             mutablePos,
@@ -1630,9 +1603,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             return;
         }
 
-        // Narrow-band propagation is already geometrically clipped by radiusSq in neighbor expansion.
-        // Keep arrival uncapped to avoid solver-shape artifacts from material-dependent slowness.
-        job.maxArrival(Double.POSITIVE_INFINITY);
+        // Narrow-band propagation is geometrically clipped by radiusSq during neighbor expansion;
+        // arrival time is intentionally uncapped to avoid solver-shape artifacts from material-dependent slowness.
         double powerScale = computeVolumetricRadiusScale(job.resolvedRadius(), VOLUMETRIC_MAX_POWER_RADIUS_SCALE);
         job.impactBudget = job.totalEnergy() * VOLUMETRIC_IMPACT_POWER_PER_ENERGY * powerScale;
         long now = System.nanoTime();
@@ -1660,9 +1632,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
             double currentArrival = job.arrivalByPos().get(posLong);
             if (!Double.isFinite(currentArrival) || queuedArrival > currentArrival + 1.0E-9D) {
-                continue;
-            }
-            if (currentArrival > job.maxArrival()) {
                 continue;
             }
             if (!job.finalized().add(posLong)) {
@@ -1716,9 +1685,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
                     if (thermalEnabled) {
                         double thermalHeat = computeHeatFalloff(
-                                job.impactHeatCelsius(),
-                                impactSample.weight(),
-                                job.resolvedRadius()
+                                job.impactHeatCelsius()
                         );
                         for (int axis = 0; axis < 6; axis++) {
                             int tx = x;
@@ -1785,16 +1752,14 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                         job.maxY(),
                         job.minZ(),
                         job.maxZ(),
-                        false,
                         job.arrivalByPos(),
                         job.finalized(),
                         job.slownessByPos(),
-                        null,
                         job.mutablePos(),
                         job.chunkStateCache(),
                         job.resistanceCostCache()
                 );
-                if (!Double.isFinite(candidate) || candidate > job.maxArrival()) {
+                if (!Double.isFinite(candidate)) {
                     continue;
                 }
                 if (candidate + 1.0E-9D < job.arrivalByPos().get(neighborPosLong)) {
@@ -1906,11 +1871,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                               int maxY,
                                                               int minZ,
                                                               int maxZ,
-                                                              boolean shadowSolve,
                                                               Long2FloatOpenHashMap arrivalByPos,
                                                               LongOpenHashSet accepted,
                                                               Long2FloatOpenHashMap normalSlownessByPos,
-                                                              LongOpenHashSet sampledSolidPositions,
                                                               BlockPos.MutableBlockPos mutablePos,
                                                               WaveChunkStateCache chunkStateCache,
                                                               Int2DoubleOpenHashMap resistanceCostCache) {
@@ -1976,14 +1939,12 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 chunkStateCache,
                 resistanceCostCache,
                 normalSlownessByPos,
-                sampledSolidPositions
+                null
         );
         if (normalSlowness <= 0.0F) {
             return Double.POSITIVE_INFINITY;
         }
-        double slowness = shadowSolve
-                ? resolveStreamingShadowSlowness(normalSlowness)
-                : normalSlowness;
+        double slowness = normalSlowness;
         return solveKrakkDistance(a, b, c, slowness);
     }
 
@@ -2144,7 +2105,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return new ThermalTargetShape(positions, weightsByPos);
     }
 
-    private static double computeHeatFalloff(double impactHeatCelsius, double targetWeight, double radius) {
+    private static double computeHeatFalloff(double impactHeatCelsius) {
         return impactHeatCelsius;
     }
 
@@ -2171,7 +2132,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         if (size <= 1) {
             return 0;
         }
-        int start = (int) Math.floorMod(seed, size);
+        int start = Math.floorMod(seed, size);
         return Math.max(0, Math.min(size - 1, start));
     }
 
@@ -2179,7 +2140,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         if (size <= 1) {
             return 1;
         }
-        int step = (int) Math.floorMod(seed >>> 17, size);
+        int step = Math.floorMod(seed >>> 17, size);
         if (step <= 0) {
             step = 1;
         }
@@ -2235,7 +2196,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             );
         }
         int volume = (int) volumeLong;
-        MutableFloatIndexedAccess slowness = createKrakkSlownessStorage(Math.max(1, volume));
+        MutableFloatIndexedAccess slowness = createKrakkSlownessStorage(volume);
         BitSet activeMask = tracksActiveMaskInSlowness(slowness)
                 ? ((SparseAirSolidSlownessStorage) slowness).activeMask()
                 : new BitSet(volume);
@@ -2267,7 +2228,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     sizeY,
                     sizeZ,
                     radiusSq,
-                    0,
                     sizeX,
                     slowness,
                     activeMask,
@@ -2306,9 +2266,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 futures.add(VOLUMETRIC_TARGET_SCAN_POOL.submit(
                         () -> sampleKrakkFieldChunk(
                                 resistanceFieldSnapshot,
-                                minX,
-                                minY,
-                                minZ,
                                 sizeY,
                                 sizeZ,
                                 chunkStartX,
@@ -2348,9 +2305,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 solidPositions.clear();
                 KrakkResistanceFieldChunkResult fallback = sampleKrakkFieldChunk(
                         resistanceFieldSnapshot,
-                        minX,
-                        minY,
-                        minZ,
                         sizeY,
                         sizeZ,
                         0,
@@ -2373,11 +2327,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
         if (rebuildActiveMaskFromSlowness) {
             int strideX = sizeY * sizeZ;
-            int strideY = sizeZ;
             for (int xOffset = 0; xOffset < sizeX; xOffset++) {
                 int baseX = xOffset * strideX;
                 for (int yOffset = 0; yOffset < sizeY; yOffset++) {
-                    int base = baseX + (yOffset * strideY);
+                    int base = baseX + (yOffset * sizeZ);
                     for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
                         int index = base + zOffset;
                         if (slowness.getFloat(index) <= 0.0F) {
@@ -2579,7 +2532,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         float[] smoothed = new float[baselineByIndex.length];
         Arrays.fill(smoothed, Float.NaN);
         int strideX = fieldSizeY * fieldSizeZ;
-        int strideY = fieldSizeZ;
         double selfWeight = Mth.clamp(KRAKK_VOLUMETRIC_MECHANICS_SELF_SMOOTH, 0.0D, 1.0D);
         for (int i = 0; i < solidPositions.size(); i++) {
             long posLong = solidPositions.getLong(i);
@@ -2605,11 +2557,11 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 if (Float.isFinite(v)) { neighborSum += v; neighborCount++; }
             }
             if (iy + 1 < fieldSizeY) {
-                float v = baselineByIndex[gridIdx + strideY];
+                float v = baselineByIndex[gridIdx + fieldSizeZ];
                 if (Float.isFinite(v)) { neighborSum += v; neighborCount++; }
             }
             if (iy > 0) {
-                float v = baselineByIndex[gridIdx - strideY];
+                float v = baselineByIndex[gridIdx - fieldSizeZ];
                 if (Float.isFinite(v)) { neighborSum += v; neighborCount++; }
             }
             if (iz + 1 < fieldSizeZ) {
@@ -2695,26 +2647,22 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 resolvedSlowness,
                 field,
                 sourceMask,
-                sourceCount,
-                true
+                sourceCount
         );
     }
 
     private static PairedKrakkSolveResult solvePairedKrakkArrivalTimes(KrakkField field,
                                                                            double centerX,
                                                                            double centerY,
-                                                                           double centerZ,
-                                                                           float uniformSlownessOverride,
-                                                                           float normalSolidSlownessScale,
-                                                                           float shadowSolidSlownessScale) {
+                                                                           double centerZ) {
         if (field.slowness().size() > KRAKK_SHADOW_SOLVE_MAX_VOLUME) {
             KrakkSolveResult normalSolveResult = solveKrakkArrivalTimes(
                     field,
                     centerX,
                     centerY,
                     centerZ,
-                    uniformSlownessOverride,
-                    normalSolidSlownessScale
+                    Float.NaN,
+                    1.0F
             );
             return new PairedKrakkSolveResult(normalSolveResult, normalSolveResult);
         }
@@ -2726,9 +2674,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         BitSet traversableMask = field.activeMask();
         PairedKrakkSlownessResult slownessResult = resolvePairedKrakkSlownessField(
                 field,
-                uniformSlownessOverride,
-                normalSolidSlownessScale,
-                shadowSolidSlownessScale
+                Float.NaN,
+                1.0F,
+                4.0F
         );
         SourceIndexSet normalSourceMask = createSourceIndexSet(normalArrivalTimes.size());
         SourceIndexSet shadowSourceMask = createSourceIndexSet(shadowArrivalTimes.size());
@@ -2765,8 +2713,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                     slownessResult.shadowSlowness(),
                                     field,
                                     shadowSourceMask,
-                                    sourceResult.shadowSourceCount(),
-                                    true
+                                    sourceResult.shadowSourceCount()
                             )
                     )
             );
@@ -2777,8 +2724,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                             slownessResult.normalSlowness(),
                             field,
                             normalSourceMask,
-                            sourceResult.normalSourceCount(),
-                            true
+                            sourceResult.normalSourceCount()
                     )
             );
             try {
@@ -2793,8 +2739,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                 slownessResult.shadowSlowness(),
                                 field,
                                 shadowSourceMask,
-                                sourceResult.shadowSourceCount(),
-                                true
+                                sourceResult.shadowSourceCount()
                         )
                 );
             } catch (ExecutionException exception) {
@@ -2806,8 +2751,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                 slownessResult.shadowSlowness(),
                                 field,
                                 shadowSourceMask,
-                                sourceResult.shadowSourceCount(),
-                                true
+                                sourceResult.shadowSourceCount()
                         )
                 );
             }
@@ -2819,8 +2763,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                             slownessResult.normalSlowness(),
                             field,
                             normalSourceMask,
-                            sourceResult.normalSourceCount(),
-                            true
+                            sourceResult.normalSourceCount()
                     )
             );
             shadowSolveResult = callWithExecutionPolicy(
@@ -2830,8 +2773,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                             slownessResult.shadowSlowness(),
                             field,
                             shadowSourceMask,
-                            sourceResult.shadowSourceCount(),
-                            true
+                            sourceResult.shadowSourceCount()
                     )
             );
         }
@@ -2901,34 +2843,30 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return new KrakkSolveResult(arrivalTimes, sourceCount, sweepCycles);
     }
 
-    private static KrakkSolveResult solveKrakkArrivalTimesPrepared(MutableFloatIndexedAccess arrivalTimes,
+    private static void solveKrakkArrivalTimesPrepared(MutableFloatIndexedAccess arrivalTimes,
                                                                        FloatIndexedAccess resolvedSlowness,
                                                                        KrakkField field,
                                                                        SourceIndexSet sourceMask,
-                                                                       int sourceCount,
-                                                                       boolean allowParallelSweep,
-                                                                       int maxSweepCyclesOverride) {
+                                                                       int sourceCount) {
         if (sourceCount <= 0) {
-            return new KrakkSolveResult(arrivalTimes, 0, 0);
+            return;
         }
-        int maxSweepCycles = Math.min(computeKrakkMaxSweepCycles(field), maxSweepCyclesOverride);
-        int sweepCycles = refineKrakkArrivalTimes(
+        int maxSweepCycles = Math.min(computeKrakkMaxSweepCycles(field), KRAKK_MULTIRES_COARSE_MAX_SWEEP_CYCLES);
+        refineKrakkArrivalTimes(
                 arrivalTimes,
                 resolvedSlowness,
                 field,
                 sourceMask,
-                allowParallelSweep,
+                true,
                 maxSweepCycles
         );
-        return new KrakkSolveResult(arrivalTimes, sourceCount, sweepCycles);
     }
 
     private static KrakkSolveResult solveKrakkArrivalTimesPreparedMultires(MutableFloatIndexedAccess arrivalTimes,
                                                                                 FloatIndexedAccess resolvedSlowness,
                                                                                 KrakkField field,
                                                                                 SourceIndexSet sourceMask,
-                                                                                int sourceCount,
-                                                                                boolean allowParallelSweep) {
+                                                                                int sourceCount) {
         RuntimeExecutionPolicy executionPolicy = activeRuntimeExecutionPolicy();
         if (!KRAKK_USE_MULTIRES_COARSE_SOLVE
                 || sourceCount <= 0) {
@@ -2938,7 +2876,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     field,
                     sourceMask,
                     sourceCount,
-                    allowParallelSweep
+                    true
             );
         }
         long fieldVolume = (long) field.sizeX() * (long) field.sizeY() * (long) field.sizeZ();
@@ -2949,7 +2887,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     field,
                     sourceMask,
                     sourceCount,
-                    allowParallelSweep
+                    true
             );
         }
 
@@ -2957,8 +2895,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 field,
                 resolvedSlowness,
                 sourceMask,
-                arrivalTimes,
-                KRAKK_MULTIRES_DOWNSAMPLE_FACTOR
+                arrivalTimes
         );
         if (coarseContext == null || coarseContext.coarseSourceCount() <= 0) {
             return solveKrakkArrivalTimesPrepared(
@@ -2967,7 +2904,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     field,
                     sourceMask,
                     sourceCount,
-                    allowParallelSweep
+                    true
             );
         }
 
@@ -2976,9 +2913,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 coarseContext.coarseSlowness(),
                 coarseContext.coarseField(),
                 coarseContext.coarseSourceMask(),
-                coarseContext.coarseSourceCount(),
-                allowParallelSweep,
-                KRAKK_MULTIRES_COARSE_MAX_SWEEP_CYCLES
+                coarseContext.coarseSourceCount()
         );
 
         seedFineArrivalTimesFromCoarse(
@@ -2993,7 +2928,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 resolvedSlowness,
                 field,
                 sourceMask,
-                allowParallelSweep,
+                true,
                 KRAKK_MULTIRES_FINE_REFINE_SWEEP_CYCLES
         );
         return new KrakkSolveResult(arrivalTimes, sourceCount, fineSweepCycles);
@@ -3013,7 +2948,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int sizeY = field.sizeY();
         int sizeZ = field.sizeZ();
         int strideX = sizeY * sizeZ;
-        int strideY = sizeZ;
         BitSet accepted = new BitSet(Math.max(1, arrivalTimes.size()));
         KrakkMinHeap heap = new KrakkMinHeap(Math.max(32, sourceCount * 4));
 
@@ -3049,8 +2983,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
             int x = index / strideX;
             int yz = index - (x * strideX);
-            int y = yz / strideY;
-            int z = yz - (y * strideY);
+            int y = yz / sizeZ;
+            int z = yz - (y * sizeZ);
 
             if (x > 0) {
                 updateKrakkNeighborFromAccepted(
@@ -3078,7 +3012,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                         resolvedSlowness,
                         accepted,
                         heap,
-                        index - strideY,
+                        index - sizeZ,
                         field
                 );
             }
@@ -3088,7 +3022,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                         resolvedSlowness,
                         accepted,
                         heap,
-                        index + strideY,
+                        index + sizeZ,
                         field
                 );
             }
@@ -3130,7 +3064,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int sizeY = field.sizeY();
         int sizeZ = field.sizeZ();
         int strideX = sizeY * sizeZ;
-        int strideY = sizeZ;
         double bucketWidth = Math.max(1.0E-4D, KRAKK_DELTA_STEPPING_BUCKET_WIDTH);
         KrakkDeltaBucketQueue bucketQueue = new KrakkDeltaBucketQueue(bucketWidth, arrivalTimes.size());
         BitSet accepted = new BitSet(Math.max(1, arrivalTimes.size()));
@@ -3202,8 +3135,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 acceptedCount++;
                 int x = index / strideX;
                 int yz = index - (x * strideX);
-                int y = yz / strideY;
-                int z = yz - (y * strideY);
+                int y = yz / sizeZ;
+                int z = yz - (y * sizeZ);
 
                 if (x > 0) {
                     updateKrakkNeighborFromAcceptedDelta(
@@ -3231,7 +3164,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                             resolvedSlowness,
                             accepted,
                             bucketQueue,
-                            index - strideY,
+                            index - sizeZ,
                             field
                     );
                 }
@@ -3241,7 +3174,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                             resolvedSlowness,
                             accepted,
                             bucketQueue,
-                            index + strideY,
+                            index + sizeZ,
                             field
                     );
                 }
@@ -3350,8 +3283,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static KrakkCoarseSolveContext buildCoarseKrakkSolveContext(KrakkField fineField,
                                                                              FloatIndexedAccess fineSlowness,
                                                                              SourceIndexSet fineSourceMask,
-                                                                             FloatIndexedAccess fineArrivalTimes,
-                                                                             int downsampleFactor) {
+                                                                             FloatIndexedAccess fineArrivalTimes) {
+        int downsampleFactor = KRAKK_MULTIRES_DOWNSAMPLE_FACTOR;
         if (downsampleFactor <= 1) {
             return null;
         }
@@ -3375,15 +3308,14 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         }
         int coarseVolume = (int) coarseVolumeLong;
         MutableFloatIndexedAccess coarseSlowness = createKrakkFloatStorage(Math.max(1, coarseVolume));
-        MutableFloatIndexedAccess coarseArrivalTimes = createKrakkArrivalStorage(Math.max(1, coarseVolume));
+        MutableFloatIndexedAccess coarseArrivalTimes = createKrakkArrivalStorage(coarseVolume);
         coarseArrivalTimes.fill(Float.POSITIVE_INFINITY);
         SourceIndexSet coarseSourceMask = createSourceIndexSet(coarseArrivalTimes.size());
         int coarseSourceCount = 0;
-        LongArrayList coarseSolidPositions = new LongArrayList(Math.max(16, fineField.solidPositions().size() / Math.max(1, downsampleFactor * downsampleFactor)));
+        LongArrayList coarseSolidPositions = new LongArrayList(Math.max(16, fineField.solidPositions().size() / (downsampleFactor * downsampleFactor)));
 
         float airSlowness = (float) KRAKK_AIR_SLOWNESS;
         int fineStrideX = fineSizeY * fineSizeZ;
-        int fineStrideY = fineSizeZ;
         for (int coarseX = 0; coarseX < coarseSizeX; coarseX++) {
             int fineStartX = coarseX * downsampleFactor;
             int fineEndX = Math.min(fineSizeX, fineStartX + downsampleFactor);
@@ -3401,7 +3333,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     for (int fineX = fineStartX; fineX < fineEndX; fineX++) {
                         int baseX = fineX * fineStrideX;
                         for (int fineY = fineStartY; fineY < fineEndY; fineY++) {
-                            int base = baseX + (fineY * fineStrideY);
+                            int base = baseX + (fineY * fineSizeZ);
                             for (int fineZ = fineStartZ; fineZ < fineEndZ; fineZ++) {
                                 int fineIndex = base + fineZ;
                                 float slowness = fineSlowness.getFloat(fineIndex);
@@ -3485,12 +3417,11 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int[] activeCountByRow = new int[rowCount];
 
         int strideX = sizeY * sizeZ;
-        int strideY = sizeZ;
         for (int xOffset = 0; xOffset < sizeX; xOffset++) {
             int baseX = xOffset * strideX;
             for (int yOffset = 0; yOffset < sizeY; yOffset++) {
                 int rowIndex = krakkRowIndex(xOffset, yOffset, sizeY);
-                int base = baseX + (yOffset * strideY);
+                int base = baseX + (yOffset * sizeZ);
                 int activeCount = 0;
                 for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
                     int index = base + zOffset;
@@ -3532,7 +3463,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int coarseSizeY = coarseField.sizeY();
         int coarseSizeZ = coarseField.sizeZ();
         int fineStrideX = fineSizeY * fineSizeZ;
-        int fineStrideY = fineSizeZ;
         int maxCoarseX = coarseField.sizeX() - 1;
         int maxCoarseY = coarseField.sizeY() - 1;
         int maxCoarseZ = coarseField.sizeZ() - 1;
@@ -3543,8 +3473,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             }
             int fineX = fineIndex / fineStrideX;
             int fineYZ = fineIndex - (fineX * fineStrideX);
-            int fineY = fineYZ / fineStrideY;
-            int fineZ = fineYZ - (fineY * fineStrideY);
+            int fineY = fineYZ / fineSizeZ;
+            int fineZ = fineYZ - (fineY * fineSizeZ);
 
             int coarseX = Math.min(maxCoarseX, fineX / downsampleFactor);
             int coarseY = Math.min(maxCoarseY, fineY / downsampleFactor);
@@ -3920,7 +3850,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int sizeY = field.sizeY();
         int sizeZ = field.sizeZ();
         int strideX = sizeY * sizeZ;
-        int strideY = sizeZ;
         double maxDelta = 0.0D;
         IntArrayList dirtyRows = new IntArrayList(Math.max(4, endXOrderExclusive - startXOrderInclusive));
         for (int xOrder = startXOrderInclusive; xOrder < endXOrderExclusive; xOrder++) {
@@ -3942,7 +3871,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             if (rowLength <= 0) {
                 continue;
             }
-            int baseIndex = (x * strideX) + (y * strideY);
+            int baseIndex = (x * strideX) + (y * sizeZ);
             boolean rowChanged = false;
             if (zForward) {
                 for (int z = 0; z < sizeZ; z++) {
@@ -3960,7 +3889,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                             activeMaskWordCount,
                             index, x, y, z,
                             sizeX, sizeY, sizeZ,
-                            strideX, strideY
+                            strideX, sizeZ
                     );
                     if (!Double.isFinite(candidate)) {
                         continue;
@@ -3996,7 +3925,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                         activeMaskWordCount,
                         index, x, y, z,
                         sizeX, sizeY, sizeZ,
-                        strideX, strideY
+                        strideX, sizeZ
                 );
                 if (!Double.isFinite(candidate)) {
                     continue;
@@ -4099,15 +4028,14 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int sizeY = field.sizeY();
         int sizeZ = field.sizeZ();
         int strideX = sizeY * sizeZ;
-        int strideY = sizeZ;
         int x = index / strideX;
         int yz = index - (x * strideX);
-        int y = yz / strideY;
-        int z = yz - (y * strideY);
+        int y = yz / sizeZ;
+        int z = yz - (y * sizeZ);
         int negX = x > 0 && activeMask.get(index - strideX) ? index - strideX : -1;
         int posX = x + 1 < sizeX && activeMask.get(index + strideX) ? index + strideX : -1;
-        int negY = y > 0 && activeMask.get(index - strideY) ? index - strideY : -1;
-        int posY = y + 1 < sizeY && activeMask.get(index + strideY) ? index + strideY : -1;
+        int negY = y > 0 && activeMask.get(index - sizeZ) ? index - sizeZ : -1;
+        int posY = y + 1 < sizeY && activeMask.get(index + sizeZ) ? index + sizeZ : -1;
         int negZ = z > 0 && activeMask.get(index - 1) ? index - 1 : -1;
         int posZ = z + 1 < sizeZ && activeMask.get(index + 1) ? index + 1 : -1;
 
@@ -4203,7 +4131,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return min;
     }
 
-    private static int krakkDeltaBucketIndex(double arrival, double bucketWidth) {
+    static int krakkDeltaBucketIndex(double arrival, double bucketWidth) {
         if (!Double.isFinite(arrival) || arrival <= 0.0D) {
             return 0;
         }
@@ -4484,7 +4412,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                                                                              int sizeY,
                                                                              int sizeZ,
                                                                              double radiusSq,
-                                                                             int startXOffsetInclusive,
                                                                              int endXOffsetExclusive,
                                                                              MutableFloatIndexedAccess slowness,
                                                                              BitSet activeMask,
@@ -4497,7 +4424,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             localResistanceCache.defaultReturnValue(Double.NaN);
         }
         IntArrayList localSolidIndices = new IntArrayList(
-                estimateKrakkChunkSolidPositionsCapacity(endXOffsetExclusive - startXOffsetInclusive, sizeY)
+                estimateKrakkChunkSolidPositionsCapacity(endXOffsetExclusive, sizeY)
         );
         BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
         LevelChunk cachedChunk = null;
@@ -4506,7 +4433,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         int sampledVoxelCount = 0;
         float airSlowness = (float) KRAKK_AIR_SLOWNESS;
         float solidScale = (float) KRAKK_SOLID_SLOWNESS_SCALE;
-        for (int xOffset = startXOffsetInclusive; xOffset < endXOffsetExclusive; xOffset++) {
+        for (int xOffset = 0; xOffset < endXOffsetExclusive; xOffset++) {
             int x = minX + xOffset;
             int baseX = xOffset * sizeY * sizeZ;
             for (int yOffset = 0; yOffset < sizeY; yOffset++) {
@@ -4574,17 +4501,16 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             return new ResistanceFieldSnapshot(new BlockState[1], 0);
         }
         int volume = (int) volumeLong;
-        BlockState[] sampledStates = new BlockState[Math.max(1, volume)];
+        BlockState[] sampledStates = new BlockState[volume];
         BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
         int sampledVoxelCount = 0;
         int strideX = sizeY * sizeZ;
-        int strideY = sizeZ;
         for (int xOffset = 0; xOffset < sizeX; xOffset++) {
             int x = minX + xOffset;
             int baseX = xOffset * strideX;
             for (int yOffset = 0; yOffset < sizeY; yOffset++) {
                 int y = minY + yOffset;
-                int baseIndex = baseX + (yOffset * strideY);
+                int baseIndex = baseX + (yOffset * sizeZ);
                 for (int zOffset = 0; zOffset < sizeZ; zOffset++) {
                     int z = minZ + zOffset;
                     double dx = (x + 0.5D) - centerX;
@@ -4607,9 +4533,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     }
 
     private static KrakkResistanceFieldChunkResult sampleKrakkFieldChunk(ResistanceFieldSnapshot resistanceFieldSnapshot,
-                                                                             int minX,
-                                                                             int minY,
-                                                                             int minZ,
                                                                              int sizeY,
                                                                              int sizeZ,
                                                                              int startXOffsetInclusive,
@@ -4724,23 +4647,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
         return new BitSetSourceIndexSet(boundedSize);
     }
 
-    private static FloatChunk createAdaptiveFloatChunk(int chunkSize, boolean preferOffHeapFirst) {
-        if (preferOffHeapFirst) {
-            try {
-                return new DirectFloatChunk(chunkSize);
-            } catch (OutOfMemoryError directAllocationFailure) {
-                // Fall back to heap for this chunk.
-            }
-            return new HeapFloatChunk(chunkSize);
-        }
-
-        try {
-            return new HeapFloatChunk(chunkSize);
-        } catch (OutOfMemoryError heapAllocationFailure) {
-            // Fall back to direct for this chunk.
-        }
-        return new DirectFloatChunk(chunkSize);
-    }
 
     private static MutableFloatIndexedAccess createKrakkFloatStorage(int size, boolean preferOffHeapForLarge) {
         int boundedSize = Math.max(1, size);
@@ -4959,8 +4865,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 continue;
             }
 
-            double maxWeight = gradient;
-            if (maxWeight <= VOLUMETRIC_MIN_ENERGY) {
+            if (gradient <= VOLUMETRIC_MIN_ENERGY) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
                 }
@@ -4978,7 +4883,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             double shellAlpha = clampedShell - lowerShell;
             double lowerShellPressure = maxPressureByShell[lowerShell];
             double shellPressureUpper = lowerShellPressure + ((maxPressureByShell[upperShell] - lowerShellPressure) * shellAlpha);
-            if ((maxWeight * shellPressureUpper) <= VOLUMETRIC_MIN_ENERGY) {
+            if ((gradient * shellPressureUpper) <= VOLUMETRIC_MIN_ENERGY) {
                 if (profileSubstages) {
                     precheckNanos += (System.nanoTime() - precheckStart);
                 }
@@ -4990,7 +4895,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             }
 
             long blendStart = profileSubstages ? System.nanoTime() : 0L;
-            double localPressure = sampleBlendedVolumetricPressure(
+            double pressureFactor = sampleBlendedVolumetricPressure(
                     pressureByShell,
                     directionCount,
                     lowerShell * directionCount,
@@ -5006,13 +4911,12 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                     directionLookup,
                     directionLookupResolution
             );
-            double pressureFactor = localPressure;
             if (pressureFactor < 0.0D) {
                 pressureFactor = 0.0D;
             } else if (pressureFactor > 1.0D) {
                 pressureFactor = 1.0D;
             }
-            double weight = maxWeight * pressureFactor;
+            double weight = gradient * pressureFactor;
             if (profileSubstages) {
                 blendNanos += (System.nanoTime() - blendStart);
             }
@@ -5301,7 +5205,6 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 }
                 continue;
             }
-            double eikNormalized = normalized;
             boolean outerGatePassed = false;
             if (normalized < 0.5D) {
                 long h = ((long) x * 0x9E3779B97F4A7C15L)
@@ -5325,7 +5228,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 outerGatePassed = blastTransmittanceScale > 0.0D;
             }
             double weightExponent = Mth.lerp(blastTransmittanceScale, KRAKK_WEIGHT_EXPONENT_SMOOTH, KRAKK_WEIGHT_EXPONENT);
-            double eikEnvelope = Math.pow(eikNormalized, weightExponent);
+            double eikEnvelope = Math.pow(normalized, weightExponent);
             double rawTransFactor = Mth.lerp(
                     KRAKK_ENVELOPE_TRANSMITTANCE_BLEND,
                     1.0D,
@@ -5343,7 +5246,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             // Gate-passing blocks blend cutoffRetention toward 1.0 proportionally to
             // blastTransmittanceScale: at full blastTransmittance the gate is the sole break/spare decision
             // (retention=1), at zero blastTransmittance the smooth curve is used in full.
-            double smoothCutoff = computeKrakkCutoffEdgeRetention(eikNormalized);
+            double smoothCutoff = computeKrakkCutoffEdgeRetention(normalized);
             double cutoffRetention = outerGatePassed
                     ? Mth.lerp(blastTransmittanceScale, smoothCutoff, 1.0D)
                     : smoothCutoff;
@@ -5443,8 +5346,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             int[][] neighbors = computeVolumetricDirectionNeighbors(
                     dirX,
                     dirY,
-                    dirZ,
-                    VOLUMETRIC_DIRECTION_NEIGHBOR_COUNT
+                    dirZ
             );
             int lookupResolution = Math.max(8, VOLUMETRIC_DIRECTION_LOOKUP_RESOLUTION);
             int[] directionLookup = buildVolumetricDirectionCubeMap(dirX, dirY, dirZ, lookupResolution);
@@ -5710,8 +5612,8 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
     private static int[][] computeVolumetricDirectionNeighbors(double[] dirX,
                                                                double[] dirY,
-                                                               double[] dirZ,
-                                                               int neighborCount) {
+                                                               double[] dirZ) {
+        int neighborCount = VOLUMETRIC_DIRECTION_NEIGHBOR_COUNT;
         int directionCount = dirX.length;
         int[][] neighbors = new int[directionCount][neighborCount];
         for (int i = 0; i < directionCount; i++) {
@@ -6404,1213 +6306,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private record Direction(double x, double y, double z) {
     }
 
-    private interface FloatIndexedAccess {
-        int size();
 
-        float getFloat(int index);
-    }
 
-    private interface MutableFloatIndexedAccess extends FloatIndexedAccess {
-        void setFloat(int index, float value);
 
-        void fill(float value);
-    }
-
-    private static final class HeapFloatArrayStorage implements MutableFloatIndexedAccess {
-        private final float[] values;
-
-        private HeapFloatArrayStorage(int size) {
-            this.values = new float[size];
-        }
-
-        @Override
-        public int size() {
-            return values.length;
-        }
-
-        @Override
-        public float getFloat(int index) {
-            return values[index];
-        }
-
-        @Override
-        public void setFloat(int index, float value) {
-            values[index] = value;
-        }
-
-        @Override
-        public void fill(float value) {
-            Arrays.fill(values, value);
-        }
-    }
-
-    private static final class SparseAirSolidSlownessStorage implements MutableFloatIndexedAccess {
-        private final int size;
-        private final float airSlowness;
-        private final BitSet activeMask;
-        private final Int2FloatOpenHashMap solidSlownessByIndex;
-
-        private SparseAirSolidSlownessStorage(int size, float airSlowness) {
-            this.size = Math.max(1, size);
-            this.airSlowness = airSlowness;
-            this.activeMask = new BitSet(this.size);
-            this.solidSlownessByIndex = new Int2FloatOpenHashMap(1024);
-            this.solidSlownessByIndex.defaultReturnValue(Float.NaN);
-        }
-
-        @Override
-        public int size() {
-            return size;
-        }
-
-        @Override
-        public float getFloat(int index) {
-            if (index < 0 || index >= size) {
-                throw new IndexOutOfBoundsException("index=" + index + " size=" + size);
-            }
-            if (!activeMask.get(index)) {
-                return 0.0F;
-            }
-            float solidSlowness = solidSlownessByIndex.get(index);
-            return Float.isFinite(solidSlowness) ? solidSlowness : airSlowness;
-        }
-
-        @Override
-        public void setFloat(int index, float value) {
-            if (index < 0 || index >= size) {
-                throw new IndexOutOfBoundsException("index=" + index + " size=" + size);
-            }
-            if (!(value > 0.0F)) {
-                activeMask.clear(index);
-                solidSlownessByIndex.remove(index);
-                return;
-            }
-            activeMask.set(index);
-            if (Math.abs(value - airSlowness) <= 1.0E-6F) {
-                solidSlownessByIndex.remove(index);
-                return;
-            }
-            solidSlownessByIndex.put(index, value);
-        }
-
-        @Override
-        public void fill(float value) {
-            solidSlownessByIndex.clear();
-            if (!(value > 0.0F)) {
-                activeMask.clear();
-                return;
-            }
-            activeMask.set(0, size);
-            if (Math.abs(value - airSlowness) <= 1.0E-6F) {
-                return;
-            }
-            for (int index = 0; index < size; index++) {
-                solidSlownessByIndex.put(index, value);
-            }
-        }
-
-        private BitSet activeMask() {
-            return activeMask;
-        }
-    }
-
-
-    private interface FloatChunk {
-        float getFloat(int index);
-
-        void setFloat(int index, float value);
-
-        void fill(float value);
-    }
-
-    private static final class HeapFloatChunk implements FloatChunk {
-        private final float[] values;
-
-        private HeapFloatChunk(int size) {
-            this.values = new float[size];
-        }
-
-        @Override
-        public float getFloat(int index) {
-            return values[index];
-        }
-
-        @Override
-        public void setFloat(int index, float value) {
-            values[index] = value;
-        }
-
-        @Override
-        public void fill(float value) {
-            Arrays.fill(values, value);
-        }
-    }
-
-    private static final class DirectFloatChunk implements FloatChunk {
-        private static final sun.misc.Unsafe UNSAFE;
-        private static final long BUFFER_ADDRESS_OFFSET;
-        static {
-            try {
-                java.lang.reflect.Field fu = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
-                fu.setAccessible(true);
-                UNSAFE = (sun.misc.Unsafe) fu.get(null);
-                java.lang.reflect.Field fa = java.nio.Buffer.class.getDeclaredField("address");
-                BUFFER_ADDRESS_OFFSET = UNSAFE.objectFieldOffset(fa);
-            } catch (Exception e) {
-                throw new ExceptionInInitializerError(e);
-            }
-        }
-        private final ByteBuffer values; // held to prevent GC of native memory
-        private final long address;
-
-        private DirectFloatChunk(int size) {
-            this.values = ByteBuffer.allocateDirect(size * Float.BYTES);
-            this.address = UNSAFE.getLong(values, BUFFER_ADDRESS_OFFSET);
-        }
-
-        @Override
-        public float getFloat(int index) {
-            return UNSAFE.getFloat(address + (long) index * Float.BYTES);
-        }
-
-        @Override
-        public void setFloat(int index, float value) {
-            UNSAFE.putFloat(address + (long) index * Float.BYTES, value);
-        }
-
-        @Override
-        public void fill(float value) {
-            int limit = values.capacity() / Float.BYTES;
-            for (int i = 0; i < limit; i++) {
-                UNSAFE.putFloat(address + (long) i * Float.BYTES, value);
-            }
-        }
-    }
-
-    private static final class AdaptiveFloatArrayStorage implements MutableFloatIndexedAccess {
-        // Plain array instead of ArrayList: eliminates ArrayList.get() overhead (bounds check +
-        // virtual dispatch) on every getFloat/setFloat call in the solveKrakkCell hot path.
-        private final FloatChunk[] chunks;
-        private final int size;
-
-        private AdaptiveFloatArrayStorage(int size, boolean preferOffHeapFirst) {
-            this.size = size;
-            int expectedChunks = Math.max(
-                    1,
-                    (size + KRAKK_OFFHEAP_FLOAT_CHUNK_SIZE - 1) / KRAKK_OFFHEAP_FLOAT_CHUNK_SIZE
-            );
-            this.chunks = new FloatChunk[expectedChunks];
-            int remaining = size;
-            for (int i = 0; i < expectedChunks; i++) {
-                int chunkSize = Math.min(KRAKK_OFFHEAP_FLOAT_CHUNK_SIZE, remaining);
-                chunks[i] = createAdaptiveFloatChunk(chunkSize, preferOffHeapFirst);
-                remaining -= chunkSize;
-            }
-        }
-
-        @Override
-        public int size() {
-            return size;
-        }
-
-        @Override
-        public float getFloat(int index) {
-            if (index < 0 || index >= size) {
-                throw new IndexOutOfBoundsException("index=" + index + " size=" + size);
-            }
-            int chunkIndex = index >>> KRAKK_OFFHEAP_FLOAT_CHUNK_SHIFT;
-            int chunkOffset = index & KRAKK_OFFHEAP_FLOAT_CHUNK_MASK;
-            return chunks[chunkIndex].getFloat(chunkOffset);
-        }
-
-        @Override
-        public void setFloat(int index, float value) {
-            if (index < 0 || index >= size) {
-                throw new IndexOutOfBoundsException("index=" + index + " size=" + size);
-            }
-            int chunkIndex = index >>> KRAKK_OFFHEAP_FLOAT_CHUNK_SHIFT;
-            int chunkOffset = index & KRAKK_OFFHEAP_FLOAT_CHUNK_MASK;
-            chunks[chunkIndex].setFloat(chunkOffset, value);
-        }
-
-        @Override
-        public void fill(float value) {
-            for (FloatChunk chunk : chunks) {
-                chunk.fill(value);
-            }
-        }
-    }
-
-    private static final class PagedFloatArrayStorage implements MutableFloatIndexedAccess {
-        private final int size;
-        private final int pageCount;
-        private final int maxCachedPages;
-        private final float[][] cachePages;
-        private final int[] cachePageIds;
-        private final boolean[] cacheDirty;
-        private final long[] cacheAccessTicks;
-        private final Int2IntOpenHashMap pageToSlot;
-        private final boolean[] persistedPages;
-        private final FileChannel channel;
-        private final ByteBuffer ioBuffer;
-        private float defaultFillValue;
-        private long accessTick;
-
-        private PagedFloatArrayStorage(int size, int requestedCachePages) {
-            this.size = Math.max(1, size);
-            this.pageCount = Math.max(1, (this.size + KRAKK_PAGED_FLOAT_PAGE_SIZE - 1) / KRAKK_PAGED_FLOAT_PAGE_SIZE);
-            this.maxCachedPages = Math.max(4, Math.min(this.pageCount, requestedCachePages));
-            this.cachePages = new float[this.maxCachedPages][KRAKK_PAGED_FLOAT_PAGE_SIZE];
-            this.cachePageIds = new int[this.maxCachedPages];
-            Arrays.fill(this.cachePageIds, -1);
-            this.cacheDirty = new boolean[this.maxCachedPages];
-            this.cacheAccessTicks = new long[this.maxCachedPages];
-            this.pageToSlot = new Int2IntOpenHashMap(Math.max(16, this.maxCachedPages * 2));
-            this.pageToSlot.defaultReturnValue(-1);
-            this.persistedPages = new boolean[this.pageCount];
-            this.ioBuffer = ByteBuffer.allocate(KRAKK_PAGED_FLOAT_PAGE_SIZE * Float.BYTES).order(ByteOrder.LITTLE_ENDIAN);
-            this.defaultFillValue = 0.0F;
-            this.accessTick = 1L;
-
-            Path backingFile = null;
-            FileChannel openedChannel = null;
-            try {
-                backingFile = Files.createTempFile("krakk-float-pages-", ".bin");
-                openedChannel = FileChannel.open(
-                        backingFile,
-                        StandardOpenOption.CREATE,
-                        StandardOpenOption.TRUNCATE_EXISTING,
-                        StandardOpenOption.READ,
-                        StandardOpenOption.WRITE
-                );
-                PAGED_FLOAT_STORAGE_CLEANER.register(
-                        this,
-                        new PagedFloatStorageCleanup(openedChannel, backingFile)
-                );
-            } catch (IOException exception) {
-                if (openedChannel != null) {
-                    try {
-                        openedChannel.close();
-                    } catch (IOException ignored) {
-                    }
-                }
-                if (backingFile != null) {
-                    try {
-                        Files.deleteIfExists(backingFile);
-                    } catch (IOException ignored) {
-                    }
-                }
-                throw new IllegalStateException("Unable to create paged float storage.", exception);
-            }
-            this.channel = openedChannel;
-        }
-
-        @Override
-        public int size() {
-            return size;
-        }
-
-        @Override
-        public float getFloat(int index) {
-            if (index < 0 || index >= size) {
-                throw new IndexOutOfBoundsException("index=" + index + " size=" + size);
-            }
-            int pageIndex = index >>> KRAKK_PAGED_FLOAT_PAGE_SHIFT;
-            int pageOffset = index & KRAKK_PAGED_FLOAT_PAGE_MASK;
-            int slot = ensurePageLoaded(pageIndex);
-            cacheAccessTicks[slot] = accessTick++;
-            return cachePages[slot][pageOffset];
-        }
-
-        @Override
-        public void setFloat(int index, float value) {
-            if (index < 0 || index >= size) {
-                throw new IndexOutOfBoundsException("index=" + index + " size=" + size);
-            }
-            int pageIndex = index >>> KRAKK_PAGED_FLOAT_PAGE_SHIFT;
-            int pageOffset = index & KRAKK_PAGED_FLOAT_PAGE_MASK;
-            int slot = ensurePageLoaded(pageIndex);
-            cacheAccessTicks[slot] = accessTick++;
-            cachePages[slot][pageOffset] = value;
-            cacheDirty[slot] = true;
-        }
-
-        @Override
-        public void fill(float value) {
-            defaultFillValue = value;
-            Arrays.fill(persistedPages, false);
-            pageToSlot.clear();
-            Arrays.fill(cachePageIds, -1);
-            Arrays.fill(cacheDirty, false);
-            Arrays.fill(cacheAccessTicks, 0L);
-            accessTick = 1L;
-            try {
-                channel.truncate(0L);
-            } catch (IOException exception) {
-                throw new IllegalStateException("Unable to clear paged float storage.", exception);
-            }
-        }
-
-        private int ensurePageLoaded(int pageIndex) {
-            int existingSlot = pageToSlot.get(pageIndex);
-            if (existingSlot >= 0) {
-                return existingSlot;
-            }
-            int slot = claimSlot();
-            int previousPageIndex = cachePageIds[slot];
-            if (previousPageIndex >= 0) {
-                if (cacheDirty[slot]) {
-                    writePage(previousPageIndex, cachePages[slot]);
-                    cacheDirty[slot] = false;
-                }
-                pageToSlot.remove(previousPageIndex);
-            }
-
-            int length = pageLength(pageIndex);
-            if (persistedPages[pageIndex]) {
-                readPage(pageIndex, cachePages[slot], length);
-            } else {
-                Arrays.fill(cachePages[slot], 0, length, defaultFillValue);
-            }
-            cachePageIds[slot] = pageIndex;
-            cacheAccessTicks[slot] = accessTick++;
-            cacheDirty[slot] = false;
-            pageToSlot.put(pageIndex, slot);
-            return slot;
-        }
-
-        private int claimSlot() {
-            for (int i = 0; i < maxCachedPages; i++) {
-                if (cachePageIds[i] < 0) {
-                    return i;
-                }
-            }
-            int lruSlot = 0;
-            long lruTick = cacheAccessTicks[0];
-            for (int i = 1; i < maxCachedPages; i++) {
-                long tick = cacheAccessTicks[i];
-                if (tick < lruTick) {
-                    lruTick = tick;
-                    lruSlot = i;
-                }
-            }
-            return lruSlot;
-        }
-
-        private void writePage(int pageIndex, float[] pageData) {
-            int length = pageLength(pageIndex);
-            int byteLength = length * Float.BYTES;
-            ioBuffer.clear();
-            ioBuffer.limit(byteLength);
-            for (int i = 0; i < length; i++) {
-                ioBuffer.putFloat(pageData[i]);
-            }
-            ioBuffer.flip();
-            long writePos = pageStartOffset(pageIndex);
-            try {
-                while (ioBuffer.hasRemaining()) {
-                    int written = channel.write(ioBuffer, writePos);
-                    if (written <= 0) {
-                        throw new IOException("Unable to write paged float page.");
-                    }
-                    writePos += written;
-                }
-            } catch (IOException exception) {
-                throw new IllegalStateException("Unable to write paged float storage.", exception);
-            }
-            persistedPages[pageIndex] = true;
-        }
-
-        private void readPage(int pageIndex, float[] pageData, int length) {
-            int byteLength = length * Float.BYTES;
-            ioBuffer.clear();
-            ioBuffer.limit(byteLength);
-            long readPos = pageStartOffset(pageIndex);
-            int totalRead = 0;
-            try {
-                while (totalRead < byteLength) {
-                    int read = channel.read(ioBuffer, readPos + totalRead);
-                    if (read <= 0) {
-                        break;
-                    }
-                    totalRead += read;
-                }
-            } catch (IOException exception) {
-                throw new IllegalStateException("Unable to read paged float storage.", exception);
-            }
-            ioBuffer.flip();
-            int readableFloats = totalRead / Float.BYTES;
-            for (int i = 0; i < readableFloats; i++) {
-                pageData[i] = ioBuffer.getFloat();
-            }
-            if (readableFloats < length) {
-                Arrays.fill(pageData, readableFloats, length, defaultFillValue);
-            }
-        }
-
-        private int pageLength(int pageIndex) {
-            int pageStart = pageIndex << KRAKK_PAGED_FLOAT_PAGE_SHIFT;
-            int remaining = size - pageStart;
-            return Math.max(0, Math.min(KRAKK_PAGED_FLOAT_PAGE_SIZE, remaining));
-        }
-
-        private long pageStartOffset(int pageIndex) {
-            return (long) pageIndex * (long) KRAKK_PAGED_FLOAT_PAGE_SIZE * (long) Float.BYTES;
-        }
-    }
-
-    private static final class PagedFloatStorageCleanup implements Runnable {
-        private final FileChannel channel;
-        private final Path filePath;
-
-        private PagedFloatStorageCleanup(FileChannel channel, Path filePath) {
-            this.channel = channel;
-            this.filePath = filePath;
-        }
-
-        @Override
-        public void run() {
-            if (channel != null) {
-                try {
-                    channel.close();
-                } catch (IOException ignored) {
-                }
-            }
-            if (filePath != null) {
-                try {
-                    Files.deleteIfExists(filePath);
-                } catch (IOException ignored) {
-                }
-            }
-        }
-    }
-
-    @FunctionalInterface
-    private interface IntIndexConsumer {
-        void accept(int index);
-    }
-
-    private interface SourceIndexSet {
-        boolean contains(int index);
-
-        boolean add(int index);
-
-        void forEach(IntIndexConsumer consumer);
-    }
-
-    private static final class BitSetSourceIndexSet implements SourceIndexSet {
-        private final BitSet indices;
-
-        private BitSetSourceIndexSet(int approximateVolume) {
-            this.indices = new BitSet(Math.max(1, approximateVolume));
-        }
-
-        @Override
-        public boolean contains(int index) {
-            return indices.get(index);
-        }
-
-        @Override
-        public boolean add(int index) {
-            if (indices.get(index)) {
-                return false;
-            }
-            indices.set(index);
-            return true;
-        }
-
-        @Override
-        public void forEach(IntIndexConsumer consumer) {
-            if (consumer == null) {
-                return;
-            }
-            for (int index = indices.nextSetBit(0); index >= 0; index = indices.nextSetBit(index + 1)) {
-                consumer.accept(index);
-            }
-        }
-    }
-
-    private static final class SparseSourceIndexSet implements SourceIndexSet {
-        private final IntOpenHashSet membership;
-        private final IntArrayList insertionOrder;
-
-        private SparseSourceIndexSet() {
-            this.membership = new IntOpenHashSet(32);
-            this.insertionOrder = new IntArrayList(32);
-        }
-
-        @Override
-        public boolean contains(int index) {
-            return membership.contains(index);
-        }
-
-        @Override
-        public boolean add(int index) {
-            if (!membership.add(index)) {
-                return false;
-            }
-            insertionOrder.add(index);
-            return true;
-        }
-
-        @Override
-        public void forEach(IntIndexConsumer consumer) {
-            if (consumer == null) {
-                return;
-            }
-            for (int i = 0; i < insertionOrder.size(); i++) {
-                consumer.accept(insertionOrder.getInt(i));
-            }
-        }
-    }
-
-    private interface LongIndexedAccess {
-        int size();
-
-        boolean isEmpty();
-
-        long getLong(int index);
-    }
-
-    private static final class EmptyLongIndexedAccess implements LongIndexedAccess {
-        private static final EmptyLongIndexedAccess INSTANCE = new EmptyLongIndexedAccess();
-
-        @Override
-        public int size() {
-            return 0;
-        }
-
-        @Override
-        public boolean isEmpty() {
-            return true;
-        }
-
-        @Override
-        public long getLong(int index) {
-            throw new IndexOutOfBoundsException("index=" + index + " size=0");
-        }
-    }
-
-    private static final class LongArrayListIndexedAccess implements LongIndexedAccess {
-        private final LongArrayList values;
-
-        private LongArrayListIndexedAccess(LongArrayList values) {
-            this.values = values;
-        }
-
-        @Override
-        public int size() {
-            return values.size();
-        }
-
-        @Override
-        public boolean isEmpty() {
-            return values.isEmpty();
-        }
-
-        @Override
-        public long getLong(int index) {
-            return values.getLong(index);
-        }
-    }
-
-    private static final class PackedKrakkSolidPositions implements LongIndexedAccess {
-        private final IntArrayList indices;
-        private final int minX;
-        private final int minY;
-        private final int minZ;
-        private final int strideX;
-        private final int strideY;
-
-        private PackedKrakkSolidPositions(int minX, int minY, int minZ, int sizeY, int sizeZ, int expectedEntries) {
-            this.indices = new IntArrayList(Math.max(16, expectedEntries));
-            this.minX = minX;
-            this.minY = minY;
-            this.minZ = minZ;
-            this.strideX = sizeY * sizeZ;
-            this.strideY = sizeZ;
-        }
-
-        private void addIndex(int index) {
-            indices.add(index);
-        }
-
-        private void clear() {
-            indices.clear();
-        }
-
-        @Override
-        public int size() {
-            return indices.size();
-        }
-
-        @Override
-        public boolean isEmpty() {
-            return indices.isEmpty();
-        }
-
-        @Override
-        public long getLong(int index) {
-            int gridIndex = indices.getInt(index);
-            int xOffset = gridIndex / strideX;
-            int yz = gridIndex - (xOffset * strideX);
-            int yOffset = yz / strideY;
-            int zOffset = yz - (yOffset * strideY);
-            return BlockPos.asLong(minX + xOffset, minY + yOffset, minZ + zOffset);
-        }
-    }
-
-
-    private enum NarrowBandWavefrontPhase {
-        SEED,
-        PROPAGATE,
-        COMPLETE,
-        FAILED
-    }
-
-    private static final class NarrowBandWavefrontJob {
-        private final long jobId;
-        private final ResourceKey<Level> dimension;
-        private final double centerX;
-        private final double centerY;
-        private final double centerZ;
-        private final double resolvedRadius;
-        private final double radiusSq;
-        private final int minX;
-        private final int maxX;
-        private final int minY;
-        private final int maxY;
-        private final int minZ;
-        private final int maxZ;
-        private final double totalEnergy;
-        private final double impactHeatCelsius;
-        private final UUID sourceUuid;
-        private final UUID ownerUuid;
-        private final boolean applyWorldChanges;
-        private final ExplosionProfileTrace trace;
-        private final boolean phaseLoggingEnabled;
-        private final long phaseTraceId;
-        private final long queuedAtNanos;
-
-        private NarrowBandWavefrontPhase phase;
-        private String failureMessage;
-        private Entity cachedSource;
-        private LivingEntity cachedOwner;
-
-        private final Int2DoubleOpenHashMap resistanceCostCache = new Int2DoubleOpenHashMap(256);
-        private final WaveChunkStateCache chunkStateCache = new WaveChunkStateCache();
-        private final BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
-        private final Long2FloatOpenHashMap slownessByPos = new Long2FloatOpenHashMap(2048);
-        private final Long2FloatOpenHashMap arrivalByPos = new Long2FloatOpenHashMap(4096);
-        private final LongOpenHashSet finalized = new LongOpenHashSet(4096);
-        private final WaveLongMinHeap trialQueue = new WaveLongMinHeap(256);
-
-        private int sourceCount;
-        private double maxArrival;
-        private long solveStartNanos;
-        private long impactApplyStartNanos;
-        private double impactBudget;
-        private double directWeight;
-        private int acceptedNodes;
-        private int poppedNodes;
-        private int directImpactApplications;
-        private int thermalImpactApplications;
-        private long lastProgressLogNanos;
-
-        private NarrowBandWavefrontJob(long jobId,
-                                       ResourceKey<Level> dimension,
-                                       double centerX,
-                                       double centerY,
-                                       double centerZ,
-                                       double resolvedRadius,
-                                       double radiusSq,
-                                       int minX,
-                                       int maxX,
-                                       int minY,
-                                       int maxY,
-                                       int minZ,
-                                       int maxZ,
-                                       double totalEnergy,
-                                       double impactHeatCelsius,
-                                       UUID sourceUuid,
-                                       UUID ownerUuid,
-                                       boolean applyWorldChanges,
-                                       ExplosionProfileTrace trace,
-                                       boolean phaseLoggingEnabled,
-                                       long phaseTraceId,
-                                       long queuedAtNanos) {
-            this.jobId = jobId;
-            this.dimension = dimension;
-            this.centerX = centerX;
-            this.centerY = centerY;
-            this.centerZ = centerZ;
-            this.resolvedRadius = resolvedRadius;
-            this.radiusSq = radiusSq;
-            this.minX = minX;
-            this.maxX = maxX;
-            this.minY = minY;
-            this.maxY = maxY;
-            this.minZ = minZ;
-            this.maxZ = maxZ;
-            this.totalEnergy = totalEnergy;
-            this.impactHeatCelsius = impactHeatCelsius;
-            this.sourceUuid = sourceUuid;
-            this.ownerUuid = ownerUuid;
-            this.applyWorldChanges = applyWorldChanges;
-            this.trace = trace;
-            this.phaseLoggingEnabled = phaseLoggingEnabled;
-            this.phaseTraceId = phaseTraceId;
-            this.queuedAtNanos = queuedAtNanos;
-            this.phase = NarrowBandWavefrontPhase.SEED;
-            this.failureMessage = null;
-            this.lastProgressLogNanos = queuedAtNanos;
-
-            this.resistanceCostCache.defaultReturnValue(Double.NaN);
-            this.slownessByPos.defaultReturnValue(Float.NaN);
-            this.arrivalByPos.defaultReturnValue(Float.POSITIVE_INFINITY);
-        }
-
-        private long jobId() {
-            return jobId;
-        }
-
-        private ResourceKey<Level> dimension() {
-            return dimension;
-        }
-
-        private double centerX() {
-            return centerX;
-        }
-
-        private double centerY() {
-            return centerY;
-        }
-
-        private double centerZ() {
-            return centerZ;
-        }
-
-        private double resolvedRadius() {
-            return resolvedRadius;
-        }
-
-        private double radiusSq() {
-            return radiusSq;
-        }
-
-        private int minX() {
-            return minX;
-        }
-
-        private int maxX() {
-            return maxX;
-        }
-
-        private int minY() {
-            return minY;
-        }
-
-        private int maxY() {
-            return maxY;
-        }
-
-        private int minZ() {
-            return minZ;
-        }
-
-        private int maxZ() {
-            return maxZ;
-        }
-
-        private double totalEnergy() {
-            return totalEnergy;
-        }
-
-        private double impactHeatCelsius() {
-            return impactHeatCelsius;
-        }
-
-        private boolean applyWorldChanges() {
-            return applyWorldChanges;
-        }
-
-        private ExplosionProfileTrace trace() {
-            return trace;
-        }
-
-        private boolean phaseLoggingEnabled() {
-            return phaseLoggingEnabled;
-        }
-
-        private long phaseTraceId() {
-            return phaseTraceId;
-        }
-
-        private long queuedAtNanos() {
-            return queuedAtNanos;
-        }
-
-        private long lastProgressLogNanos() {
-            return lastProgressLogNanos;
-        }
-
-        private void lastProgressLogNanos(long value) {
-            this.lastProgressLogNanos = value;
-        }
-
-        private NarrowBandWavefrontPhase phase() {
-            return phase;
-        }
-
-        private void setPhase(NarrowBandWavefrontPhase phase) {
-            this.phase = phase == null ? NarrowBandWavefrontPhase.FAILED : phase;
-        }
-
-        private String failureMessage() {
-            return failureMessage;
-        }
-
-        private void failureMessage(String message) {
-            this.failureMessage = message;
-        }
-
-        private Int2DoubleOpenHashMap resistanceCostCache() {
-            return resistanceCostCache;
-        }
-
-        private WaveChunkStateCache chunkStateCache() {
-            return chunkStateCache;
-        }
-
-        private BlockPos.MutableBlockPos mutablePos() {
-            return mutablePos;
-        }
-
-        private Long2FloatOpenHashMap slownessByPos() {
-            return slownessByPos;
-        }
-
-        private Long2FloatOpenHashMap arrivalByPos() {
-            return arrivalByPos;
-        }
-
-        private LongOpenHashSet finalized() {
-            return finalized;
-        }
-
-        private WaveLongMinHeap trialQueue() {
-            return trialQueue;
-        }
-
-        private int sourceCount() {
-            return sourceCount;
-        }
-
-        private void sourceCount(int sourceCount) {
-            this.sourceCount = sourceCount;
-        }
-
-        private double maxArrival() {
-            return maxArrival;
-        }
-
-        private void maxArrival(double maxArrival) {
-            this.maxArrival = maxArrival;
-        }
-
-        private long solveStartNanos() {
-            return solveStartNanos;
-        }
-
-        private void solveStartNanos(long solveStartNanos) {
-            this.solveStartNanos = solveStartNanos;
-        }
-
-        private long impactApplyStartNanos() {
-            return impactApplyStartNanos;
-        }
-
-        private void impactApplyStartNanos(long impactApplyStartNanos) {
-            this.impactApplyStartNanos = impactApplyStartNanos;
-        }
-
-        private Entity resolveSource(ServerLevel level) {
-            if (sourceUuid == null) {
-                return null;
-            }
-            if (cachedSource != null && !cachedSource.isRemoved()) {
-                return cachedSource;
-            }
-            Entity resolved = level.getEntity(sourceUuid);
-            if (resolved != null && !resolved.isRemoved()) {
-                cachedSource = resolved;
-                return resolved;
-            }
-            cachedSource = null;
-            return null;
-        }
-
-        private LivingEntity resolveOwner(ServerLevel level) {
-            if (ownerUuid == null) {
-                return null;
-            }
-            if (cachedOwner != null && !cachedOwner.isRemoved()) {
-                return cachedOwner;
-            }
-            Entity resolved = level.getEntity(ownerUuid);
-            if (resolved instanceof LivingEntity living && !living.isRemoved()) {
-                cachedOwner = living;
-                return living;
-            }
-            cachedOwner = null;
-            return null;
-        }
-    }
-
-
-    private static final class WaveChunkStateCache {
-        private final Long2ObjectOpenHashMap<LevelChunk> chunksByPos = new Long2ObjectOpenHashMap<>();
-
-        private BlockState getBlockState(ServerLevel level, BlockPos.MutableBlockPos mutablePos, int x, int y, int z) {
-            int chunkX = x >> 4;
-            int chunkZ = z >> 4;
-            long chunkKey = ChunkPos.asLong(chunkX, chunkZ);
-            LevelChunk chunk = chunksByPos.get(chunkKey);
-            if (chunk == null) {
-                chunk = level.getChunk(chunkX, chunkZ);
-                chunksByPos.put(chunkKey, chunk);
-            }
-            mutablePos.set(x, y, z);
-            return chunk.getBlockState(mutablePos);
-        }
-    }
-
-    private static final class WaveLongMinHeap {
-        private long[] keys;
-        private double[] priorities;
-        private int size;
-        private double polledPriority;
-
-        private WaveLongMinHeap(int initialCapacity) {
-            int capacity = Math.max(16, initialCapacity);
-            this.keys = new long[capacity];
-            this.priorities = new double[capacity];
-            this.size = 0;
-            this.polledPriority = Double.POSITIVE_INFINITY;
-        }
-
-        private boolean isEmpty() {
-            return size <= 0;
-        }
-
-        private int size() {
-            return size;
-        }
-
-        private void add(long key, double priority) {
-            ensureCapacity(size + 1);
-            int cursor = size++;
-            while (cursor > 0) {
-                int parent = (cursor - 1) >>> 1;
-                if (priority >= priorities[parent]) {
-                    break;
-                }
-                keys[cursor] = keys[parent];
-                priorities[cursor] = priorities[parent];
-                cursor = parent;
-            }
-            keys[cursor] = key;
-            priorities[cursor] = priority;
-        }
-
-        private long pollKey() {
-            long rootKey = keys[0];
-            polledPriority = priorities[0];
-            size--;
-            if (size > 0) {
-                long tailKey = keys[size];
-                double tailPriority = priorities[size];
-                int cursor = 0;
-                while (true) {
-                    int left = (cursor << 1) + 1;
-                    if (left >= size) {
-                        break;
-                    }
-                    int right = left + 1;
-                    int child = right < size && priorities[right] < priorities[left] ? right : left;
-                    if (tailPriority <= priorities[child]) {
-                        break;
-                    }
-                    keys[cursor] = keys[child];
-                    priorities[cursor] = priorities[child];
-                    cursor = child;
-                }
-                keys[cursor] = tailKey;
-                priorities[cursor] = tailPriority;
-            }
-            return rootKey;
-        }
-
-        private double pollPriority() {
-            return polledPriority;
-        }
-
-        private void ensureCapacity(int minCapacity) {
-            if (minCapacity <= keys.length) {
-                return;
-            }
-            int newCapacity = Math.max(minCapacity, keys.length << 1);
-            keys = Arrays.copyOf(keys, newCapacity);
-            priorities = Arrays.copyOf(priorities, newCapacity);
-        }
-    }
-
-    private record WavefrontSolveStats(int acceptedNodes, int poppedNodes) {
-    }
-
-    private static final class KrakkMinHeap {
-        private int[] indices;
-        private double[] priorities;
-        private int size;
-        private double polledPriority;
-
-        private KrakkMinHeap(int initialCapacity) {
-            int capacity = Math.max(16, initialCapacity);
-            this.indices = new int[capacity];
-            this.priorities = new double[capacity];
-            this.size = 0;
-            this.polledPriority = Double.POSITIVE_INFINITY;
-        }
-
-        private boolean isEmpty() {
-            return size <= 0;
-        }
-
-        private void add(int index, double priority) {
-            ensureCapacity(size + 1);
-            int cursor = size++;
-            while (cursor > 0) {
-                int parent = (cursor - 1) >>> 1;
-                if (priority >= priorities[parent]) {
-                    break;
-                }
-                indices[cursor] = indices[parent];
-                priorities[cursor] = priorities[parent];
-                cursor = parent;
-            }
-            indices[cursor] = index;
-            priorities[cursor] = priority;
-        }
-
-        private int pollIndex() {
-            int rootIndex = indices[0];
-            polledPriority = priorities[0];
-            size--;
-            if (size > 0) {
-                int tailIndex = indices[size];
-                double tailPriority = priorities[size];
-                int cursor = 0;
-                while (true) {
-                    int left = (cursor << 1) + 1;
-                    if (left >= size) {
-                        break;
-                    }
-                    int right = left + 1;
-                    int child = right < size && priorities[right] < priorities[left] ? right : left;
-                    if (tailPriority <= priorities[child]) {
-                        break;
-                    }
-                    indices[cursor] = indices[child];
-                    priorities[cursor] = priorities[child];
-                    cursor = child;
-                }
-                indices[cursor] = tailIndex;
-                priorities[cursor] = tailPriority;
-            }
-            return rootIndex;
-        }
-
-        private double pollPriority() {
-            return polledPriority;
-        }
-
-        private void ensureCapacity(int minCapacity) {
-            if (minCapacity <= indices.length) {
-                return;
-            }
-            int newCapacity = Math.max(minCapacity, indices.length << 1);
-            indices = Arrays.copyOf(indices, newCapacity);
-            priorities = Arrays.copyOf(priorities, newCapacity);
-        }
-    }
-
-    private static final class KrakkDeltaBucketQueue {
-        private final double bucketWidth;
-        private final Int2ObjectOpenHashMap<IntArrayList> buckets;
-        private final PriorityQueue<Integer> bucketOrder;
-        private final IntOpenHashSet queuedBuckets;
-        private final BitSet pendingEntries;
-
-        private KrakkDeltaBucketQueue(double bucketWidth, int indexCapacity) {
-            this.bucketWidth = Math.max(1.0E-9D, bucketWidth);
-            this.buckets = new Int2ObjectOpenHashMap<>();
-            this.bucketOrder = new PriorityQueue<>();
-            this.queuedBuckets = new IntOpenHashSet();
-            this.pendingEntries = new BitSet(Math.max(1, indexCapacity));
-        }
-
-        private boolean isEmpty() {
-            return buckets.isEmpty();
-        }
-
-        private int bucketCount() {
-            return buckets.size();
-        }
-
-        private void add(int index, double arrival) {
-            if (index < 0) {
-                return;
-            }
-            if (pendingEntries.get(index)) {
-                return;
-            }
-            int bucketIndex = krakkDeltaBucketIndex(arrival, bucketWidth);
-            IntArrayList entries = buckets.get(bucketIndex);
-            if (entries == null) {
-                entries = new IntArrayList(16);
-                buckets.put(bucketIndex, entries);
-            }
-            entries.add(index);
-            pendingEntries.set(index);
-            if (queuedBuckets.add(bucketIndex)) {
-                bucketOrder.add(bucketIndex);
-            }
-        }
-
-        private boolean claim(int index) {
-            if (index < 0 || !pendingEntries.get(index)) {
-                return false;
-            }
-            pendingEntries.clear(index);
-            return true;
-        }
-
-        private int pollBucketIndex() {
-            while (!bucketOrder.isEmpty()) {
-                int bucketIndex = bucketOrder.poll();
-                queuedBuckets.remove(bucketIndex);
-                IntArrayList entries = buckets.get(bucketIndex);
-                if (entries != null && !entries.isEmpty()) {
-                    return bucketIndex;
-                }
-            }
-            return -1;
-        }
-
-        private IntArrayList takeBucket(int bucketIndex) {
-            return buckets.remove(bucketIndex);
-        }
-    }
 
     private record VolumetricDirectionCache(double[] dirX,
                                             double[] dirY,
@@ -7903,59 +6601,4 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private record ExplosionResolution(double radius, double energy, double impactHeatCelsius, double blastTransmittance) {
     }
 
-    private static final class ExplosionProfileTrace {
-        private int initialRays;
-        private int processedRays;
-        private int raySplits;
-        private int splitChecks;
-        private int raySteps;
-        private int rawImpactedBlocks;
-        private int postAaImpactedBlocks;
-        private int blocksEvaluated;
-        private int brokenBlocks;
-        private int damagedBlocks;
-        private int predictedBrokenBlocks;
-        private int predictedDamagedBlocks;
-        private int tntTriggered;
-        private int specialHandled;
-        private int lowImpactSkipped;
-        private int entityCandidates;
-        private int entityIntersectionTests;
-        private int entityHits;
-        private int octreeNodeTests;
-        private int octreeLeafVisits;
-        private int entityAffected;
-        private int entityDamaged;
-        private int entityKilled;
-        private long broadphaseNanos;
-        private long raycastNanos;
-        private long antialiasNanos;
-        private long blockResolveNanos;
-        private long splitCheckNanos;
-        private long entitySegmentNanos;
-        private long entityApplyNanos;
-        private long volumetricResistanceFieldNanos;
-        private long volumetricDirectionSetupNanos;
-        private long volumetricPressureSolveNanos;
-        private long krakkSolveNanos;
-        private long volumetricTargetScanNanos;
-        private long volumetricTargetScanPrecheckNanos;
-        private long volumetricTargetScanBlendNanos;
-        private long volumetricImpactApplyNanos;
-        private long volumetricImpactApplyDirectNanos;
-        private long volumetricImpactApplyCollapseSeedNanos;
-        private long volumetricImpactApplyCollapseBfsNanos;
-        private long volumetricImpactApplyCollapseApplyNanos;
-        private int volumetricSampledVoxels;
-        private int volumetricSampledSolids;
-        private int volumetricTargetBlocks;
-        private int volumetricDirectionSamples;
-        private int volumetricRadialSteps;
-        private int krakkSourceCells;
-        private int krakkSweepCycles;
-        private int syncPacketsEstimated;
-        private int syncBytesEstimated;
-        @SuppressWarnings("unused") // emitRaySmoke is intentionally disabled for Cannonical; always 0 but kept for trace reporting
-        private int smokeParticles;
-    }
 }
