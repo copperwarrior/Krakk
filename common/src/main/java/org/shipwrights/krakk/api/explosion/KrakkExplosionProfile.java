@@ -11,11 +11,18 @@ import org.shipwrights.krakk.engine.explosion.KrakkExplosionCurves;
  * @param energy explicit energy pool used by the Krakk algorithm
  * @param impactHeatCelsius thermal magnitude routed to impact conversion and placement systems
  * @param debugVisuals enables debug visuals
+ * @param entityDamage scalar multiplier for HP damage applied to entities; {@code 0} disables, {@code 1} is full damage
+ * @param entityKnockback scalar multiplier for knockback applied to entities; {@code 0} disables, {@code 1} is full knockback
+ * @param blockDamage whether this explosion applies damage to blocks
  */
+@SuppressWarnings("unused") // public API — methods are available to dependent mods
 public record KrakkExplosionProfile(double radius, double energy,
                                     double impactHeatCelsius,
                                     boolean debugVisuals,
-                                    double blastTransmittance) {
+                                    double blastTransmittance,
+                                    double entityDamage,
+                                    double entityKnockback,
+                                    boolean blockDamage) {
     public static final double TONNAGE_PER_MINECRAFT_TNT = 0.1D;
     public static final double MINECRAFT_TNT_PER_TON = 1.0D / TONNAGE_PER_MINECRAFT_TNT;
     public static final double KILOTON_TONS = 1_000.0D;
@@ -27,23 +34,37 @@ public record KrakkExplosionProfile(double radius, double energy,
     public KrakkExplosionProfile {
         impactHeatCelsius = sanitizeHeat(impactHeatCelsius);
         blastTransmittance = Math.max(0.0D, Math.min(1.0D, blastTransmittance));
+        entityDamage = Math.max(0.0D, entityDamage);
+        entityKnockback = Math.max(0.0D, entityKnockback);
     }
 
     public KrakkExplosionProfile(double radius, double energy) {
-        this(radius, energy, KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS, false, DEFAULT_BLAST_TRANSMITTANCE);
+        this(radius, energy, KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS, false, DEFAULT_BLAST_TRANSMITTANCE, 1.0D, 1.0D, true);
     }
 
     public KrakkExplosionProfile(double radius, double energy, double impactHeatCelsius) {
-        this(radius, energy, impactHeatCelsius, false, DEFAULT_BLAST_TRANSMITTANCE);
+        this(radius, energy, impactHeatCelsius, false, DEFAULT_BLAST_TRANSMITTANCE, 1.0D, 1.0D, true);
     }
 
     public KrakkExplosionProfile(double power) {
         this(radiusFromPower(power), energyFromPower(power),
-                KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS, false, DEFAULT_BLAST_TRANSMITTANCE);
+                KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS, false, DEFAULT_BLAST_TRANSMITTANCE, 1.0D, 1.0D, true);
     }
 
     public KrakkExplosionProfile withBlastTransmittance(double newBlastTransmittance) {
-        return new KrakkExplosionProfile(radius, energy, impactHeatCelsius, debugVisuals, newBlastTransmittance);
+        return new KrakkExplosionProfile(radius, energy, impactHeatCelsius, debugVisuals, newBlastTransmittance, entityDamage, entityKnockback, blockDamage);
+    }
+
+    public KrakkExplosionProfile withEntityDamage(double newEntityDamage) {
+        return new KrakkExplosionProfile(radius, energy, impactHeatCelsius, debugVisuals, blastTransmittance, newEntityDamage, entityKnockback, blockDamage);
+    }
+
+    public KrakkExplosionProfile withEntityKnockback(double newEntityKnockback) {
+        return new KrakkExplosionProfile(radius, energy, impactHeatCelsius, debugVisuals, blastTransmittance, entityDamage, newEntityKnockback, blockDamage);
+    }
+
+    public KrakkExplosionProfile withBlockDamage(boolean newBlockDamage) {
+        return new KrakkExplosionProfile(radius, energy, impactHeatCelsius, debugVisuals, blastTransmittance, entityDamage, entityKnockback, newBlockDamage);
     }
 
     public static KrakkExplosionProfile fromPower(double power) {
@@ -52,7 +73,8 @@ public record KrakkExplosionProfile(double radius, double energy,
                 energyFromPower(power),
                 KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS,
                 false,
-                DEFAULT_BLAST_TRANSMITTANCE
+                DEFAULT_BLAST_TRANSMITTANCE,
+                1.0D, 1.0D, true
         );
     }
 
@@ -62,7 +84,8 @@ public record KrakkExplosionProfile(double radius, double energy,
                 energyFromPower(power),
                 impactHeatCelsius,
                 false,
-                DEFAULT_BLAST_TRANSMITTANCE
+                DEFAULT_BLAST_TRANSMITTANCE,
+                1.0D, 1.0D, true
         );
     }
 
@@ -71,19 +94,19 @@ public record KrakkExplosionProfile(double radius, double energy,
     }
 
     public static KrakkExplosionProfile krakk(double radius, double energy) {
-        return new KrakkExplosionProfile(radius, energy, KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS, false, DEFAULT_BLAST_TRANSMITTANCE);
+        return new KrakkExplosionProfile(radius, energy, KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS, false, DEFAULT_BLAST_TRANSMITTANCE, 1.0D, 1.0D, true);
     }
 
     public static KrakkExplosionProfile krakk(double radius, double energy, double impactHeatCelsius) {
-        return new KrakkExplosionProfile(radius, energy, impactHeatCelsius, false, DEFAULT_BLAST_TRANSMITTANCE);
+        return new KrakkExplosionProfile(radius, energy, impactHeatCelsius, false, DEFAULT_BLAST_TRANSMITTANCE, 1.0D, 1.0D, true);
     }
 
     public static KrakkExplosionProfile krakkDebug(double radius, double energy) {
-        return new KrakkExplosionProfile(radius, energy, KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS, true, DEFAULT_BLAST_TRANSMITTANCE);
+        return new KrakkExplosionProfile(radius, energy, KrakkDamageApi.DEFAULT_IMPACT_HEAT_CELSIUS, true, DEFAULT_BLAST_TRANSMITTANCE, 1.0D, 1.0D, true);
     }
 
     public static KrakkExplosionProfile krakkDebug(double radius, double energy, double impactHeatCelsius) {
-        return new KrakkExplosionProfile(radius, energy, impactHeatCelsius, true, DEFAULT_BLAST_TRANSMITTANCE);
+        return new KrakkExplosionProfile(radius, energy, impactHeatCelsius, true, DEFAULT_BLAST_TRANSMITTANCE, 1.0D, 1.0D, true);
     }
 
     public static KrakkExplosionProfile fromTonnage(double tonnageTons) {

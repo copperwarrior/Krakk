@@ -739,7 +739,6 @@ public final class KrakkDebugCommands {
                         level,
                         targets,
                         seed + effectiveWarmup + i,
-                        true,
                         cleanup
                 );
                 nanos[i] = result.elapsedNanos();
@@ -960,8 +959,8 @@ public final class KrakkDebugCommands {
         int maxZ = (int) Math.ceil(center.z + radius);
         double radiusSq = radius * radius;
 
-        LongArrayList positions = new LongArrayList(Math.max(4096, (int) (radius * radius)));
-        DoubleArrayList impactPowers = new DoubleArrayList(Math.max(4096, (int) (radius * radius)));
+        LongArrayList positions = new LongArrayList((int) (radius * radius));
+        DoubleArrayList impactPowers = new DoubleArrayList((int) (radius * radius));
         BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
         for (int x = minX; x <= maxX; x += QPROF_DAMAGE_SAMPLE_STEP) {
             double dx = (x + 0.5D) - center.x;
@@ -974,7 +973,7 @@ public final class KrakkDebugCommands {
                         continue;
                     }
                     double dist = Math.sqrt(distSq);
-                    double normalized = 1.0D - (dist / Math.max(radius, 1.0E-9D));
+                    double normalized = 1.0D - (dist / radius);
                     double impactPower = normalized * QPROF_DAMAGE_MAX_IMPACT;
                     if (impactPower <= 0.0D) {
                         continue;
@@ -996,7 +995,7 @@ public final class KrakkDebugCommands {
     }
 
     private static DamageProfileRunResult runDamageProfilePass(ServerLevel level, DamageProfileTargets targets, long seed,
-                                                               boolean logProgress, boolean cleanup) {
+                                                               boolean cleanup) {
         final long[] preClearNanos = {0L};
         final long[] applyNanos = {0L};
         final long[] postClearNanos = {0L};
@@ -1009,7 +1008,7 @@ public final class KrakkDebugCommands {
 
         Runnable preClearWork = () -> {
             long preClearStart = System.nanoTime();
-            clearDamageProfileTargets(level, targets, "preClear", logProgress);
+            clearDamageProfileTargets(level, targets, "preClear");
             preClearNanos[0] = System.nanoTime() - preClearStart;
         };
 
@@ -1047,7 +1046,7 @@ public final class KrakkDebugCommands {
                     }
                 }
                 int processed = i + 1;
-                if (logProgress && (processed % DAMAGE_PROFILE_PROGRESS_INTERVAL) == 0) {
+                if ((processed % DAMAGE_PROFILE_PROGRESS_INTERVAL) == 0) {
                     LOGGER.info(
                             "Krakk profdamage progress: stage=apply processed={}/{} elapsed={}ms broken={} damaged={} noEffect={} skipped={}",
                             processed,
@@ -1060,7 +1059,7 @@ public final class KrakkDebugCommands {
                     );
                 }
             }
-            if (logProgress && size > 0 && ((size % DAMAGE_PROFILE_PROGRESS_INTERVAL) != 0)) {
+            if (size > 0 && ((size % DAMAGE_PROFILE_PROGRESS_INTERVAL) != 0)) {
                 LOGGER.info(
                         "Krakk profdamage progress: stage=apply processed={}/{} elapsed={}ms broken={} damaged={} noEffect={} skipped={}",
                         size,
@@ -1077,20 +1076,18 @@ public final class KrakkDebugCommands {
 
         Runnable postClearWork = () -> {
             long postClearStart = System.nanoTime();
-            clearDamageProfileTargets(level, targets, "postClear", logProgress);
+            clearDamageProfileTargets(level, targets, "postClear");
             postClearNanos[0] = System.nanoTime() - postClearStart;
         };
 
-        if (logProgress) {
-            LOGGER.info(
-                    "Krakk profdamage pass mode: bulkSync={} pipeline=impactApply->visible cleanup={} dropOnBreak={} sampleStep={} maxImpact={}",
-                    bulkSync,
-                    cleanup,
-                    dropOnBreak,
-                    QPROF_DAMAGE_SAMPLE_STEP,
-                    String.format("%.3f", QPROF_DAMAGE_MAX_IMPACT)
-            );
-        }
+        LOGGER.info(
+                "Krakk profdamage pass mode: bulkSync={} pipeline=impactApply->visible cleanup={} dropOnBreak={} sampleStep={} maxImpact={}",
+                bulkSync,
+                cleanup,
+                QPROF_DAMAGE_DROP_ON_BREAK,
+                QPROF_DAMAGE_SAMPLE_STEP,
+                String.format("%.3f", QPROF_DAMAGE_MAX_IMPACT)
+        );
         preClearWork.run();
         if (bulkSync) {
             KrakkDamageRuntime.runInBulkSync(level, applyWork);
@@ -1101,19 +1098,17 @@ public final class KrakkDebugCommands {
             postClearWork.run();
         }
 
-        if (logProgress) {
-            LOGGER.info(
-                    "Krakk profdamage pass complete: preClear={}ms apply={}ms postClear={}ms attempted={} broken={} damaged={} noEffect={} skipped={}",
-                    String.format("%.3f", nanosToMs(preClearNanos[0])),
-                    String.format("%.3f", nanosToMs(applyNanos[0])),
-                    String.format("%.3f", nanosToMs(postClearNanos[0])),
-                    size,
-                    broken[0],
-                    damaged[0],
-                    noEffect[0],
-                    skipped[0]
-            );
-        }
+        LOGGER.info(
+                "Krakk profdamage pass complete: preClear={}ms apply={}ms postClear={}ms attempted={} broken={} damaged={} noEffect={} skipped={}",
+                String.format("%.3f", nanosToMs(preClearNanos[0])),
+                String.format("%.3f", nanosToMs(applyNanos[0])),
+                String.format("%.3f", nanosToMs(postClearNanos[0])),
+                size,
+                broken[0],
+                damaged[0],
+                noEffect[0],
+                skipped[0]
+        );
 
         return new DamageProfileRunResult(
                 applyNanos[0],
@@ -1145,26 +1140,23 @@ public final class KrakkDebugCommands {
         )), false);
     }
 
-    private static void clearDamageProfileTargets(ServerLevel level, DamageProfileTargets targets, String stage,
-                                                  boolean logProgress) {
+    private static void clearDamageProfileTargets(ServerLevel level, DamageProfileTargets targets, String stage) {
         LongArrayList positions = targets.positions();
         long stageStart = System.nanoTime();
         if (KrakkApi.damage() instanceof KrakkDamageRuntime runtime) {
-            KrakkDamageRuntime.BulkDebugProgressListener progressListener = null;
-            if (logProgress) {
-                progressListener = (processed, total, cleared, ignored) -> LOGGER.info(
-                        "Krakk profdamage progress: stage={} processed={}/{} elapsed={}ms",
-                        stage,
-                        processed,
-                        total,
-                        String.format("%.3f", nanosToMs(System.nanoTime() - stageStart))
-                );
-            }
+            KrakkDamageRuntime.BulkDebugProgressListener progressListener =
+                    (processed, total, cleared, ignored) -> LOGGER.info(
+                            "Krakk profdamage progress: stage={} processed={}/{} elapsed={}ms",
+                            stage,
+                            processed,
+                            total,
+                            String.format("%.3f", nanosToMs(System.nanoTime() - stageStart))
+                    );
             runtime.clearDamageStatesBulk(
                     level,
                     positions,
                     0,
-                    logProgress ? DAMAGE_PROFILE_PROGRESS_INTERVAL : 0,
+                    DAMAGE_PROFILE_PROGRESS_INTERVAL,
                     progressListener
             );
             return;
@@ -1175,7 +1167,7 @@ public final class KrakkDebugCommands {
             long posLong = positions.getLong(i);
             cursor.set(BlockPos.getX(posLong), BlockPos.getY(posLong), BlockPos.getZ(posLong));
             KrakkApi.damage().clearDamage(level, cursor);
-            if (logProgress && ((i + 1) % DAMAGE_PROFILE_PROGRESS_INTERVAL) == 0) {
+            if (((i + 1) % DAMAGE_PROFILE_PROGRESS_INTERVAL) == 0) {
                 LOGGER.info(
                         "Krakk profdamage progress: stage={} processed={}/{} elapsed={}ms",
                         stage,

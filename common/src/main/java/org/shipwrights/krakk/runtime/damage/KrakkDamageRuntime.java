@@ -41,7 +41,6 @@ import org.shipwrights.krakk.api.damage.KrakkImpactResult;
 import org.shipwrights.krakk.api.damage.KrakkDamageType;
 import org.shipwrights.krakk.engine.damage.KrakkDamageCurves;
 import org.shipwrights.krakk.engine.damage.KrakkDamageDecay;
-import org.shipwrights.krakk.api.network.KrakkNetworkApi;
 import org.shipwrights.krakk.state.chunk.KrakkBlockDamageChunkAccess;
 import org.shipwrights.krakk.state.chunk.KrakkBlockDamageChunkStorage;
 import org.shipwrights.krakk.state.chunk.KrakkBlockDamageSectionAccess;
@@ -49,14 +48,11 @@ import org.shipwrights.krakk.state.network.KrakkServerChunkCacheAccess;
 
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.ForkJoinTask;
 import java.util.concurrent.atomic.LongAdder;
 import java.lang.reflect.Method;
 import org.slf4j.Logger;
@@ -85,7 +81,7 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
     private static final DamageRuntimeProfileCounters DAMAGE_RUNTIME_PROFILE = new DamageRuntimeProfileCounters();
     private static volatile boolean damageRuntimeProfilingEnabled = false;
     private static volatile DamageStateConversionHandler damageStateConversionHandler = DamageStateConversionHandler.NOOP;
-    private static volatile boolean syncDebugLoggingEnabled =
+    private static final boolean syncDebugLoggingEnabled =
             Boolean.getBoolean("krakk.damage.sync_debug_logging");
     private static final LongAdder SYNC_DEBUG_CHUNK_NOTIFY_SUCCESS = new LongAdder();
     private static final LongAdder SYNC_DEBUG_CHUNK_NOTIFY_FAIL = new LongAdder();
@@ -110,9 +106,11 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
         void onProgress(int processed, int total, int applied, int failed);
     }
 
+    @SuppressWarnings("unused") // public API
     public record BulkDebugApplyResult(int attempted, int applied, int failed) {
     }
 
+    @SuppressWarnings("unused") // public API
     public record BulkDebugClearResult(int attempted, int cleared) {
     }
 
@@ -272,6 +270,7 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
         ).impactResult();
     }
 
+    @SuppressWarnings("unused") // public API
     public KrakkImpactResult applyImpactPrevalidated(ServerLevel level, BlockPos blockPos, BlockState blockState, Entity source,
                                                      double impactPower, double impactHeatCelsius,
                                                      boolean dropOnBreak, KrakkDamageType damageType) {
@@ -403,15 +402,11 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
                                     impactResult = new KrakkImpactResult(false, nextState);
                                 }
                             } else {
-                                if (nextState >= FLUID_TO_FLOWING_THRESHOLD && tryConvertSourceFluidToFlowing(level, blockPos, blockState)) {
-                                    // keep damage state; conversion updates fluid behavior while preserving damage progression
+                                if (nextState >= FLUID_TO_FLOWING_THRESHOLD) {
+                                    tryConvertSourceFluidToFlowing(level, blockPos, blockState);
                                 }
-                                if (nextState >= MAX_DAMAGE_STATE) {
-                                    impactResult = breakDamagedBlock(level, blockPos, blockState, source, dropOnBreak, resolvedDamageType);
-                                } else {
-                                    setDamageState(level, blockPos, nextState);
-                                    impactResult = new KrakkImpactResult(false, nextState);
-                                }
+                                setDamageState(level, blockPos, nextState);
+                                impactResult = new KrakkImpactResult(false, nextState);
                             }
                         } else if (nextState >= MAX_DAMAGE_STATE) {
                             impactResult = breakDamagedBlock(level, blockPos, blockState, source, dropOnBreak, resolvedDamageType);
@@ -1552,6 +1547,7 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
         return resolved;
     }
 
+    @SuppressWarnings("unused")
     private static int parsePositiveIntProperty(String key, int fallback) {
         String raw = System.getProperty(key);
         if (raw == null || raw.isBlank()) {
@@ -1749,6 +1745,7 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
         return (short) ((y << 8) | (z << 4) | x);
     }
 
+    @SuppressWarnings("unused")
     private static final class SectionWriteBucket {
         private final LongArrayList positions = new LongArrayList();
         private final IntArrayList states = new IntArrayList();
@@ -1790,7 +1787,9 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
             long flushEntries,
             long flushMethodNanos,
             long flushRouteChunkCache,
-            long flushRoutePerBlockFallback
+            long flushRoutePerBlockFallback,
+            long flushRouteSectionDelta,
+            long flushRouteSectionSnapshot
     ) {
     }
 
