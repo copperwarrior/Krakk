@@ -20,6 +20,10 @@ base {
 
 repositories {
     mavenLocal()
+    maven {
+        name = "Valkyrien Skies"
+        url = 'https://maven.valkyrienskies.org'
+    }
 }
 
 architectury {
@@ -33,6 +37,22 @@ dependencies {
     // Used for @Environment annotations remapped by Architectury.
     modImplementation "net.fabricmc:fabric-loader:${fabricLoaderVersion}"
     modImplementation "dev.architectury:architectury:${architecturyApiVersion}"
+
+    // Valkyrien Skies 2 — optional at runtime, available at compile time for deep integration.
+    def vs2Version = findProperty("vs2_version") ?: "2.4.10"
+    modCompileOnly("org.valkyrienskies:valkyrienskies-120-common:${vs2Version}") {
+        exclude group: "com.simibubi"
+        exclude group: "io.github.fabricators_of_create"
+        exclude group: "dev.engine-room"
+        exclude group: "dev.engine_room"
+    }
+    // VS2 core API is a transitive of vs2-common but Loom does not include compileOnly transitives;
+    // declare it explicitly so Ship/ClientShip/ChunkClaim interfaces are on the compile classpath.
+    def vs2CoreVersion = findProperty("vs2_core_version") ?: "1.1.0+1d4a7373e9"
+    modCompileOnly("org.valkyrienskies.core:api:${vs2CoreVersion}") {
+        exclude group: "com.simibubi"
+        exclude group: "io.github.fabricators_of_create"
+    }
 }
 
 java {

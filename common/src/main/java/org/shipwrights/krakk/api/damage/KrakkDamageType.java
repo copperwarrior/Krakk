@@ -5,5 +5,6 @@ package org.shipwrights.krakk.api.damage;
  */
 public enum KrakkDamageType {
     KRAKK_DAMAGE_BASIC,
-    KRAKK_DAMAGE_EXPLOSION
+    KRAKK_DAMAGE_EXPLOSION,
+    KRAKK_DAMAGE_COLLISION
 }

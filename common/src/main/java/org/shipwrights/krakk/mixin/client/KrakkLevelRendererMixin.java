@@ -41,6 +41,8 @@ import org.joml.Matrix3f;
 import org.joml.Matrix4f;
 import org.shipwrights.krakk.api.KrakkApi;
 import org.shipwrights.krakk.runtime.client.KrakkClientShaders;
+import org.shipwrights.krakk.vs2.KrakkVS2ClientSupport;
+import org.shipwrights.krakk.vs2.KrakkVS2Support;
 import org.shipwrights.krakk.runtime.client.SectionRebuildWork;
 import org.shipwrights.krakk.runtime.client.SectionRenderCache;
 import org.shipwrights.krakk.runtime.client.VecRange;
@@ -191,7 +193,7 @@ public abstract class KrakkLevelRendererMixin {
             krakk$parsePositiveIntProperty("krakk.client.overlay_async_rebuild_tasks", 2);
     @Unique
     private static final boolean KRAKK_OVERLAY_TIMING_LOGGING_ENABLED =
-            krakk$parseBooleanProperty("krakk.client.overlay_timing_logging", true);
+            krakk$parseBooleanProperty("krakk.client.overlay_timing_logging", false);
     @Unique
     private static final long KRAKK_OVERLAY_TIMING_WARN_NANOS =
             krakk$parsePositiveLongProperty("krakk.client.overlay_timing_warn_ms", 50L) * 1_000_000L;
@@ -639,6 +641,11 @@ public abstract class KrakkLevelRendererMixin {
             int cameraChunkX = Mth.floor(cameraX) >> 4;
             int cameraChunkZ = Mth.floor(cameraZ) >> 4;
             LongOpenHashSet activeVisibleSections = this.krakk$collectActiveVisibleSectionKeys();
+            // VS2: inject section keys for any loaded ships into the active-visible set
+            // so ship sections pass the visibility filter in the rebuild and collect passes.
+            if (KrakkVS2Support.isPresent() && this.krakk$activeDimensionId != null) {
+                KrakkVS2ClientSupport.addShipSectionKeys(this.krakk$activeDimensionId, activeVisibleSections);
+            }
             long syncStartNanos = KRAKK_OVERLAY_TIMING_LOGGING_ENABLED ? System.nanoTime() : 0L;
             profiler.popPush("krakk_overlay_sync");
             this.krakk$enqueueVisibleDamageSections(level, range.minChunkX(), range.maxChunkX(), range.minChunkZ(), range.maxChunkZ());
@@ -766,11 +773,15 @@ public abstract class KrakkLevelRendererMixin {
                         stageRendered = true;
                     }
 
-                    modelViewMatrix.set(baseModelViewMatrix).translate(
-                            cacheOffsetX[cacheIndex],
-                            cacheOffsetY[cacheIndex],
-                            cacheOffsetZ[cacheIndex]
-                    );
+                    if (!KrakkVS2Support.isPresent()
+                            || !KrakkVS2ClientSupport.applyShipSectionModelView(
+                                    cache, cameraX, cameraY, cameraZ, baseModelViewMatrix, modelViewMatrix)) {
+                        modelViewMatrix.set(baseModelViewMatrix).translate(
+                                cacheOffsetX[cacheIndex],
+                                cacheOffsetY[cacheIndex],
+                                cacheOffsetZ[cacheIndex]
+                        );
+                    }
                     for (int bufferIndex = 0; bufferIndex < stageBuffers.size(); bufferIndex++) {
                         if (drawCalls >= drawCallBudget) {
                             drawBudgetReached = true;
@@ -1287,6 +1298,9 @@ public abstract class KrakkLevelRendererMixin {
             int sectionZ = SectionPos.z(sectionKey);
             boolean inRange = sectionX >= minChunkX && sectionX <= maxChunkX
                     && sectionZ >= minChunkZ && sectionZ <= maxChunkZ;
+            if (!inRange && KrakkVS2Support.isPresent()) {
+                inRange = KrakkVS2ClientSupport.isSectionInShipRange(sectionX, sectionZ);
+            }
             if (!inRange || !krakk$isChunkLoaded(level, sectionX, sectionZ, chunkLoadedCache)) {
                 this.krakk$pendingDirtySections.remove(sectionKey);
                 this.krakk$discardSection(sectionKey);
@@ -1321,6 +1335,9 @@ public abstract class KrakkLevelRendererMixin {
             int sectionZ = SectionPos.z(sectionKey);
             boolean inRange = sectionX >= minChunkX && sectionX <= maxChunkX
                     && sectionZ >= minChunkZ && sectionZ <= maxChunkZ;
+            if (!inRange && KrakkVS2Support.isPresent()) {
+                inRange = KrakkVS2ClientSupport.isSectionInShipRange(sectionX, sectionZ);
+            }
             if (!inRange) {
                 // Drop stale pending work outside the current render window.
                 // Visible sections are re-queued from overlay dirty events when needed.
@@ -2016,8 +2033,11 @@ public abstract class KrakkLevelRendererMixin {
             int sectionX = SectionPos.x(sectionKey);
             int sectionZ = SectionPos.z(sectionKey);
             if (sectionX < minChunkX || sectionX > maxChunkX || sectionZ < minChunkZ || sectionZ > maxChunkZ) {
-                staleSections.add(sectionKey);
-                continue;
+                if (!KrakkVS2Support.isPresent() || !KrakkVS2ClientSupport.isSectionInShipRange(sectionX, sectionZ)) {
+                    staleSections.add(sectionKey);
+                    continue;
+                }
+                // VS2 ship section: falls through to the chunk-loaded check below.
             }
             if (!krakk$isChunkLoaded(level, sectionX, sectionZ, chunkLoadedCache)) {
                 staleSections.add(sectionKey);
@@ -2261,7 +2281,11 @@ public abstract class KrakkLevelRendererMixin {
             if (cache == null) {
                 continue;
             }
-            if (cache.inChunkRange(minChunkX, maxChunkX, minChunkZ, maxChunkZ)) {
+            boolean inRange = cache.inChunkRange(minChunkX, maxChunkX, minChunkZ, maxChunkZ);
+            if (!inRange && KrakkVS2Support.isPresent()) {
+                inRange = KrakkVS2ClientSupport.isSectionInShipRange(cache.sectionX(), cache.sectionZ());
+            }
+            if (inRange) {
                 if (hasVisibilityFilter && !activeVisibleSections.contains(cache.sectionKey())) {
                     continue;
                 }

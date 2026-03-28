@@ -65,6 +65,9 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
     private static final int FLUID_REMOVE_THRESHOLD = 9;
     private static final float STONE_EQUIVALENT_HARDNESS = 1.5F;
     private static final float STONE_EQUIVALENT_RESISTANCE = 6.0F;
+    // Blocks at or above this blast resistance are immune to all Krakk damage.
+    // Covers obsidian (1200), reinforced deepslate (1200), bedrock (3600000).
+    private static final float INDESTRUCTIBLE_RESISTANCE = 1200.0F;
     private static final long DAMAGE_DECAY_INTERVAL_TICKS = 24_000L;
     private static final Map<Class<?>, Method> CHUNK_SOURCE_NOTIFY_METHODS = new ConcurrentHashMap<>();
     private static final Set<Class<?>> CHUNK_SOURCE_NO_NOTIFY_METHOD = ConcurrentHashMap.newKeySet();
@@ -378,6 +381,12 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
                 boolean fluidBlock = isDamageableFluidBlock(blockState);
                 float hardness = fluidBlock ? STONE_EQUIVALENT_HARDNESS : blockState.getDestroySpeed(level, blockPos);
                 if (!fluidBlock && hardness < 0.0F) {
+                    clearDamage(level, blockPos);
+                    return new ImpactExecutionResult(new KrakkImpactResult(false, NO_DAMAGE_STATE), false, false);
+                }
+                // Blocks with blast resistance >= 1200 are effectively indestructible
+                // (obsidian, reinforced deepslate, etc.) — immune to all Krakk damage.
+                if (!fluidBlock && blockState.getBlock().getExplosionResistance() >= INDESTRUCTIBLE_RESISTANCE) {
                     clearDamage(level, blockPos);
                     return new ImpactExecutionResult(new KrakkImpactResult(false, NO_DAMAGE_STATE), false, false);
                 }
@@ -898,7 +907,8 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
 
         BlockState currentState = level.getBlockState(blockPos);
         float hardness = currentState.getDestroySpeed(level, blockPos);
-        if (currentState.isAir() || hardness < 0.0F) {
+        if (currentState.isAir() || hardness < 0.0F
+                || currentState.getBlock().getExplosionResistance() >= INDESTRUCTIBLE_RESISTANCE) {
             return new KrakkImpactResult(false, NO_DAMAGE_STATE);
         }
         if (expectedState != null && currentState.getBlock() != expectedState.getBlock()) {
@@ -926,7 +936,8 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
     @Override
     public int getDamageState(ServerLevel level, BlockPos blockPos) {
         BlockState liveState = level.getBlockState(blockPos);
-        if (liveState.isAir() || liveState.getDestroySpeed(level, blockPos) < 0.0F) {
+        if (liveState.isAir() || liveState.getDestroySpeed(level, blockPos) < 0.0F
+                || liveState.getBlock().getExplosionResistance() >= INDESTRUCTIBLE_RESISTANCE) {
             clearDamage(level, blockPos);
             return 0;
         }
@@ -1175,7 +1186,8 @@ public final class KrakkDamageRuntime implements KrakkDamageApi {
 
     private KrakkImpactResult breakDamagedBlock(ServerLevel level, BlockPos blockPos, BlockState blockState, Entity source,
                                                 boolean dropOnBreak, KrakkDamageType damageType) {
-        boolean broken = damageType == KrakkDamageType.KRAKK_DAMAGE_EXPLOSION
+        boolean broken = (damageType == KrakkDamageType.KRAKK_DAMAGE_EXPLOSION
+                || damageType == KrakkDamageType.KRAKK_DAMAGE_COLLISION)
                 ? breakDamagedBlockExplosionStyle(level, blockPos, blockState, source, dropOnBreak)
                 : level.destroyBlock(blockPos, dropOnBreak, source);
         if (!broken) {

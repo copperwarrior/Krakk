@@ -334,7 +334,9 @@ final class WaveChunkStateCache {
             chunksByPos.put(chunkKey, chunk);
         }
         mutablePos.set(x, y, z);
-        return chunk.getBlockState(mutablePos);
+        BlockState worldState = chunk.getBlockState(mutablePos);
+        BlockState override = KrakkExplosionRuntime.blockStateProvider.provide(level, mutablePos, worldState);
+        return override != null ? override : worldState;
     }
 }
 

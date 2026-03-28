@@ -240,6 +240,12 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     private static final Set<Class<?>> BLOCK_NO_IGNITE_METHOD = ConcurrentHashMap.newKeySet();
     private static final Set<Class<?>> BLOCK_IGNITE_FAILURE_LOGGED = ConcurrentHashMap.newKeySet();
     private static volatile SpecialBlockHandler specialBlockHandler = SpecialBlockHandler.NOOP;
+    // Package-visible so NarrowBandWavefrontJob.WaveChunkStateCache can apply it during solver traversal.
+    static volatile BlockStateProvider blockStateProvider = (l, p, s) -> null;
+    private static volatile PostExplosionHook postExplosionHook = (l, x, y, z, r, e, p, src, o) -> {};
+    // Thread-local scratch for the impact parameters of the block currently being processed.
+    // Written immediately before specialBlockHandler.handle() so VS2 support can read them.
+    private static final ThreadLocal<double[]> CURRENT_BLOCK_IMPACT = ThreadLocal.withInitial(() -> new double[2]);
     private static final boolean parallelResistanceFieldSamplingEnabled = true;
     private static volatile double raySplitDistanceThreshold = DEFAULT_RAY_SPLIT_DISTANCE_THRESHOLD;
     private static final double EXTRA_RADIUS_FRACTION       = 0.30;
@@ -294,6 +300,63 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
 
     public static void setSpecialBlockHandler(SpecialBlockHandler handler) {
         specialBlockHandler = handler == null ? SpecialBlockHandler.NOOP : handler;
+    }
+
+    public static SpecialBlockHandler getSpecialBlockHandler() {
+        return specialBlockHandler;
+    }
+
+    /**
+     * Optional override for block state lookups during explosion propagation and impact application.
+     * When VS2 is present, this injects real ship block states for world positions that appear as air
+     * because the ship blocks live in the Shipyard dimension.
+     */
+    @FunctionalInterface
+    public interface BlockStateProvider {
+        /** @return effective BlockState at pos, or null to use the world block unchanged. */
+        BlockState provide(ServerLevel level, BlockPos pos, BlockState worldState);
+    }
+
+    public static void setBlockStateProvider(BlockStateProvider provider) {
+        blockStateProvider = provider == null ? (l, p, s) -> null : provider;
+    }
+
+    /**
+     * Called once after all block and entity impacts are resolved for a detonation.
+     * VS2 support uses this to apply physics impulses to ships within the blast radius.
+     */
+    @FunctionalInterface
+    public interface PostExplosionHook {
+        void onComplete(ServerLevel level, double x, double y, double z,
+                        double resolvedRadius, double resolvedEnergy,
+                        KrakkExplosionProfile profile, Entity source, LivingEntity owner);
+    }
+
+    public static void setPostExplosionHook(PostExplosionHook hook) {
+        postExplosionHook = hook == null ? (l, x, y, z, r, e, p, src, o) -> {} : hook;
+    }
+
+    @FunctionalInterface
+    public interface PreExplosionHook {
+        void onBegin(ServerLevel level, double x, double y, double z,
+                     double resolvedRadius, double resolvedEnergy,
+                     KrakkExplosionProfile profile, Entity source, LivingEntity owner);
+    }
+
+    private static volatile PreExplosionHook preExplosionHook = (l, x, y, z, r, e, p, src, o) -> {};
+
+    public static void setPreExplosionHook(PreExplosionHook hook) {
+        preExplosionHook = hook == null ? (l, x, y, z, r, e, p, src, o) -> {} : hook;
+    }
+
+    /** Impact power (Krakk units) of the block currently being processed inside the explosion loop. */
+    public static double currentBlockImpactPower() {
+        return CURRENT_BLOCK_IMPACT.get()[0];
+    }
+
+    /** Impact heat (°C) of the block currently being processed inside the explosion loop. */
+    public static double currentBlockImpactHeat() {
+        return CURRENT_BLOCK_IMPACT.get()[1];
     }
 
     private static boolean tryTriggerNativeIgnite(ServerLevel level, BlockPos blockPos, BlockState blockState,
@@ -4171,7 +4234,10 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             }
 
             mutablePos.set(x, y, z);
-            if (level.getBlockState(mutablePos).isAir()) {
+            BlockState collapseWorldState = level.getBlockState(mutablePos);
+            BlockState collapseState = blockStateProvider.provide(level, mutablePos, collapseWorldState);
+            if (collapseState == null) collapseState = collapseWorldState;
+            if (collapseState.isAir()) {
                 continue;
             }
 
@@ -4371,9 +4437,11 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                         cachedChunkZ = chunkZ;
                         cachedChunk = level.getChunkSource().getChunkNow(chunkX, chunkZ);
                     }
-                    BlockState blockState = cachedChunk != null
+                    BlockState worldBlockState = cachedChunk != null
                             ? cachedChunk.getBlockState(mutablePos)
                             : level.getBlockState(mutablePos);
+                    BlockState blockState = blockStateProvider.provide(level, mutablePos, worldBlockState);
+                    if (blockState == null) blockState = worldBlockState;
                     if (blockState.isAir()) {
                         slowness.setFloat(index, airSlowness);
                         rowActiveCount++;
@@ -4430,7 +4498,9 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                         continue;
                     }
                     sampledVoxelCount++;
-                    sampledStates[baseIndex + zOffset] = level.getBlockState(mutablePos);
+                    BlockState sampledWorldState = level.getBlockState(mutablePos);
+                    BlockState sampledOverride = blockStateProvider.provide(level, mutablePos, sampledWorldState);
+                    sampledStates[baseIndex + zOffset] = sampledOverride != null ? sampledOverride : sampledWorldState;
                 }
             }
         }
@@ -5581,8 +5651,20 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             return;
         }
 
-        BlockState blockState = level.getBlockState(mutablePos);
+        BlockState worldState = level.getBlockState(mutablePos);
+        BlockState blockState = blockStateProvider.provide(level, mutablePos, worldState);
+        if (blockState == null) blockState = worldState;
         if (blockState.isAir()) {
+            // Give the special handler a chance to process air positions.
+            // This allows integrations such as VS2 to handle ship blocks that appear
+            // as air in the game world but physically exist in the Shipyard dimension,
+            // without requiring a proxy block state from the BlockStateProvider.
+            if (!thermalOnly && applyWorldChanges) {
+                double[] impact = CURRENT_BLOCK_IMPACT.get();
+                impact[0] = resolvedImpactPower;
+                impact[1] = impactHeatCelsius;
+                specialBlockHandler.handle(level, mutablePos, blockState, source, owner);
+            }
             return;
         }
         if (trace != null) {
@@ -5596,11 +5678,16 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
             return;
         }
 
-        if (!thermalOnly && applyWorldChanges && specialBlockHandler.handle(level, mutablePos, blockState, source, owner)) {
-            if (trace != null) {
-                trace.specialHandled++;
+        if (!thermalOnly && applyWorldChanges) {
+            double[] impact = CURRENT_BLOCK_IMPACT.get();
+            impact[0] = resolvedImpactPower;
+            impact[1] = impactHeatCelsius;
+            if (specialBlockHandler.handle(level, mutablePos, blockState, source, owner)) {
+                if (trace != null) {
+                    trace.specialHandled++;
+                }
+                return;
             }
-            return;
         }
 
         if (!thermalOnly && blockState.is(Blocks.TNT)) {
@@ -6340,6 +6427,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
     @Override
     public void detonate(ServerLevel level, double x, double y, double z, Entity source, LivingEntity owner, KrakkExplosionProfile profile) {
         ExplosionResolution resolution = resolveProfile(profile);
+        preExplosionHook.onBegin(level, x, y, z, resolution.radius, resolution.energy, profile, source, owner);
         detonateKrakk(
                 level,
                 x,
@@ -6358,6 +6446,7 @@ public final class KrakkExplosionRuntime implements KrakkExplosionApi {
                 true,
                 null
         );
+        postExplosionHook.onComplete(level, x, y, z, resolution.radius, resolution.energy, profile, source, owner);
     }
 
     public ExplosionProfileReport profileDetonate(ServerLevel level, double x, double y, double z, Entity source,

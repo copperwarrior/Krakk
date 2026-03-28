@@ -18,6 +18,10 @@ base {
 
 repositories {
     mavenLocal()
+    maven {
+        name = "Valkyrien Skies"
+        url = 'https://maven.valkyrienskies.org'
+    }
 }
 
 loom {
@@ -65,6 +69,12 @@ dependencies {
 
     common(project(path: krakkCommonProjectPath, configuration: 'namedElements')) { transitive false }
     shadowBundle project(path: krakkCommonProjectPath, configuration: 'transformProductionForge')
+
+    // Valkyrien Skies 2 — optional at runtime.
+    // transitive = false: VS Core API is already provided by the common modCompileOnly dep.
+    def vs2Version = findProperty("vs2_version") ?: "2.4.10"
+    modLocalRuntime("org.valkyrienskies:valkyrienskies-120-forge:${vs2Version}") { transitive = false }
+    modCompileOnly("org.valkyrienskies:valkyrienskies-120-forge:${vs2Version}") { transitive = false }
 }
 
 processResources {
